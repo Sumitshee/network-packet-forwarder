@@ -8,9 +8,6 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-env:
-  DEPS_CACHE_KEY: deps-${{ hashFiles('cmake/Dependencies.cmake') }}
-
 jobs:
   build:
     name: build (${{ matrix.compiler.name }}, ci)
@@ -30,7 +27,7 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: .deps-cache
-          key: ${{ env.DEPS_CACHE_KEY }}
+          key: deps-${{ hashFiles('cmake/Dependencies.cmake') }}
       - run: cmake --preset ci
       - run: cmake --build --preset ci -j
       - run: ctest --preset ci --output-on-failure
@@ -51,7 +48,7 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: .deps-cache
-          key: ${{ env.DEPS_CACHE_KEY }}
+          key: deps-${{ hashFiles('cmake/Dependencies.cmake') }}
       - run: cmake --preset ${{ matrix.preset }}
       - run: cmake --build --preset ${{ matrix.preset }} -j
       - run: ctest --preset ${{ matrix.preset }} --output-on-failure
@@ -74,7 +71,7 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: .deps-cache
-          key: ${{ env.DEPS_CACHE_KEY }}
+          key: deps-${{ hashFiles('cmake/Dependencies.cmake') }}
       - run: cmake --preset dev
       - name: clang-tidy
         run: |
