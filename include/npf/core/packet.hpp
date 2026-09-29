@@ -34,10 +34,14 @@ class alignas(64) Packet {
   [[nodiscard]] std::span<const std::byte> data() const noexcept { return {base_ + off_, len_}; }
   [[nodiscard]] std::size_t size() const noexcept { return len_; }
 
+  // The largest size() that resize() accepts: the buffer from the current start to its end.
+  // Lets a builder refuse a frame that will not fit instead of tripping resize()'s precondition.
+  [[nodiscard]] std::size_t capacity() const noexcept { return kMaxFrame - off_; }
+
   // Set the frame length. Must fit within the buffer from the current start offset. That is
   // asserted in debug builds; release builds clamp, so data() can never reach past the buffer.
   void resize(std::size_t n) noexcept {
-    const std::size_t room = kMaxFrame - off_;
+    const std::size_t room = capacity();
     assert(n <= room && "resize() beyond the end of the buffer");
     len_ = static_cast<std::uint16_t>(n <= room ? n : room);
   }

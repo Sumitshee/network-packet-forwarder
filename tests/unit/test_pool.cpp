@@ -244,6 +244,22 @@ TEST(Packet, ResizeCanFillTheBufferFromTheCurrentStart) {
   pool.release(p);
 }
 
+TEST(Packet, CapacityIsTheRoomFromTheCurrentStartToTheEndOfTheBuffer) {
+  PacketPool pool(1);
+  Packet* p = pool.acquire();
+  ASSERT_NE(p, nullptr);
+  EXPECT_EQ(p->capacity(), kMaxFrame - kHeadroom);
+  p->resize(20);
+  EXPECT_EQ(p->capacity(), kMaxFrame - kHeadroom);  // the frame's length does not change it
+  ASSERT_NE(p->push(10), nullptr);
+  EXPECT_EQ(p->capacity(), kMaxFrame - kHeadroom + 10);
+  ASSERT_TRUE(p->pull(15));
+  EXPECT_EQ(p->capacity(), kMaxFrame - kHeadroom - 5);
+  p->resize(p->capacity());  // exactly capacity() is accepted
+  EXPECT_EQ(p->size(), p->capacity());
+  pool.release(p);
+}
+
 // --- misuse: asserted in debug builds
 // -------------------------------------------------------------
 

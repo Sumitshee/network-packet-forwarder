@@ -53,6 +53,26 @@ jobs:
       - run: cmake --build --preset ${{ matrix.preset }} -j
       - run: ctest --preset ${{ matrix.preset }} --output-on-failure
 
+  fuzz:
+    name: fuzz (clang-18, 60 s per harness)
+    runs-on: ubuntu-24.04
+    env:
+      CXX: clang++-18
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install tools
+        run: sudo apt-get update && sudo apt-get install -y ninja-build
+      - uses: actions/cache@v4
+        with:
+          path: .deps-cache
+          key: deps-${{ hashFiles('cmake/Dependencies.cmake') }}
+      - run: cmake --preset ci
+      - run: cmake --build --preset ci -j --target fuzz_ethernet fuzz_arp fuzz_corpus
+      - name: fuzz_ethernet
+        run: build/ci/tests/fuzz/fuzz_ethernet -max_total_time=60 build/ci/tests/fuzz/corpus/ethernet
+      - name: fuzz_arp
+        run: build/ci/tests/fuzz/fuzz_arp -max_total_time=60 build/ci/tests/fuzz/corpus/arp
+
   format:
     runs-on: ubuntu-24.04
     steps:

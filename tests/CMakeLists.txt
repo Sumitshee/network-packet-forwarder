@@ -5,6 +5,9 @@ function(npf_add_unit_test name)
   add_executable(${name} ${ARGN})
   target_include_directories(${name} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
   target_link_libraries(${name} PRIVATE npf_warnings npf_core GTest::gtest_main)
+  # Where tests/support/proto_helpers.hpp finds the committed pcaps.
+  target_compile_definitions(${name} PRIVATE
+    NPF_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures")
   # gtest_discover_tests prefixes both test discovery and every test it registers with this
   # property. CMake 3.29 adds TEST_LAUNCHER for exactly this; 3.28 (Ubuntu 24.04) does not have it.
   if(NPF_TEST_LAUNCHER)
@@ -27,4 +30,12 @@ if(NPF_SANITIZER STREQUAL "tsan" AND CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
                   OUTPUT_STRIP_TRAILING_WHITESPACE
                   COMMAND_ERROR_IS_FATAL ANY)
   target_link_options(test_pool PRIVATE -shared-libsan "-Wl,-rpath,${npf_clang_runtime_dir}")
+endif()
+npf_add_unit_test(test_mac unit/test_mac.cpp)
+npf_add_unit_test(test_ethernet unit/test_ethernet.cpp)
+npf_add_unit_test(test_arp unit/test_arp.cpp)
+
+# libFuzzer ships only with Clang, and ThreadSanitizer cannot be combined with the fuzzers' ASan.
+if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang" AND NOT NPF_SANITIZER STREQUAL "tsan")
+  add_subdirectory(fuzz)
 endif()
