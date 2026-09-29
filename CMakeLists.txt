@@ -47,6 +47,9 @@ npf_apply_sanitizer("${NPF_SANITIZER}")
 
 include(Dependencies)
 
+# Phase 0.5 throwaway prototype. Never link it into anything.
+add_executable(skeleton tools/skeleton/skeleton.cpp)
+
 if(NPF_BUILD_TESTS)
   enable_testing()
   add_subdirectory(tests)
