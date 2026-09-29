@@ -1,0 +1,86 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  DEPS_CACHE_KEY: deps-${{ hashFiles('cmake/Dependencies.cmake') }}
+
+jobs:
+  build:
+    name: build (${{ matrix.compiler.name }}, ci)
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        compiler:
+          - { name: gcc-13, cxx: g++-13 }
+          - { name: clang-18, cxx: clang++-18 }
+    env:
+      CXX: ${{ matrix.compiler.cxx }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install tools
+        run: sudo apt-get update && sudo apt-get install -y ninja-build
+      - uses: actions/cache@v4
+        with:
+          path: .deps-cache
+          key: ${{ env.DEPS_CACHE_KEY }}
+      - run: cmake --preset ci
+      - run: cmake --build --preset ci -j
+      - run: ctest --preset ci --output-on-failure
+
+  sanitizer:
+    name: ${{ matrix.preset }} (clang-18)
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        preset: [asan, tsan]
+    env:
+      CXX: clang++-18
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install tools
+        run: sudo apt-get update && sudo apt-get install -y ninja-build
+      - uses: actions/cache@v4
+        with:
+          path: .deps-cache
+          key: ${{ env.DEPS_CACHE_KEY }}
+      - run: cmake --preset ${{ matrix.preset }}
+      - run: cmake --build --preset ${{ matrix.preset }} -j
+      - run: ctest --preset ${{ matrix.preset }} --output-on-failure
+
+  format:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: clang-format
+        run: clang-format-18 --dry-run --Werror $(git ls-files '*.hpp' '*.cpp')
+
+  clang-tidy:
+    runs-on: ubuntu-24.04
+    env:
+      CXX: clang++-18
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install tools
+        run: sudo apt-get update && sudo apt-get install -y ninja-build clang-tidy-18
+      - uses: actions/cache@v4
+        with:
+          path: .deps-cache
+          key: ${{ env.DEPS_CACHE_KEY }}
+      - run: cmake --preset dev
+      - name: clang-tidy
+        run: |
+          files=$(git ls-files 'src/*.cpp')
+          if [ -z "$files" ]; then
+            echo "No src/*.cpp files yet; nothing to lint."
+            exit 0
+          fi
+          clang-tidy-18 -p build/dev $files

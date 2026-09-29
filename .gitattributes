@@ -1,0 +1,4 @@
+# The checkout may live on a Windows filesystem; Linux tools must always see LF.
+* text=auto eol=lf
+*.sh text eol=lf
+*.pcap binary

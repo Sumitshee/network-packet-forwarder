@@ -1,0 +1,25 @@
+# build trees and dependency cache
+/build/
+/.deps-cache/
+compile_commands.json
+.cache/
+
+# BGP data is fetched by scripts/fetch_bgp_table.sh, never committed
+/data/
+*.mrt
+*.bz2
+
+# raw benchmark dumps; the curated bench/results/*.json ARE committed
+/bench/results/raw/
+
+# fuzzing artefacts
+crash-*
+leak-*
+timeout-*
+oom-*
+
+# editors and OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
