@@ -8,14 +8,14 @@ The pcaps are committed; rerun this only to add or change a fixture:
 scapy builds the frames. They are written by a minimal pcap writer below, with zero timestamps
 and fixed addresses, so that regenerating produces byte-identical files and git shows no change.
 
-The expected field values in tests/unit/test_ethernet.cpp and test_arp.cpp come from the
-constants here; change both together.
+The expected field values in tests/unit/test_ethernet.cpp, test_arp.cpp and test_ipv4.cpp come
+from the constants here; change both together.
 """
 
 import pathlib
 import struct
 
-from scapy.layers.inet import IP, UDP
+from scapy.layers.inet import IP, UDP, IPOption_RR
 from scapy.layers.l2 import ARP, Dot1AD, Dot1Q, Ether
 from scapy.packet import Raw
 
@@ -80,6 +80,15 @@ def main() -> None:
                bytes(Ether(dst=ROUTER_MAC, src=CLIENT_MAC) / Dot1AD(vlan=200) / Dot1Q(vlan=100) / udp))
     write_pcap("lldp", bytes(Ether(dst=LLDP_MULTICAST, src=SERVER_MAC, type=0x88CC) / Raw(lldp_payload())))
     write_pcap("runt_13", arp_request[:13])
+
+    # A 30-byte datagram in a 60-byte frame: total_length, not the frame, must bound the payload.
+    small = bytes(Ether(dst=ROUTER_MAC, src=CLIENT_MAC) / IP(
+        src="10.0.1.2", dst="10.0.2.2", ttl=64, id=0x1234, flags="DF") / UDP(sport=40000, dport=9) / Raw(b"hi"))
+    write_pcap("ipv4_udp_padded_60", small + bytes(60 - len(small)))
+    # Record Route with three empty slots: 15 option bytes, padded to 16, so ihl is 9, not 5.
+    write_pcap("ipv4_options_rr", bytes(Ether(dst=ROUTER_MAC, src=CLIENT_MAC) / IP(
+        src="10.0.1.2", dst="10.0.2.2", ttl=64, id=0x5678, options=[IPOption_RR(routers=["0.0.0.0"] * 3)])
+        / UDP(sport=40000, dport=9) / Raw(b"npf")))
 
 
 if __name__ == "__main__":

@@ -3,7 +3,7 @@
 #
 # Run one, e.g. for the CI's 60 seconds:
 #   build/ci/tests/fuzz/fuzz_ethernet -max_total_time=60 build/ci/tests/fuzz/corpus/ethernet
-foreach(harness fuzz_ethernet fuzz_arp)
+foreach(harness fuzz_ethernet fuzz_arp fuzz_ipv4)
   add_executable(${harness} ${harness}.cpp)
   target_link_libraries(${harness} PRIVATE npf_warnings npf_core)
   # -UNDEBUG keeps assert() live in every preset: a fuzzer should trip on each broken

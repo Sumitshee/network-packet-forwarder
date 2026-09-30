@@ -56,3 +56,7 @@ if(NPF_BUILD_TESTS)
   enable_testing()
   add_subdirectory(tests)
 endif()
+
+if(NPF_BUILD_BENCH)
+  add_subdirectory(bench)
+endif()
