@@ -8,14 +8,14 @@ The pcaps are committed; rerun this only to add or change a fixture:
 scapy builds the frames. They are written by a minimal pcap writer below, with zero timestamps
 and fixed addresses, so that regenerating produces byte-identical files and git shows no change.
 
-The expected field values in tests/unit/test_ethernet.cpp, test_arp.cpp and test_ipv4.cpp come
-from the constants here; change both together.
+The expected field values in tests/unit/test_ethernet.cpp, test_arp.cpp, test_ipv4.cpp and
+test_l4.cpp come from the constants here; change both together.
 """
 
 import pathlib
 import struct
 
-from scapy.layers.inet import IP, UDP, IPOption_RR
+from scapy.layers.inet import ICMP, IP, TCP, UDP, IPOption_RR, fragment
 from scapy.layers.l2 import ARP, Dot1AD, Dot1Q, Ether
 from scapy.packet import Raw
 
@@ -29,12 +29,13 @@ SERVER_MAC = "02:00:00:00:02:02"
 LLDP_MULTICAST = "01:80:c2:00:00:0e"
 
 
-def write_pcap(name: str, frame: bytes) -> None:
-    """Classic pcap: little-endian, microsecond timestamps, LINKTYPE_ETHERNET, one record."""
-    header = struct.pack("<IHHiIII", 0xA1B2C3D4, 2, 4, 0, 0, 65535, 1)
-    record = struct.pack("<IIII", 0, 0, len(frame), len(frame))
-    (FIXTURES / f"{name}.pcap").write_bytes(header + record + frame)
-    print(f"  {name}.pcap  {len(frame)} bytes")
+def write_pcap(name: str, *frames: bytes) -> None:
+    """Classic pcap: little-endian, microsecond timestamps, LINKTYPE_ETHERNET, a record per frame."""
+    out = struct.pack("<IHHiIII", 0xA1B2C3D4, 2, 4, 0, 0, 65535, 1)
+    for frame in frames:
+        out += struct.pack("<IIII", 0, 0, len(frame), len(frame)) + frame
+    (FIXTURES / f"{name}.pcap").write_bytes(out)
+    print(f"  {name}.pcap  {' + '.join(str(len(f)) for f in frames)} bytes")
 
 
 def lldp_payload() -> bytes:
@@ -89,6 +90,26 @@ def main() -> None:
     write_pcap("ipv4_options_rr", bytes(Ether(dst=ROUTER_MAC, src=CLIENT_MAC) / IP(
         src="10.0.1.2", dst="10.0.2.2", ttl=64, id=0x5678, options=[IPOption_RR(routers=["0.0.0.0"] * 3)])
         / UDP(sport=40000, dport=9) / Raw(b"npf")))
+
+    # 108 bytes of UDP split 48 + 48 + 12. The data is arranged so that the second fragment begins
+    # with 01 bb 1f 90: bytes that would read as ports 443 -> 8080 to a parser that trusted a
+    # non-initial fragment.
+    data = bytes(range(40)) + bytes.fromhex("01bb1f90") + bytes(range(56))
+    datagram = IP(src="10.0.1.2", dst="10.0.2.2", ttl=64, id=0x9ABC) / UDP(sport=40000, dport=9) / Raw(data)
+    write_pcap("udp_fragmented",
+               *[bytes(Ether(dst=ROUTER_MAC, src=CLIENT_MAC) / f) for f in fragment(datagram, fragsize=48)])
+    # One option (MSS), so the data offset is 6, not 5.
+    write_pcap("tcp_syn", bytes(Ether(dst=ROUTER_MAC, src=CLIENT_MAC) / IP(
+        src="10.0.1.2", dst="10.0.2.2", ttl=64, id=0x2468, flags="DF") / TCP(
+        sport=40001, dport=443, seq=0x12345678, flags="S", window=64240, options=[("MSS", 1460)])))
+    write_pcap("icmp_echo_request", bytes(Ether(dst=ROUTER_MAC, src=CLIENT_MAC) / IP(
+        src="10.0.1.2", dst="10.0.2.2", ttl=64, id=0x1357) / ICMP(type=8, id=0x0457, seq=1)
+        / Raw(b"npf-ping-payload")))
+    # What a router sends back when a datagram's TTL runs out: its IP header and first 8 bytes.
+    expired = bytes(IP(src="10.0.1.2", dst="10.0.2.2", ttl=1, id=0x0001) / UDP(sport=40000, dport=9)
+                    / Raw(b"npf-fixture"))[:28]
+    write_pcap("icmp_time_exceeded", bytes(Ether(dst=CLIENT_MAC, src=ROUTER_MAC) / IP(
+        src="10.0.1.1", dst="10.0.1.2", ttl=64, id=0x0002) / ICMP(type=11, code=0) / Raw(expired)))
 
 
 if __name__ == "__main__":

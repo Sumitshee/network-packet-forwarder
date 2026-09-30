@@ -36,6 +36,7 @@ npf_add_unit_test(test_ethernet unit/test_ethernet.cpp)
 npf_add_unit_test(test_arp unit/test_arp.cpp)
 npf_add_unit_test(test_checksum unit/test_checksum.cpp)
 npf_add_unit_test(test_ipv4 unit/test_ipv4.cpp)
+npf_add_unit_test(test_l4 unit/test_l4.cpp)
 
 # libFuzzer ships only with Clang, and ThreadSanitizer cannot be combined with the fuzzers' ASan.
 if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang" AND NOT NPF_SANITIZER STREQUAL "tsan")

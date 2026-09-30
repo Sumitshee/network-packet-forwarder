@@ -1,7 +1,7 @@
 // Seeds the fuzz corpora from the fixture pcaps, one file per frame: every whole frame into
-// <out>/ethernet/ for fuzz_ethernet, and the Ethernet payload of every ARP or IPv4 frame into
-// <out>/arp/ or <out>/ipv4/ for fuzz_arp and fuzz_ipv4. Run by the fuzz_corpus custom command in
-// tests/fuzz/CMakeLists.txt.
+// <out>/ethernet/ for fuzz_ethernet, the Ethernet payload of every ARP frame into <out>/arp/ for
+// fuzz_arp, and that of every IPv4 frame into both <out>/ipv4/ and <out>/l4/, one corpus per
+// harness. Run by the fuzz_corpus custom command in tests/fuzz/CMakeLists.txt.
 
 #include <cstddef>
 #include <cstdio>
@@ -38,7 +38,7 @@ int main(int argc, char** argv) {
   try {
     const std::vector<std::string> args(argv + 1, argv + argc);
     const std::filesystem::path out{args[0]};
-    for (const char* dir : {"ethernet", "arp", "ipv4"}) {
+    for (const char* dir : {"ethernet", "arp", "ipv4", "l4"}) {
       std::filesystem::create_directories(out / dir);
     }
 
@@ -58,11 +58,12 @@ int main(int argc, char** argv) {
           ++arp;
         } else if (eth && eth->ethertype() == npf::proto::kEtherTypeIpv4) {
           write_seed(out / "ipv4" / seed, eth->payload());
+          write_seed(out / "l4" / seed, eth->payload());
           ++ipv4;
         }
       }
     }
-    std::printf("seeded %zu ethernet, %zu arp and %zu ipv4 inputs\n", frames, arp, ipv4);
+    std::printf("seeded %zu ethernet, %zu arp, and %zu ipv4 and l4 inputs\n", frames, arp, ipv4);
   } catch (const std::exception& e) {
     std::fprintf(stderr, "pcap_to_corpus: %s\n", e.what());
     return 1;
