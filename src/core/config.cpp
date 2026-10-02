@@ -1,0 +1,522 @@
+#include <algorithm>
+#include <array>
+#include <cassert>
+#include <charconv>
+#include <cstddef>
+#include <cstdint>
+#include <filesystem>
+#include <format>
+#include <fstream>
+#include <limits>
+#include <npf/core/config.hpp>
+#include <npf/proto/mac.hpp>
+#include <npf/table/fib.hpp>
+#include <optional>
+#include <sstream>
+#include <stdexcept>
+#include <string>
+#include <string_view>
+#include <system_error>
+#include <utility>
+#include <vector>
+
+namespace npf::core {
+namespace {
+
+// Thrown anywhere in the parser and caught in one place, parse_config, so that no helper has to
+// pass an error back up through its callers. It never leaves this file.
+class ConfigError : public std::runtime_error {
+ public:
+  ConfigError(int line, const std::string& message)
+      : std::runtime_error(std::format("line {}: {}", line, message)), line_{line} {}
+  [[nodiscard]] int line() const noexcept { return line_; }
+
+ private:
+  int line_;
+};
+
+// The word the file uses for each value of an enumeration; one table serves parsing and printing.
+template <class E>
+struct Word {
+  std::string_view text;
+  E value;
+};
+
+constexpr std::array<Word<PortMode>, 2> kPortModes{{
+    {"routed", PortMode::Routed},
+    {"bridged", PortMode::Bridged},
+}};
+constexpr std::array<Word<RunMode>, 2> kRunModes{{
+    {"rtc", RunMode::Rtc},
+    {"pipeline", RunMode::Pipeline},
+}};
+constexpr std::array<Word<IoKind>, 4> kIoKinds{{
+    {"af_packet", IoKind::AfPacket},
+    {"mmap", IoKind::Mmap},
+    {"xdp", IoKind::Xdp},
+    {"pcap", IoKind::Pcap},
+}};
+constexpr std::array<Word<FibKind>, 4> kFibKinds{{
+    {"linear", FibKind::Linear},
+    {"trie", FibKind::Trie},
+    {"patricia", FibKind::Patricia},
+    {"dir24_8", FibKind::Dir24_8},
+}};
+
+constexpr std::array<std::string_view, 6> kSettings{"pool_size", "burst", "mode",
+                                                    "workers",   "io",    "fib"};
+
+constexpr std::uint64_t kMaxCount = std::numeric_limits<std::uint32_t>::max();
+
+// --- values: text to number, and back ------------------------------------------------------------
+
+// Decimal digits and nothing else: no sign, no spaces, no base prefix.
+std::optional<std::uint64_t> to_number(std::string_view s, std::uint64_t max) {
+  std::uint64_t value = 0;
+  const char* end = s.data() + s.size();
+  const auto [ptr, ec] = std::from_chars(s.data(), end, value);
+  if (ec != std::errc{} || ptr != end || value > max) {
+    return std::nullopt;
+  }
+  return value;
+}
+
+// Dotted quad, to host order. An octet with a leading zero is refused: inet_aton reads "010" as
+// octal 8 and inet_pton rejects it, and the file must not mean different things to different tools.
+std::optional<std::uint32_t> to_ipv4(std::string_view s) {
+  std::uint32_t addr = 0;
+  for (int i = 0; i < 4; ++i) {
+    const std::size_t dot = s.find('.');
+    if ((dot != std::string_view::npos) != (i < 3)) {  // exactly three dots
+      return std::nullopt;
+    }
+    const std::string_view octet = s.substr(0, dot);
+    const auto value = to_number(octet, 255);
+    if (!value || (octet.size() > 1 && octet.front() == '0')) {
+      return std::nullopt;
+    }
+    addr = addr << 8U | static_cast<std::uint32_t>(*value);
+    s.remove_prefix(dot == std::string_view::npos ? s.size() : dot + 1);
+  }
+  return addr;
+}
+
+// "<address>/<len>". Whether the address may have bits set past len is the caller's decision.
+std::optional<std::pair<std::uint32_t, std::uint8_t>> to_address_and_len(std::string_view s) {
+  const std::size_t slash = s.find('/');
+  if (slash == std::string_view::npos) {
+    return std::nullopt;
+  }
+  const auto addr = to_ipv4(s.substr(0, slash));
+  const auto len = to_number(s.substr(slash + 1), 32);
+  if (!addr || !len) {
+    return std::nullopt;
+  }
+  return std::pair{*addr, static_cast<std::uint8_t>(*len)};
+}
+
+// Six two-digit hex octets separated by colons, in either case: aa:bb:cc:dd:ee:02.
+std::optional<proto::MacAddr> to_mac(std::string_view s) {
+  proto::MacAddr mac;
+  for (std::size_t i = 0; i < mac.b.size(); ++i) {
+    const std::size_t colon = s.find(':');
+    if ((colon != std::string_view::npos) != (i + 1 < mac.b.size())) {  // exactly five colons
+      return std::nullopt;
+    }
+    const std::string_view hex = s.substr(0, colon);
+    const char* end = hex.data() + hex.size();
+    std::uint8_t octet = 0;
+    const auto [ptr, ec] = std::from_chars(hex.data(), end, octet, 16);
+    if (hex.size() != 2 || ec != std::errc{} || ptr != end) {
+      return std::nullopt;
+    }
+    mac.b.at(i) = octet;
+    s.remove_prefix(colon == std::string_view::npos ? s.size() : colon + 1);
+  }
+  return mac;
+}
+
+std::string format_ipv4(std::uint32_t a) {
+  return std::format("{}.{}.{}.{}", a >> 24U, a >> 16U & 0xFFU, a >> 8U & 0xFFU, a & 0xFFU);
+}
+
+std::string format_prefix(table::Prefix p) {
+  return std::format("{}/{}", format_ipv4(p.addr), p.len);
+}
+
+std::string format_mac(const proto::MacAddr& m) {
+  return std::format("{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}", m.b[0], m.b[1], m.b[2], m.b[3],
+                     m.b[4], m.b[5]);
+}
+
+template <class E, std::size_t N>
+std::string_view word_for(const std::array<Word<E>, N>& words, E value) {
+  for (const Word<E>& w : words) {
+    if (w.value == value) {
+      return w.text;
+    }
+  }
+  throw std::invalid_argument("to_string: a Config field holds a value its enumeration lacks");
+}
+
+// "linear, trie, patricia or dir24_8"
+template <class E, std::size_t N>
+std::string list_of(const std::array<Word<E>, N>& words) {
+  std::string out;
+  std::size_t i = 0;
+  for (const Word<E>& w : words) {
+    if (i > 0) {
+      out += i + 1 < N ? ", " : " or ";
+    }
+    out += w.text;
+    ++i;
+  }
+  return out;
+}
+
+// --- one line ------------------------------------------------------------------------------------
+
+// The words of one line, taken from left to right. Running out of words, or finding the wrong one,
+// is an error that names the line.
+class Words {
+ public:
+  Words(std::string_view text, int line) : line_{line} {
+    constexpr std::string_view kBlank = " \t\r\v\f";  // \r too: a file saved with CRLF endings
+    for (std::size_t pos = text.find_first_not_of(kBlank); pos != std::string_view::npos;
+         pos = text.find_first_not_of(kBlank, pos)) {
+      const std::size_t end = std::min(text.find_first_of(kBlank, pos), text.size());
+      words_.push_back(text.substr(pos, end - pos));
+      pos = end;
+    }
+  }
+
+  [[nodiscard]] int line() const noexcept { return line_; }
+  [[nodiscard]] bool at_end() const noexcept { return next_ == words_.size(); }
+
+  // The next word, which the caller is about to read as `what`.
+  std::string_view take(std::string_view what) {
+    if (at_end()) {
+      fail(std::format("expected {}, got end of line", what));
+    }
+    return words_[next_++];
+  }
+
+  // Takes the next word only if it is `word`.
+  bool accept(std::string_view word) {
+    if (at_end() || words_[next_] != word) {
+      return false;
+    }
+    ++next_;
+    return true;
+  }
+
+  void expect(std::string_view word) {
+    const std::string_view got = take(std::format("'{}'", word));
+    if (got != word) {
+      fail(std::format("expected '{}', got '{}'", word, got));
+    }
+  }
+
+  void expect_end() const {
+    if (!at_end()) {
+      fail(std::format("expected end of line, got '{}'", words_[next_]));
+    }
+  }
+
+  [[noreturn]] void fail(const std::string& message) const { throw ConfigError(line_, message); }
+
+ private:
+  std::vector<std::string_view> words_;
+  std::size_t next_{0};
+  int line_;
+};
+
+struct Bounds {
+  std::uint64_t min;
+  std::uint64_t max;
+};
+
+std::uint64_t take_number(Words& w, std::string_view what, Bounds bounds) {
+  const std::string_view word = w.take(what);
+  if (const auto value = to_number(word, bounds.max); value && *value >= bounds.min) {
+    return *value;
+  }
+  w.fail(std::format("expected {} from {} to {}, got '{}'", what, bounds.min, bounds.max, word));
+}
+
+std::uint16_t take_port(Words& w) {
+  return static_cast<std::uint16_t>(
+      take_number(w, "a port id", {0, std::numeric_limits<std::uint16_t>::max()}));
+}
+
+std::uint32_t take_ipv4(Words& w, std::string_view what) {
+  const std::string_view word = w.take(what);
+  if (const auto addr = to_ipv4(word)) {
+    return *addr;
+  }
+  w.fail(std::format("expected {} such as 10.0.2.254, got '{}'", what, word));
+}
+
+std::pair<std::uint32_t, std::uint8_t> take_interface_address(Words& w) {
+  const std::string_view word = w.take("an address and prefix length");
+  if (const auto addr = to_address_and_len(word)) {
+    return *addr;
+  }
+  w.fail(std::format("expected an address and prefix length such as 10.0.1.1/24, got '{}'", word));
+}
+
+table::Prefix take_route_prefix(Words& w) {
+  const std::string_view word = w.take("a prefix");
+  const auto parsed = to_address_and_len(word);
+  if (!parsed) {
+    w.fail(std::format("expected a prefix such as 10.0.1.0/24, got '{}'", word));
+  }
+  const auto [addr, len] = *parsed;
+  const table::Prefix prefix{addr & table::prefix_mask(len), len};
+  if (prefix.addr != addr) {
+    w.fail(std::format("{} has bits set past its prefix length; did you mean {}?", word,
+                       format_prefix(prefix)));
+  }
+  return prefix;
+}
+
+proto::MacAddr take_mac(Words& w) {
+  const std::string_view word = w.take("a MAC address");
+  if (const auto mac = to_mac(word)) {
+    return *mac;
+  }
+  w.fail(std::format("expected a MAC address such as aa:bb:cc:dd:ee:02, got '{}'", word));
+}
+
+std::optional<proto::MacAddr> take_mac_or_auto(Words& w) {
+  const std::string_view word = w.take("a MAC address or 'auto'");
+  if (word == "auto") {
+    return std::nullopt;
+  }
+  if (const auto mac = to_mac(word)) {
+    return mac;
+  }
+  w.fail(
+      std::format("expected a MAC address such as aa:bb:cc:dd:ee:02, or 'auto', got '{}'", word));
+}
+
+template <class E, std::size_t N>
+E take_word(Words& w, const std::array<Word<E>, N>& words, std::string_view what) {
+  const std::string_view word = w.take(what);
+  for (const Word<E>& candidate : words) {
+    if (candidate.text == word) {
+      return candidate.value;
+    }
+  }
+  w.fail(std::format("expected {} ({}), got '{}'", what, list_of(words), word));
+}
+
+// --- the whole file ------------------------------------------------------------------------------
+
+class Parser {
+ public:
+  void parse_line(Words& w) {
+    const std::string_view keyword = w.take("a keyword");
+    if (keyword == "interface") {
+      interface_line(w);
+    } else if (keyword == "route") {
+      route_line(w);
+    } else if (keyword == "arp") {
+      arp_line(w);
+    } else if (std::ranges::find(kSettings, keyword) != kSettings.end()) {
+      setting_line(w, keyword);
+    } else {
+      w.fail(
+          std::format("unknown keyword '{}'; expected interface, route, arp, pool_size, burst, "
+                      "mode, workers, io or fib",
+                      keyword));
+    }
+  }
+
+  // The checks that need the whole file, so a route may come before the interface it uses.
+  Config result() {
+    const auto has_port = [this](std::uint16_t port) {
+      return std::ranges::any_of(cfg_.interfaces,
+                                 [port](const InterfaceConfig& i) { return i.port == port; });
+    };
+    for (std::size_t i = 0; i < cfg_.routes.size(); ++i) {
+      const table::Route& r = cfg_.routes[i];
+      if (!has_port(r.out_port)) {
+        throw ConfigError(route_lines_[i],
+                          std::format("route {} uses dev {}, but no interface has port {}",
+                                      format_prefix(r.prefix), r.out_port, r.out_port));
+      }
+    }
+    for (std::size_t i = 0; i < cfg_.arp.size(); ++i) {
+      const StaticArp& a = cfg_.arp[i];
+      if (!has_port(a.port)) {
+        throw ConfigError(
+            arp_lines_[i],
+            std::format("the ARP entry for {} uses dev {}, but no interface has port {}",
+                        format_ipv4(a.ip), a.port, a.port));
+      }
+    }
+    return std::move(cfg_);
+  }
+
+ private:
+  void interface_line(Words& w) {
+    InterfaceConfig ifc;
+    ifc.name = w.take("an interface name");
+    w.expect("port");
+    ifc.port = take_port(w);
+    w.expect("ip");
+    const auto [ip, prefix_len] = take_interface_address(w);
+    ifc.ip = ip;
+    ifc.prefix_len = prefix_len;
+    w.expect("mode");
+    ifc.mode = take_word(w, kPortModes, "a port mode");
+    if (w.accept("mac")) {
+      ifc.mac = take_mac_or_auto(w);
+    }
+    w.expect_end();
+    for (std::size_t i = 0; i < cfg_.interfaces.size(); ++i) {
+      const InterfaceConfig& other = cfg_.interfaces[i];
+      if (other.name == ifc.name) {
+        w.fail(std::format("interface '{}' is already defined on line {}", ifc.name,
+                           interface_lines_[i]));
+      }
+      if (other.port == ifc.port) {
+        w.fail(std::format("port {} is already used by interface '{}' on line {}", ifc.port,
+                           other.name, interface_lines_[i]));
+      }
+    }
+    cfg_.interfaces.push_back(std::move(ifc));
+    interface_lines_.push_back(w.line());
+  }
+
+  void route_line(Words& w) {
+    table::Route r;
+    r.prefix = take_route_prefix(w);
+    if (w.accept("via")) {
+      r.next_hop = take_ipv4(w, "a next hop");
+      if (r.next_hop == 0) {  // next_hop 0 is how a Route spells "directly connected"
+        w.fail("'via 0.0.0.0' is not a next hop; a directly connected route has no 'via'");
+      }
+    }
+    w.expect("dev");
+    r.out_port = take_port(w);
+    w.expect_end();
+    for (std::size_t i = 0; i < cfg_.routes.size(); ++i) {
+      if (cfg_.routes[i].prefix == r.prefix) {
+        w.fail(std::format("a route for {} is already defined on line {}", format_prefix(r.prefix),
+                           route_lines_[i]));
+      }
+    }
+    cfg_.routes.push_back(r);
+    route_lines_.push_back(w.line());
+  }
+
+  void arp_line(Words& w) {
+    StaticArp a;
+    a.ip = take_ipv4(w, "a neighbour's address");
+    a.mac = take_mac(w);
+    w.expect("dev");
+    a.port = take_port(w);
+    w.expect_end();
+    for (std::size_t i = 0; i < cfg_.arp.size(); ++i) {
+      if (cfg_.arp[i].ip == a.ip) {
+        w.fail(std::format("an ARP entry for {} is already defined on line {}", format_ipv4(a.ip),
+                           arp_lines_[i]));
+      }
+    }
+    cfg_.arp.push_back(a);
+    arp_lines_.push_back(w.line());
+  }
+
+  void setting_line(Words& w, std::string_view key) {
+    for (const auto& [seen, seen_on] : settings_) {
+      if (seen == key) {
+        w.fail(std::format("'{}' is already set on line {}", key, seen_on));
+      }
+    }
+    settings_.emplace_back(key, w.line());
+    if (key == "pool_size") {
+      cfg_.pool_size = take_number(w, "a packet count", {1, kMaxCount});
+    } else if (key == "burst") {
+      cfg_.burst = take_number(w, "a burst size", {1, kMaxBurst});
+    } else if (key == "mode") {
+      cfg_.mode = take_word(w, kRunModes, "a threading mode");
+    } else if (key == "workers") {
+      cfg_.workers = take_number(w, "a worker count", {1, kMaxCount});
+    } else if (key == "io") {
+      cfg_.io = take_word(w, kIoKinds, "an I/O backend");
+    } else {
+      assert(key == "fib" && "kSettings names a setting this function does not handle");
+      cfg_.fib = take_word(w, kFibKinds, "a FIB");
+    }
+    w.expect_end();
+  }
+
+  Config cfg_;
+  // The line each interface, route and ARP entry came from, index for index, and each setting's.
+  std::vector<int> interface_lines_;
+  std::vector<int> route_lines_;
+  std::vector<int> arp_lines_;
+  std::vector<std::pair<std::string_view, int>> settings_;
+};
+
+}  // namespace
+
+ParseResult parse_config(std::string_view text) {
+  try {
+    Parser parser;
+    int line = 0;
+    while (!text.empty()) {
+      ++line;
+      const std::size_t eol = std::min(text.find('\n'), text.size());
+      const std::string_view content = text.substr(0, eol);
+      text.remove_prefix(std::min(eol + 1, text.size()));
+      Words words(content.substr(0, content.find('#')), line);
+      if (!words.at_end()) {
+        parser.parse_line(words);
+      }
+    }
+    return {parser.result(), {}, 0};
+  } catch (const ConfigError& e) {
+    return {std::nullopt, e.what(), e.line()};
+  }
+}
+
+ParseResult load_config(const std::filesystem::path& path) {
+  std::ifstream in(path, std::ios::binary);
+  if (!in) {
+    return {std::nullopt, std::format("cannot open {}", path.string()), 0};
+  }
+  std::ostringstream text;
+  text << in.rdbuf();
+  return parse_config(text.view());
+}
+
+std::string to_string(const Config& cfg) {
+  std::string out;
+  for (const InterfaceConfig& i : cfg.interfaces) {
+    out += std::format("interface {} port {} ip {}/{} mode {}", i.name, i.port, format_ipv4(i.ip),
+                       i.prefix_len, word_for(kPortModes, i.mode));
+    if (i.mac) {
+      out += std::format(" mac {}", format_mac(*i.mac));
+    }
+    out += '\n';
+  }
+  for (const table::Route& r : cfg.routes) {
+    out += std::format("route {}", format_prefix(r.prefix));
+    if (r.next_hop != 0) {
+      out += std::format(" via {}", format_ipv4(r.next_hop));
+    }
+    out += std::format(" dev {}\n", r.out_port);
+  }
+  for (const StaticArp& a : cfg.arp) {
+    out += std::format("arp {} {} dev {}\n", format_ipv4(a.ip), format_mac(a.mac), a.port);
+  }
+  out += std::format("pool_size {}\nburst {}\nmode {}\nworkers {}\nio {}\nfib {}\n", cfg.pool_size,
+                     cfg.burst, word_for(kRunModes, cfg.mode), cfg.workers,
+                     word_for(kIoKinds, cfg.io), word_for(kFibKinds, cfg.fib));
+  return out;
+}
+
+}  // namespace npf::core

@@ -4,10 +4,11 @@ A userspace Layer-2/Layer-3 packet forwarding engine — a software router — w
 Linux. It receives raw Ethernet frames from network interfaces, parses them, makes forwarding
 decisions, rewrites headers and transmits them out of the correct interface.
 
-**Status: phase 4 of 19.** So far: the build system and CI, a zero-allocation packet buffer pool,
+**Status: phase 5 of 19.** So far: the build system and CI, a zero-allocation packet buffer pool,
 bounds-checked, fuzz-tested parsers for Ethernet, ARP, IPv4, and the TCP, UDP and ICMP header
-fields, and the Internet checksum with the RFC 1624 incremental update. Nothing forwards packets
-yet, so no protocol should be assumed to work end to end.
+fields, the Internet checksum with the RFC 1624 incremental update, the routing table interface
+with a deliberately simple longest-prefix-match implementation, and the configuration file parser.
+Nothing forwards packets yet, so no protocol should be assumed to work end to end.
 
 ## Not implemented
 
@@ -18,6 +19,10 @@ yet, so no protocol should be assumed to work end to end.
   the transport header, so every other fragment is handled with no ports at all.
 - **TCP.** Only the header's fields are read: ports, sequence and acknowledgement numbers, flags.
   There is no connection state.
+- **Most configuration choices.** The configuration parser accepts every value the file format
+  defines, but only `fib linear` is implemented. No I/O backend exists yet, for any `io` value; the
+  `trie`, `patricia` and `dir24_8` FIBs do not exist; and without threading, neither does
+  `mode pipeline` or more than one worker.
 
 ## Building
 
