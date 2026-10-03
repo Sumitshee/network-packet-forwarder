@@ -1,12 +1,15 @@
 #!/usr/bin/env bash
 # Builds the three-namespace test topology (docs/BUILD_PLAN.md, phase 0.5):
 #
-#   ns-client               ns-router                ns-server
-#   10.0.1.2/24  veth-c <-> veth-cr  [npf]  veth-sr <-> veth-s  10.0.2.2/24
-#   gw 10.0.1.1             no IP addresses                     gw 10.0.2.1
+#   ns-client                 ns-router                ns-server
+#   10.0.1.2/24    veth-c <-> veth-cr  [npf]  veth-sr <-> veth-s    10.0.2.2/24
+#   gw 10.0.1.1                no IP addresses                     gw 10.0.2.1
+#   aa:bb:cc:dd:ee:01                                     aa:bb:cc:dd:ee:02
 #
 # The router's interfaces carry no addresses and kernel forwarding is off: the forwarder owns L3,
-# answering ARP for 10.0.1.1 (port 0) and 10.0.2.1 (port 1) itself. Needs root.
+# answering ARP for 10.0.1.1 (port 0) and 10.0.2.1 (port 1) itself. The hosts' MACs are fixed,
+# so the static ARP entry in configs/router.conf is true and captures are reproducible, and IPv6
+# is off everywhere, so the router sees only the traffic a test sends it. Needs root.
 # Undo with scripts/cleanup_netns.sh.
 set -euo pipefail
 
@@ -30,6 +33,16 @@ ip link set veth-c netns ns-client
 ip link set veth-cr netns ns-router
 ip link set veth-s netns ns-server
 ip link set veth-sr netns ns-router
+
+# Before any link comes up. A host with IPv6 sends router solicitations and duplicate-address
+# probes the moment its link is up, and the router would count every one as a bad EtherType.
+# Applying it to "all" covers the veths already moved in. A kernel without IPv6 sends none anyway.
+for ns in ns-client ns-router ns-server; do
+  ip netns exec "$ns" sysctl -qw net.ipv6.conf.all.disable_ipv6=1 \
+    net.ipv6.conf.default.disable_ipv6=1 2>/dev/null || true
+done
+ip netns exec ns-client ip link set veth-c address aa:bb:cc:dd:ee:01
+ip netns exec ns-server ip link set veth-s address aa:bb:cc:dd:ee:02
 
 ip netns exec ns-client ip addr add 10.0.1.2/24 dev veth-c
 ip netns exec ns-client ip link set veth-c up

@@ -9,6 +9,7 @@
 #include <fstream>
 #include <limits>
 #include <npf/core/config.hpp>
+#include <npf/proto/format.hpp>
 #include <npf/proto/mac.hpp>
 #include <npf/table/fib.hpp>
 #include <optional>
@@ -136,17 +137,11 @@ std::optional<proto::MacAddr> to_mac(std::string_view s) {
   return mac;
 }
 
-std::string format_ipv4(std::uint32_t a) {
-  return std::format("{}.{}.{}.{}", a >> 24U, a >> 16U & 0xFFU, a >> 8U & 0xFFU, a & 0xFFU);
-}
+using proto::format_ipv4;
+using proto::format_mac;
 
 std::string format_prefix(table::Prefix p) {
   return std::format("{}/{}", format_ipv4(p.addr), p.len);
-}
-
-std::string format_mac(const proto::MacAddr& m) {
-  return std::format("{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}", m.b[0], m.b[1], m.b[2], m.b[3],
-                     m.b[4], m.b[5]);
 }
 
 template <class E, std::size_t N>
