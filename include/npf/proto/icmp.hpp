@@ -16,6 +16,13 @@ inline constexpr std::uint8_t kIcmpEchoRequest = 8;
 inline constexpr std::uint8_t kIcmpTimeExceeded = 11;
 inline constexpr std::uint8_t kIcmpParameterProblem = 12;
 
+// The types that report a problem with some other datagram, and so must never trigger an ICMP
+// error of their own (RFC 1812 §4.3.2.7).
+[[nodiscard]] constexpr bool is_icmp_error_type(std::uint8_t t) noexcept {
+  return t == kIcmpDestUnreachable || t == kIcmpSourceQuench || t == kIcmpRedirect ||
+         t == kIcmpTimeExceeded || t == kIcmpParameterProblem;
+}
+
 // An ICMP message: the IPv4 payload, sized by total_length. It gets a view of its own because it
 // carries more than L4Info can hold -- an echo's identifier and sequence number, and an error's
 // copy of the datagram that caused it.
@@ -38,13 +45,7 @@ class IcmpView {
   // whatever bytes 4 to 7 hold.
   [[nodiscard]] constexpr std::uint16_t echo_id() const noexcept { return core::rd_be16(buf_, 4); }
   [[nodiscard]] constexpr std::uint16_t echo_seq() const noexcept { return core::rd_be16(buf_, 6); }
-  // The types that report a problem with some other datagram, and so must never trigger an ICMP
-  // error of their own (RFC 1812 §4.3.2.7).
-  [[nodiscard]] constexpr bool is_error() const noexcept {
-    const std::uint8_t t = type();
-    return t == kIcmpDestUnreachable || t == kIcmpSourceQuench || t == kIcmpRedirect ||
-           t == kIcmpTimeExceeded || t == kIcmpParameterProblem;
-  }
+  [[nodiscard]] constexpr bool is_error() const noexcept { return is_icmp_error_type(type()); }
   // Everything after the 8-byte header. For an error, the start of the datagram that caused it:
   // its IP header and at least the first 8 bytes of its payload.
   [[nodiscard]] constexpr core::CBytes payload() const noexcept { return buf_.subspan(kMinSize); }

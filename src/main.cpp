@@ -349,7 +349,7 @@ class ArpRequester final : public npf::table::ArpEvents {
   std::vector<TxQueue>* queues_;
 };
 
-// The one worker of phase 6: receive a burst, decide every packet, transmit the results.
+// The one worker: receive a burst, decide every packet, send the answers and the forwarded.
 class Worker {
  public:
   using Pipeline = npf::pipe::Forwarder<npf::table::LinearLpm>;
@@ -362,10 +362,11 @@ class Worker {
         stats_{&stats},
         requests_{&requests},
         forward_(requests.size()),
-        replies_(requests.size()),
+        arp_replies_(requests.size()),
+        icmp_(requests.size()),
         burst_{burst} {}
 
-  void run_one_burst() noexcept {
+  void run_one_burst(npf::core::Clock::time_point now) noexcept {
     const std::size_t n = backend_->rx_burst(rx_.data(), burst_);
     const std::span<Packet* const> got(rx_.data(), n);
     for (const Packet* p : got) {
@@ -375,14 +376,15 @@ class Worker {
     pipeline_->process_burst(rx_.data(), n, decisions_.data());
     const std::span<const npf::Decision> decided(decisions_.data(), n);
     for (std::size_t i = 0; i < n; ++i) {
-      dispatch(got[i], decided[i]);
+      dispatch(got[i], decided[i], now);
     }
     transmit();
   }
 
  private:
-  // Every packet leaves here queued for transmission or released: never both, never neither.
-  void dispatch(Packet* p, npf::Decision d) noexcept {
+  // Every packet leaves here queued for transmission or released: never both, never neither. So
+  // does every answer the control plane hands back.
+  void dispatch(Packet* p, npf::Decision d, npf::core::Clock::time_point now) noexcept {
     switch (d.verdict) {
       case Verdict::Forward:
         if (!forward_[d.out_port].push(p)) {
@@ -391,25 +393,42 @@ class Worker {
         }
         return;
       case Verdict::ToHost:
-        if (const std::optional<std::uint16_t> port = pipeline_->deliver_to_host(*p);
-            port && replies_[*port].push(p)) {
-          return;
+        if (const std::optional<npf::pipe::Reply> reply =
+                pipeline_->deliver_to_host(*p, *pool_, now)) {
+          if (reply->packet == p) {  // an ARP request, turned into its reply in place
+            queue(arp_replies_[reply->port], p);
+            return;
+          }
+          queue(icmp_[reply->port], reply->packet);
+        }
+        pool_->release(p);
+        return;
+      case Verdict::Drop:
+        if (Packet* error = pipeline_->error_for(*p, d.reason, *pool_, now); error != nullptr) {
+          queue(icmp_[p->in_port()], error);
         }
         pool_->release(p);
         return;
       case Verdict::Flood:  // nothing floods before phase 12
-      case Verdict::Drop:
         pool_->release(p);
         return;
     }
   }
 
-  // One tx_burst per queue per port: replies and requests first, since traffic waits on them.
+  void queue(TxQueue& q, Packet* p) noexcept {
+    if (!q.push(p)) {
+      pool_->release(p);
+    }
+  }
+
+  // One tx_burst per queue per port: what the router says itself goes first, since traffic waits
+  // on ARP and senders wait on ICMP.
   void transmit() noexcept {
     for (std::size_t i = 0; i < forward_.size(); ++i) {
       const auto port = static_cast<std::uint16_t>(i);
-      stats_->arp_replies_tx += send(port, replies_[i]);
+      stats_->arp_replies_tx += send(port, arp_replies_[i]);
       stats_->arp_requests_tx += send(port, (*requests_)[i]);
+      send(port, icmp_[i]);  // counted as generated already, and in tx_packets once sent
       const std::size_t queued = forward_[i].packets().size();
       const std::size_t sent = send(port, forward_[i]);
       stats_->forwarded += sent;
@@ -443,9 +462,10 @@ class Worker {
   PacketPool* pool_;
   Pipeline* pipeline_;
   npf::stat::Counters* stats_;
-  std::vector<TxQueue>* requests_;  // per port, filled by the ARP cache through ArpRequester
-  std::vector<TxQueue> forward_;    // per port
-  std::vector<TxQueue> replies_;    // per port: what deliver_to_host() turned around
+  std::vector<TxQueue>* requests_;    // per port, filled by the ARP cache through ArpRequester
+  std::vector<TxQueue> forward_;      // per port
+  std::vector<TxQueue> arp_replies_;  // per port: the ARP requests deliver_to_host() turned around
+  std::vector<TxQueue> icmp_;         // per port: echo replies and ICMP errors
   std::array<Packet*, npf::core::kMaxBurst> rx_{};
   std::array<npf::Decision, npf::core::kMaxBurst> decisions_{};
   std::size_t burst_;
@@ -519,7 +539,7 @@ void serve(const Options& o, const npf::io::AfPacketBackend& backend, const Pack
     }
     const auto now = npf::core::Clock::now();
     arp.tick(now);
-    worker.run_one_burst();
+    worker.run_one_burst(now);
     if (now >= next_report) {
       next_report += kStatsPeriod;
       print(std::format(

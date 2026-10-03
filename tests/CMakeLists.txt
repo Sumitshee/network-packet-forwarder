@@ -52,16 +52,19 @@ target_compile_definitions(test_config PRIVATE NPF_CONFIG_DIR="${PROJECT_SOURCE_
 npf_add_unit_test(test_forward unit/test_forward.cpp)
 npf_count_allocations(test_forward)
 target_link_libraries(test_forward PRIVATE npf_pipe)
+npf_add_unit_test(test_icmp_gen unit/test_icmp_gen.cpp)
+target_link_libraries(test_icmp_gen PRIVATE npf_pipe)
 
 # Integration tests that need root. Run by anyone else, each exits 77, which CTest reports as
 # skipped rather than failed -- so in CI they are skipped.
-add_test(NAME integration.forward_netns
-         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/integration/test_forward_netns.sh
-                 $<TARGET_FILE:npf>)
-set_tests_properties(integration.forward_netns PROPERTIES
-  SKIP_RETURN_CODE 77
-  RUN_SERIAL TRUE
-  TIMEOUT 180)
+foreach(name forward_netns traceroute)
+  add_test(NAME integration.${name}
+           COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/integration/test_${name}.sh $<TARGET_FILE:npf>)
+  set_tests_properties(integration.${name} PROPERTIES
+    SKIP_RETURN_CODE 77
+    RUN_SERIAL TRUE
+    TIMEOUT 180)
+endforeach()
 
 # libFuzzer ships only with Clang, and ThreadSanitizer cannot be combined with the fuzzers' ASan.
 if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang" AND NOT NPF_SANITIZER STREQUAL "tsan")

@@ -7,8 +7,11 @@
 #include <npf/core/byte_span.hpp>
 #include <npf/core/config.hpp>
 #include <npf/core/packet.hpp>
+#include <npf/core/pool.hpp>
+#include <npf/core/time.hpp>
 #include <npf/pipe/decision.hpp>
 #include <npf/pipe/filter.hpp>
+#include <npf/pipe/icmp_gen.hpp>
 #include <npf/proto/checksum.hpp>
 #include <npf/proto/ethernet.hpp>
 #include <npf/proto/ipv4.hpp>
@@ -35,13 +38,70 @@ struct PortState {
 // N-1 and every port's MAC is known: "mac auto" must be read from the interface first.
 [[nodiscard]] std::vector<PortState> make_port_table(const core::Config& cfg);
 
-// The control-plane half of a packet that process() handed up as ToHost. An ARP request for the
-// address of the port it came in on is turned into the reply, in place, and the port to send it
-// back out of is returned. An ARP reply completes the cache entry that asked for it; gratuitous
-// ARP refreshes an existing one. Anything else is consumed. nullopt: the caller releases p.
-[[nodiscard]] std::optional<std::uint16_t> deliver_to_host(
-    core::Packet& p, std::span<const PortState> ports, table::ArpCache& arp, stat::Counters& stats,
-    std::vector<core::Packet*>& ready) noexcept;
+inline constexpr std::uint32_t kLimitedBroadcast = 0xFFFFFFFFU;
+
+// True if ip is exactly one of the router's own addresses, on any port.
+[[nodiscard]] inline bool is_router_address(std::span<const PortState> ports,
+                                            std::uint32_t ip) noexcept {
+  return ip != 0 && std::ranges::any_of(ports, [ip](const PortState& s) { return s.ip == ip; });
+}
+
+// True if a packet to ip is delivered to the router itself, never forwarded (RFC 1812 §5.2.3):
+// one of its own addresses, or the limited broadcast -- which a router must neither forward nor
+// discard (§5.3.5.1), and which a covering route, a default route say, would otherwise forward.
+[[nodiscard]] inline bool is_local_destination(std::span<const PortState> ports,
+                                               std::uint32_t ip) noexcept {
+  return ip == kLimitedBroadcast || is_router_address(ports, ip);
+}
+
+// A packet the router sends in answer to one it received: `packet` leaves from `port`.
+struct Reply {
+  core::Packet* packet;
+  std::uint16_t port;
+};
+
+// The part of the pipeline that answers packets instead of forwarding them -- ARP for the
+// router's addresses, echo replies, ICMP errors -- run by the caller after process() has decided.
+// Compiled once, in forward.cpp; every Forwarder owns one. Nothing here allocates: a new packet
+// comes from the pool the caller passes in, and goes out of the port the original arrived on.
+class ControlPlane {
+ public:
+  ControlPlane(const core::Config& cfg, table::ArpCache& arp, stat::Counters& stats);
+
+  // For a packet process() returned as ToHost.
+  //  - An ARP request for the port's own address is turned into its reply in place: the Reply's
+  //    packet is p itself. ARP replies, and gratuitous ARP, update the cache.
+  //  - An echo request to any of the router's addresses gets an Echo Reply, and a packet of any
+  //    protocol but ICMP a Protocol Unreachable: a new packet, with p still the caller's.
+  //  - Anything else is consumed silently, other ICMP types included (RFC 1812 §4.3.2.1).
+  // nullopt: no answer, and the caller releases p.
+  [[nodiscard]] std::optional<Reply> deliver_to_host(core::Packet& p, core::PacketPool& pool,
+                                                     core::Clock::time_point now) noexcept;
+
+  // For a packet process() dropped: Time Exceeded for TtlExpired, Net Unreachable for NoRoute --
+  // if RFC 1812 §4.3.2.7 allows an error and the rate limiter has a token -- as a new packet to
+  // send from p's in_port. nullptr for every other reason, or when no error may be sent. p is
+  // still the caller's either way.
+  [[nodiscard]] core::Packet* error_for(const core::Packet& p, DropReason reason,
+                                        core::PacketPool& pool,
+                                        core::Clock::time_point now) noexcept;
+
+  [[nodiscard]] std::span<const PortState> ports() const noexcept { return ports_; }
+
+ private:
+  [[nodiscard]] std::optional<Reply> answer_arp(core::Packet& p,
+                                                const proto::EthView& eth) noexcept;
+  [[nodiscard]] core::Packet* make_error(const core::Packet& p, const proto::EthView& eth,
+                                         const proto::Ipv4View& ip, IcmpError err,
+                                         core::PacketPool& pool,
+                                         core::Clock::time_point now) noexcept;
+
+  std::vector<PortState> ports_;  // indexed by port id
+  table::ArpCache* arp_;          // borrowed, like the counters
+  stat::Counters* stats_;
+  std::vector<core::Packet*> ready_;  // ArpCache::on_reply's out-parameter, reserved once
+  IcmpRateLimiter limiter_;           // RFC 1812 §4.3.2.8: errors only, not echo replies
+};
 
 // Step 13 on a frame that passed steps 1 to 12: the next hop's MAC as destination, the output
 // port's as source, TTL down by one, and the header checksum patched for that one changed word
@@ -69,18 +129,17 @@ class Forwarder {
   // Every dependency is borrowed: the caller owns it and keeps it alive for as long as this.
   Forwarder(const core::Config& cfg, FibT& fib, table::ArpCache& arp, table::MacTable& macs,
             const Filter& filter, stat::Counters& stats)
-      : fib_{&fib},
+      : control_{cfg, arp, stats},
+        fib_{&fib},
         arp_{&arp},
         macs_{&macs},
         filter_{&filter},
-        stats_{&stats},
-        ports_{make_port_table(cfg)} {
-    ready_.reserve(table::kArpQueueDepth);
-  }
+        stats_{&stats} {}
 
   // The whole datapath for one packet: the fourteen steps of ARCHITECTURE.md §11, in order. No
   // allocation, no locks, no system calls. It counts its own drops and ToHost packets; a Forward
-  // is counted by the caller, once the backend has accepted the packet.
+  // is counted by the caller, once the backend has accepted the packet. ICMP is not sent from
+  // here: the Decision carries the reason, and the caller asks error_for() for the message.
   [[nodiscard]] Decision process(core::Packet& p) noexcept {
     const Decision d = steps(p);
     assert((d.verdict == Verdict::Drop) == (d.reason != DropReason::None) &&
@@ -95,21 +154,25 @@ class Forwarder {
     }
   }
 
-  // See the free function above. The caller runs it after process() returns ToHost.
-  [[nodiscard]] std::optional<std::uint16_t> deliver_to_host(core::Packet& p) noexcept {
-    return pipe::deliver_to_host(p, ports_, *arp_, *stats_, ready_);
+  // See ControlPlane.
+  [[nodiscard]] std::optional<Reply> deliver_to_host(core::Packet& p, core::PacketPool& pool,
+                                                     core::Clock::time_point now) noexcept {
+    return control_.deliver_to_host(p, pool, now);
+  }
+  [[nodiscard]] core::Packet* error_for(const core::Packet& p, DropReason reason,
+                                        core::PacketPool& pool,
+                                        core::Clock::time_point now) noexcept {
+    return control_.error_for(p, reason, pool, now);
   }
 
-  [[nodiscard]] std::span<const PortState> ports() const noexcept { return ports_; }
+  [[nodiscard]] std::span<const PortState> ports() const noexcept { return control_.ports(); }
 
  private:
   [[nodiscard]] Decision steps(core::Packet& p) noexcept;
 
   [[nodiscard]] const PortState* port(std::uint16_t id) const noexcept {
-    return id < ports_.size() ? &ports_[id] : nullptr;
-  }
-  [[nodiscard]] bool is_ours(std::uint32_t ip) const noexcept {
-    return ip != 0 && std::ranges::any_of(ports_, [ip](const PortState& s) { return s.ip == ip; });
+    const std::span<const PortState> ports = control_.ports();
+    return id < ports.size() ? &ports[id] : nullptr;
   }
   [[nodiscard]] Decision drop(DropReason reason) noexcept {
     ++stats_->drop(reason);
@@ -120,13 +183,12 @@ class Forwarder {
     return {Verdict::ToHost, DropReason::None, 0};
   }
 
-  FibT* fib_;
+  ControlPlane control_;
+  FibT* fib_;  // all borrowed
   table::ArpCache* arp_;
   [[maybe_unused]] table::MacTable* macs_;  // TODO(phase-12): the L2 path learns and switches
   const Filter* filter_;
   stat::Counters* stats_;
-  std::vector<PortState> ports_;      // indexed by port id
-  std::vector<core::Packet*> ready_;  // ArpCache::on_reply's out-parameter, reserved once
 };
 
 template <class FibT>
@@ -155,13 +217,13 @@ Decision Forwarder<FibT>::steps(core::Packet& p) noexcept {
     return to_host();
   }
 
-  // 4. The L2/L3 rule (ARCHITECTURE.md §2). A broadcast is routed only if it is for one of the
-  // router's addresses, which means reading that address before step 5 would.
+  // 4. The L2/L3 rule (ARCHITECTURE.md §2). A broadcast is routed only if it is for the router
+  // itself, which means reading its destination before step 5 would.
   std::optional<proto::Ipv4View> ip;
   bool route_it = to_our_mac;
   if (!route_it && dst_mac.is_broadcast() && type == proto::kEtherTypeIpv4) {
     ip = proto::Ipv4View::parse(eth->payload());
-    route_it = ip.has_value() && is_ours(ip->dst());
+    route_it = ip.has_value() && is_local_destination(control_.ports(), ip->dst());
   }
   if (!route_it) {
     // A transit frame. Only a bridged port would switch it, and until phase 12 fills the MAC
@@ -188,12 +250,12 @@ Decision Forwarder<FibT>::steps(core::Packet& p) noexcept {
     return drop(DropReason::MartianSource);
   }
 
-  // 8. For the router itself. TODO(phase-7): answer pings.
-  if (is_ours(ip->dst())) {
+  // 8. For the router itself: deliver_to_host() answers pings.
+  if (is_local_destination(control_.ports(), ip->dst())) {
     return to_host();
   }
 
-  // 9. TTL. TODO(phase-7): send ICMP Time Exceeded.
+  // 9. TTL. error_for() turns the drop into an ICMP Time Exceeded.
   if (ip->ttl() <= 1) {
     return drop(DropReason::TtlExpired);
   }
@@ -205,7 +267,7 @@ Decision Forwarder<FibT>::steps(core::Packet& p) noexcept {
     return drop(DropReason::FilterDeny);
   }
 
-  // 11. Route. TODO(phase-7): send ICMP Net Unreachable.
+  // 11. Route. error_for() turns the drop into an ICMP Net Unreachable.
   const std::optional<table::NextHop> next = fib_->lookup(ip->dst());
   if (!next) {
     return drop(DropReason::NoRoute);

@@ -41,6 +41,8 @@ class Ipv4View {
   [[nodiscard]] constexpr std::size_t header_len() const noexcept {  // ihl * 4, never assumed 20
     return hdr_len_;
   }
+  // The whole second byte: precedence and TOS bits in RFC 1812's terms, DSCP and ECN in today's.
+  [[nodiscard]] constexpr std::uint8_t tos() const noexcept { return core::rd_u8(buf_, 1); }
   [[nodiscard]] constexpr std::uint16_t total_length() const noexcept {
     return core::rd_be16(buf_, 2);
   }
