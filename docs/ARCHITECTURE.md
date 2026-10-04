@@ -20,6 +20,8 @@ enum class Verdict : std::uint8_t {
   Flood,     // L2: transmit on every port in the bridge domain except in_port
   ToHost,    // addressed to this router itself (ICMP echo, ARP request for us)
   Drop,      // drop_reason is set
+  Queued,    // [phase 8] held by the ARP cache until the next hop resolves; out_port is set.
+             // The cache owns the packet now: the caller must neither transmit nor release it.
 };
 
 enum class DropReason : std::uint8_t {
@@ -52,6 +54,10 @@ struct Decision {
 
 **Invariant:** every packet leaving the pipeline produces exactly one `Decision`, and every
 `Verdict::Drop` carries a `reason != None`. Assert this in debug builds.
+
+A `Queued` packet has not left yet. It leaves when the ARP cache lets go of it (§6): handed back
+for transmission when the neighbour answers, or given up on and dropped as `ArpUnresolved`. It is
+counted then, once, like any other packet.
 
 ---
 
@@ -347,6 +353,9 @@ class ArpEvents {
   virtual ~ArpEvents() = default;
   virtual void send_arp_request(std::uint32_t target_ip, std::uint16_t out_port) = 0;
   virtual void unresolved(core::Packet* p) = 0;   // emit ICMP 3/1 for the head, then release
+  // [phase 8] Release a queued packet with no ICMP, counting it as ArpUnresolved: the packets
+  // behind the head of a failed queue, and every packet flush() lets go of.
+  virtual void discard(core::Packet* p) = 0;
 };
 
 class ArpCache {
@@ -374,6 +383,10 @@ class ArpCache {
   void tick(std::chrono::steady_clock::time_point now) noexcept;
 
   void insert_static(std::uint32_t ip, MacAddr mac, std::uint16_t port) noexcept;  // for replay determinism
+
+  // [phase 8] Deletes every entry except the static ones, discarding the packets queued on them
+  // through ArpEvents::discard. For a test's SIGUSR2, and at shutdown, so no buffer stays held.
+  void flush() noexcept;
 };
 
 }  // namespace npf::table
@@ -588,7 +601,8 @@ Order of operations inside `process()` — do not reorder, each step depends on 
  9. TTL <= 1                           -> TtlExpired  (+ generate ICMP 11/0)
 10. parse_l4 + Filter::evaluate        -> FilterDeny
 11. fib.lookup                         -> NoRoute     (+ generate ICMP 3/0)
-12. resolve next-hop MAC via ArpCache  -> ArpUnresolved (queued, or ICMP 3/1)
+12. resolve next-hop MAC via ArpCache  -> Queued, or ArpUnresolved if the queue is full
+                                          (a queue the cache gives up on: ICMP 3/1, §6)
 13. rewrite: dst MAC, src MAC, TTL--, checksum_update16
 14. return Forward with out_port
 ```
