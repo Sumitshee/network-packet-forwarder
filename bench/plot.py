@@ -14,6 +14,7 @@ import sys
 import matplotlib
 
 matplotlib.use("Agg")
+matplotlib.rcParams["svg.hashsalt"] = "bench_lpm"  # else the SVG's element ids are random per run
 import matplotlib.pyplot as plt  # noqa: E402  (the backend must be chosen first)
 
 SIZES = ["10", "1k", "100k", "full"]
@@ -51,7 +52,7 @@ def main():
         ax.set_yscale("log")
         ax.grid(True, which="both", alpha=0.3)
     axes[0].set_ylabel("ns per lookup (median of the repetitions)")
-    axes[-1].legend(loc="upper left", fontsize="small")
+    axes[-1].legend(loc="upper right", fontsize="small")  # clear of the lines in that corner
     context = results["context"]
     fig.suptitle(f"bench_lpm, commit {context.get('git_sha', '?')}, {context.get('cpu_model', '?')}",
                  fontsize="medium")
