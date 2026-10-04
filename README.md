@@ -4,7 +4,7 @@ A userspace Layer-2/Layer-3 packet forwarding engine — a software router — w
 Linux. It receives raw Ethernet frames from network interfaces, parses them, makes forwarding
 decisions, rewrites headers and transmits them out of the correct interface.
 
-**Status: phase 9 of 19.** `npf` routes IPv4 between Linux interfaces. It has one AF_PACKET socket
+**Status: phase 10 of 19.** `npf` routes IPv4 between Linux interfaces. It has one AF_PACKET socket
 per port and runs every packet through a fixed fourteen-step pipeline: parse, validate, route,
 resolve the next hop, rewrite the MAC addresses, decrement the TTL and patch the checksum. Every
 packet it drops is counted under a reason. It resolves its neighbours with ARP itself: a packet
@@ -27,8 +27,11 @@ npf's own output.
 
 Underneath are a zero-allocation packet buffer pool; bounds-checked, fuzz-tested parsers for
 Ethernet, ARP, IPv4 and the TCP, UDP and ICMP headers, and for pcap files; the Internet checksum
-with the RFC 1624 incremental update; a deliberately simple longest-prefix-match routing table; and
-the configuration file parser.
+with the RFC 1624 incremental update; and the configuration file parser. Longest-prefix match comes
+four ways: a deliberately simple linear table, the oracle, and a binary trie, a Patricia trie and
+DIR-24-8, each held to the oracle on a thousand adversarial random tables. `bench_lpm` times them on
+a full Internet routing table, a RouteViews snapshot of 1.13 million prefixes, which
+`scripts/fetch_bgp_table.sh` downloads. The router itself still uses the linear table.
 
 ## How a frame is handled
 
@@ -139,7 +142,8 @@ ctest --preset dev -R golden --output-on-failure
 - **Packet filtering.** There are no filter rules; everything that can be routed is (phase 11).
 - **Switching.** Bridged ports drop transit frames (phase 12).
 - **Threads.** One worker forwards everything (phase 13).
-- **IPv6.** Not routed: an IPv6 frame is dropped as an unsupported EtherType.
+- **IPv6.** Not routed: an IPv6 frame is dropped as an unsupported EtherType. The longest-prefix
+  match tables are IPv4's alone too; none is written to take a wider address.
 - **Link state.** A port's link is checked once, at start-up. If it goes down later, frames sent to
   it are counted as `TxFull`.
 - **VLANs.** One 802.1Q (`0x8100`) or 802.1ad (`0x88a8`) tag is parsed and carried, not
@@ -152,7 +156,8 @@ ctest --preset dev -R golden --output-on-failure
   There is no connection state.
 - **Most configuration choices.** The configuration parser accepts every value the file format
   defines, but `npf run` runs only `io af_packet`, and `npf replay` only `io pcap`; both only with
-  `fib linear`, `mode rtc` and `workers 1`. They refuse the rest.
+  `fib linear`, `mode rtc` and `workers 1`. They refuse the rest: `fib trie`, `patricia` and
+  `dir24_8` name tables that exist and are tested, but the router is not built on them yet.
 
 ## Building
 

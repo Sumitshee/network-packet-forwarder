@@ -22,3 +22,5 @@ function(npf_add_bench name source)
 endfunction()
 
 npf_add_bench(bench_checksum micro/bench_checksum.cpp)
+npf_add_bench(bench_lpm micro/bench_lpm.cpp)
+target_link_libraries(bench_lpm PRIVATE npf_table)
