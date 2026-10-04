@@ -4,7 +4,7 @@ A userspace Layer-2/Layer-3 packet forwarding engine — a software router — w
 Linux. It receives raw Ethernet frames from network interfaces, parses them, makes forwarding
 decisions, rewrites headers and transmits them out of the correct interface.
 
-**Status: phase 8 of 19.** `npf` routes IPv4 between Linux interfaces. It has one AF_PACKET socket
+**Status: phase 9 of 19.** `npf` routes IPv4 between Linux interfaces. It has one AF_PACKET socket
 per port and runs every packet through a fixed fourteen-step pipeline: parse, validate, route,
 resolve the next hop, rewrite the MAC addresses, decrement the TTL and patch the checksum. Every
 packet it drops is counted under a reason. It resolves its neighbours with ARP itself: a packet
@@ -19,10 +19,16 @@ every packet received is accounted for as forwarded, delivered to the router its
 [`docs/rfc1812-conformance.md`](docs/rfc1812-conformance.md) lists which requirements of RFC 1812,
 *Requirements for IP Version 4 Routers*, it meets and which it does not yet.
 
+`npf replay` runs the same router over a pcap file instead of live interfaces, and writes what it
+sends to another: deterministically, and with no root. The golden-file tests use it in CI. Each
+case is a pcap, a configuration, and the frames and counters the router must end with, which
+`scripts/make_fixtures.py` builds from a separate model of what a router must do, never from
+npf's own output.
+
 Underneath are a zero-allocation packet buffer pool; bounds-checked, fuzz-tested parsers for
-Ethernet, ARP, IPv4 and the TCP, UDP and ICMP headers; the Internet checksum with the RFC 1624
-incremental update; a deliberately simple longest-prefix-match routing table; and the
-configuration file parser.
+Ethernet, ARP, IPv4 and the TCP, UDP and ICMP headers, and for pcap files; the Internet checksum
+with the RFC 1624 incremental update; a deliberately simple longest-prefix-match routing table; and
+the configuration file parser.
 
 ## How a frame is handled
 
@@ -93,6 +99,23 @@ sudo tests/integration/test_traceroute.sh build/dev/npf
 sudo tests/integration/test_arp_resolution.sh build/dev/npf
 ```
 
+### Replaying a pcap
+
+No root, and no interfaces: every frame of the input arrives on port 0, and every frame the router
+sends is written to the output, in the order sent. The configuration must give each interface's
+MAC (`mac <address>`) and say `io pcap`; `tests/fixtures/golden/*.conf` are examples.
+
+```bash
+./build/dev/npf replay in.pcap out.pcap --config tests/fixtures/golden/basic_fwd.conf --stats-json counters.json
+```
+
+The golden-file tests replay every case in `tests/fixtures/golden/` and compare both outputs, the
+frames and the counters, with what the case expects:
+
+```bash
+ctest --preset dev -R golden --output-on-failure
+```
+
 ## Not implemented
 
 - **Some of ICMP.** No Redirect, Parameter Problem or Fragmentation Needed. ICMP errors quote the
@@ -108,6 +131,11 @@ sudo tests/integration/test_arp_resolution.sh build/dev/npf
   from its replies and announcements, never from its requests, and creates an entry only for a
   neighbour it has asked about itself. Requests are always broadcast, even when checking an entry
   it already has. One cache serves every port, searched entry by entry. No proxy ARP.
+- **Some of replay.** Only classic pcap is read: not pcapng, and not the nanosecond-resolution
+  variant, which is refused rather than misread. Every input frame arrives on port 0, and the output
+  does not record which port a frame left by. No time passes during a replay, so an ARP request is
+  never answered or repeated, and at most 100 ICMP errors are sent, the rate limiter's allowance
+  for one second.
 - **Packet filtering.** There are no filter rules; everything that can be routed is (phase 11).
 - **Switching.** Bridged ports drop transit frames (phase 12).
 - **Threads.** One worker forwards everything (phase 13).
@@ -123,8 +151,8 @@ sudo tests/integration/test_arp_resolution.sh build/dev/npf
 - **TCP.** Only the header's fields are read: ports, sequence and acknowledgement numbers, flags.
   There is no connection state.
 - **Most configuration choices.** The configuration parser accepts every value the file format
-  defines, but `npf run` runs only `io af_packet`, `fib linear`, `mode rtc` and `workers 1`, and
-  refuses the rest.
+  defines, but `npf run` runs only `io af_packet`, and `npf replay` only `io pcap`; both only with
+  `fib linear`, `mode rtc` and `workers 1`. They refuse the rest.
 
 ## Building
 

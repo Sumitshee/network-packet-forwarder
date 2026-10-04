@@ -31,6 +31,9 @@ jobs:
       - run: cmake --preset ci
       - run: cmake --build --preset ci -j
       - run: ctest --preset ci --output-on-failure
+      # The phase 9 exit test, on its own: npf replay against every golden case, as a normal user.
+      - name: golden
+        run: ctest --preset ci -R golden --output-on-failure
 
   sanitizer:
     name: ${{ matrix.preset }} (clang-18)
@@ -67,7 +70,7 @@ jobs:
           path: .deps-cache
           key: deps-${{ hashFiles('cmake/Dependencies.cmake') }}
       - run: cmake --preset ci
-      - run: cmake --build --preset ci -j --target fuzz_ethernet fuzz_arp fuzz_ipv4 fuzz_l4 fuzz_corpus
+      - run: cmake --build --preset ci -j --target fuzz_ethernet fuzz_arp fuzz_ipv4 fuzz_l4 fuzz_pcap fuzz_corpus
       - name: fuzz_ethernet
         run: build/ci/tests/fuzz/fuzz_ethernet -max_total_time=60 build/ci/tests/fuzz/corpus/ethernet
       - name: fuzz_arp
@@ -76,6 +79,8 @@ jobs:
         run: build/ci/tests/fuzz/fuzz_ipv4 -max_total_time=60 build/ci/tests/fuzz/corpus/ipv4
       - name: fuzz_l4
         run: build/ci/tests/fuzz/fuzz_l4 -max_total_time=60 build/ci/tests/fuzz/corpus/l4
+      - name: fuzz_pcap
+        run: build/ci/tests/fuzz/fuzz_pcap -max_total_time=60 build/ci/tests/fuzz/corpus/pcap
 
   format:
     runs-on: ubuntu-24.04

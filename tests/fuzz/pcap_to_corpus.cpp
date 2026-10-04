@@ -1,7 +1,8 @@
 // Seeds the fuzz corpora from the fixture pcaps, one file per frame: every whole frame into
 // <out>/ethernet/ for fuzz_ethernet, the Ethernet payload of every ARP frame into <out>/arp/ for
 // fuzz_arp, and that of every IPv4 frame into both <out>/ipv4/ and <out>/l4/, one corpus per
-// harness. Run by the fuzz_corpus custom command in tests/fuzz/CMakeLists.txt.
+// harness; and each pcap whole into <out>/pcap/ for fuzz_pcap. Run by the fuzz_corpus custom
+// command in tests/fuzz/CMakeLists.txt.
 
 #include <cstddef>
 #include <cstdio>
@@ -38,7 +39,7 @@ int main(int argc, char** argv) {
   try {
     const std::vector<std::string> args(argv + 1, argv + argc);
     const std::filesystem::path out{args[0]};
-    for (const char* dir : {"ethernet", "arp", "ipv4", "l4"}) {
+    for (const char* dir : {"ethernet", "arp", "ipv4", "l4", "pcap"}) {
       std::filesystem::create_directories(out / dir);
     }
 
@@ -47,9 +48,13 @@ int main(int argc, char** argv) {
     std::size_t ipv4 = 0;
     for (std::size_t i = 1; i < args.size(); ++i) {
       const std::filesystem::path pcap{args[i]};
+      // Numbered by argument, since two fixture directories may hold files of the same name.
+      const std::string name = std::to_string(i) + "-" + pcap.stem().string();
+      std::filesystem::copy_file(pcap, out / "pcap" / name,
+                                 std::filesystem::copy_options::overwrite_existing);
       const auto records = npf::test::read_pcap(pcap);
       for (std::size_t r = 0; r < records.size(); ++r) {
-        const std::string seed = pcap.stem().string() + "-" + std::to_string(r);
+        const std::string seed = name + "-" + std::to_string(r);
         write_seed(out / "ethernet" / seed, records[r]);
         ++frames;
         const auto eth = npf::proto::EthView::parse(records[r]);
@@ -63,7 +68,8 @@ int main(int argc, char** argv) {
         }
       }
     }
-    std::printf("seeded %zu ethernet, %zu arp, and %zu ipv4 and l4 inputs\n", frames, arp, ipv4);
+    std::printf("seeded %zu ethernet, %zu arp, %zu ipv4 and l4, and %zu pcap inputs\n", frames, arp,
+                ipv4, args.size() - 1);
   } catch (const std::exception& e) {
     std::fprintf(stderr, "pcap_to_corpus: %s\n", e.what());
     return 1;

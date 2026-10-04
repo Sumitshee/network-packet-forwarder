@@ -79,6 +79,20 @@ TEST(ByteSpan, ReadsEndingExactlyAtTheEndOfTheSpan) {
   EXPECT_EQ(rd_be32(v, 0), 0x01020304U);
   EXPECT_EQ(rd_be16(v, 2), 0x0304);
   EXPECT_EQ(rd_u8(v, 3), 4);
+  EXPECT_EQ(npf::core::rd_le32(v, 0), 0x04030201U);
+  EXPECT_EQ(npf::core::rd_le16(v, 2), 0x0403);
+}
+
+// The pcap file header's magic, as a little-endian writer lays it out.
+TEST(ByteSpan, LittleEndianWritesLeastSignificantByteFirst) {
+  std::array<std::byte, 6> buf{};
+  npf::core::wr_le32(buf, 0, 0xA1B2C3D4U);
+  npf::core::wr_le16(buf, 4, 0x0204);
+  const std::array<std::byte, 6> expected{std::byte{0xD4}, std::byte{0xC3}, std::byte{0xB2},
+                                          std::byte{0xA1}, std::byte{0x04}, std::byte{0x02}};
+  EXPECT_EQ(buf, expected);
+  EXPECT_EQ(npf::core::rd_le32(buf, 0), 0xA1B2C3D4U);
+  EXPECT_EQ(npf::core::rd_le16(buf, 4), 0x0204);
 }
 
 }  // namespace

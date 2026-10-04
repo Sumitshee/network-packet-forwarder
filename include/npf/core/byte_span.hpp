@@ -56,12 +56,42 @@ constexpr void wr_be32(Bytes b, std::size_t off, std::uint32_t v) noexcept {
   b[off + 3] = static_cast<std::byte>(v & 0xFFU);
 }
 
+// Little-endian, for the one format here that is: a pcap file as the router writes it.
+
+[[nodiscard]] constexpr std::uint16_t rd_le16(CBytes b, std::size_t off) noexcept {
+  assert(off <= b.size() && b.size() - off >= 2);
+  return static_cast<std::uint16_t>(std::to_integer<std::uint16_t>(b[off]) |
+                                    std::to_integer<std::uint16_t>(b[off + 1]) << 8U);
+}
+
+[[nodiscard]] constexpr std::uint32_t rd_le32(CBytes b, std::size_t off) noexcept {
+  assert(off <= b.size() && b.size() - off >= 4);
+  return std::to_integer<std::uint32_t>(b[off]) | std::to_integer<std::uint32_t>(b[off + 1]) << 8U |
+         std::to_integer<std::uint32_t>(b[off + 2]) << 16U |
+         std::to_integer<std::uint32_t>(b[off + 3]) << 24U;
+}
+
+constexpr void wr_le16(Bytes b, std::size_t off, std::uint16_t v) noexcept {
+  assert(off <= b.size() && b.size() - off >= 2);
+  b[off] = static_cast<std::byte>(v & 0xFFU);
+  b[off + 1] = static_cast<std::byte>(v >> 8U);
+}
+
+constexpr void wr_le32(Bytes b, std::size_t off, std::uint32_t v) noexcept {
+  assert(off <= b.size() && b.size() - off >= 4);
+  b[off] = static_cast<std::byte>(v & 0xFFU);
+  b[off + 1] = static_cast<std::byte>(v >> 8U & 0xFFU);
+  b[off + 2] = static_cast<std::byte>(v >> 16U & 0xFFU);
+  b[off + 3] = static_cast<std::byte>(v >> 24U);
+}
+
 // Evaluated by the compiler in every translation unit that includes this header: proves the
 // helpers work at compile time and fails the build on a byte-order mistake without running
 // anything.
 static_assert([] {
   std::array<std::byte, 4> buf{std::byte{0x12}, std::byte{0x34}, std::byte{0x56}, std::byte{0x78}};
-  return rd_be16(buf, 0) == 0x1234 && rd_be32(buf, 0) == 0x12345678U;
+  return rd_be16(buf, 0) == 0x1234 && rd_be32(buf, 0) == 0x12345678U && rd_le16(buf, 0) == 0x3412 &&
+         rd_le32(buf, 0) == 0x78563412U;
 }());
 
 }  // namespace npf::core

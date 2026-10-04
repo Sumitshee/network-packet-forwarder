@@ -8,8 +8,14 @@
 //       Prints the parsed headers of every frame received on one interface.
 //   npf show stats [--pidfile <path>] [--stats-file <path>]
 //       Asks the running `npf run` for its counters, and prints them.
+//   npf replay <in.pcap> <out.pcap> --config <file> [--stats-json <path>]
+//       Runs every frame of in.pcap through the router, as if it had arrived on port 0, and writes
+//       every frame the router sends to out.pcap. No clock is read and no ARP request is ever
+//       answered, so the same input always gives the same output, byte for byte. --stats-json
+//       writes the final counters as JSON.
 //
 // run and dump need CAP_NET_RAW, and show signals a process that has it: in practice, sudo.
+// replay needs nothing.
 
 #include <poll.h>
 #include <sys/signalfd.h>
@@ -37,6 +43,8 @@
 #include <npf/core/time.hpp>
 #include <npf/core/unique_fd.hpp>
 #include <npf/io/af_packet.hpp>
+#include <npf/io/backend.hpp>
+#include <npf/io/pcap_file.hpp>
 #include <npf/pipe/decision.hpp>
 #include <npf/pipe/filter.hpp>
 #include <npf/pipe/forward.hpp>
@@ -75,7 +83,8 @@ using npf::proto::format_mac;
 constexpr std::string_view kUsage =
     "usage: npf run --config <file> [--pidfile <path>] [--stats-file <path>] [--busy-poll]\n"
     "       npf dump --iface <name>\n"
-    "       npf show stats [--pidfile <path>] [--stats-file <path>]\n";
+    "       npf show stats [--pidfile <path>] [--stats-file <path>]\n"
+    "       npf replay <in.pcap> <out.pcap> --config <file> [--stats-json <path>]\n";
 
 constexpr auto kStatsPeriod = std::chrono::seconds{5};
 constexpr int kPollTimeoutMs = 100;  // long enough that an idle router does not spin a core
@@ -106,6 +115,8 @@ struct Options {
   std::filesystem::path stats_file{"/run/npf.stats"};
   std::string iface;
   bool busy_poll{false};
+  std::vector<std::filesystem::path> files;  // replay's: the pcap to read, then the one to write
+  std::filesystem::path stats_json;
 };
 
 struct Flag {
@@ -115,18 +126,35 @@ struct Flag {
 
 // Applies one "--name value" pair. False if the command has no such option.
 bool set_option(Options& o, const Flag& flag) {
-  if (flag.name == "--config" && o.command == "run") {
+  const bool run_or_replay = o.command == "run" || o.command == "replay";
+  const bool run_or_show = o.command == "run" || o.command == "show";
+  if (flag.name == "--config" && run_or_replay) {
     o.config = flag.value;
   } else if (flag.name == "--iface" && o.command == "dump") {
     o.iface = flag.value;
-  } else if (flag.name == "--pidfile" && o.command != "dump") {
+  } else if (flag.name == "--pidfile" && run_or_show) {
     o.pidfile = flag.value;
-  } else if (flag.name == "--stats-file" && o.command != "dump") {
+  } else if (flag.name == "--stats-file" && run_or_show) {
     o.stats_file = flag.value;
+  } else if (flag.name == "--stats-json" && o.command == "replay") {
+    o.stats_json = flag.value;
   } else {
     return false;
   }
   return true;
+}
+
+// What each command cannot do without.
+void require_complete(const Options& o) {
+  if (o.command == "replay" && o.files.size() != 2) {
+    throw UsageError("npf replay takes two files: the pcap to read, and the pcap to write");
+  }
+  if ((o.command == "run" || o.command == "replay") && o.config.empty()) {
+    throw UsageError(std::format("npf {} needs --config <file>", o.command));
+  }
+  if (o.command == "dump" && o.iface.empty()) {
+    throw UsageError("npf dump needs --iface <name>");
+  }
 }
 
 Options parse_args(std::span<char* const> argv) {
@@ -145,23 +173,22 @@ Options parse_args(std::span<char* const> argv) {
       throw UsageError("show what? The only thing to show is: npf show stats");
     }
     i = 2;
-  } else if (o.command != "run" && o.command != "dump") {
+  } else if (o.command != "run" && o.command != "dump" && o.command != "replay") {
     throw UsageError(std::format("unknown command '{}'", o.command));
   }
   for (; i < args.size(); ++i) {
-    const std::string_view flag = args[i];
-    if (flag == "--busy-poll" && o.command == "run") {
+    const std::string_view arg = args[i];
+    if (o.command == "replay" && !arg.starts_with("--")) {
+      o.files.emplace_back(arg);
+    } else if (arg == "--busy-poll" && o.command == "run") {
       o.busy_poll = true;
     } else if (i + 1 == args.size()) {
-      throw UsageError(std::format("{} needs a value", flag));
-    } else if (!set_option(o, {.name = flag, .value = args[++i]})) {
-      throw UsageError(std::format("'{}' is not an option of npf {}", flag, o.command));
+      throw UsageError(std::format("{} needs a value", arg));
+    } else if (!set_option(o, {.name = arg, .value = args[++i]})) {
+      throw UsageError(std::format("'{}' is not an option of npf {}", arg, o.command));
     }
   }
-  if ((o.command == "run" && o.config.empty()) || (o.command == "dump" && o.iface.empty())) {
-    throw UsageError(std::format("npf {} needs {}", o.command,
-                                 o.command == "run" ? "--config <file>" : "--iface <name>"));
-  }
+  require_complete(o);
   return o;
 }
 
@@ -242,38 +269,59 @@ class Pidfile {
 
 // --- statistics ----------------------------------------------------------------------------------
 
-// One "name value" pair per line, so a script can pick out any counter with awk.
-std::string counter_table(const npf::stat::Counters& c, const PacketPool& pool) {
-  std::string out;
-  const auto line = [&out](std::string_view name, std::uint64_t value) {
-    out += std::format("{:<18}{}\n", name, value);
+using CounterList = std::vector<std::pair<std::string, std::uint64_t>>;
+
+// Every counter, by name, in one fixed order: the drop reasons in DropReason's, then only the IP
+// protocols seen, by number.
+CounterList counter_list(const npf::stat::Counters& c, const PacketPool& pool) {
+  CounterList out{
+      {"rx_packets", c.rx_packets},
+      {"rx_bytes", c.rx_bytes},
+      {"tx_packets", c.tx_packets},
+      {"tx_bytes", c.tx_bytes},
+      {"forwarded", c.forwarded},
+      {"flooded", c.flooded},
+      {"to_host", c.to_host},
+      {"arp_requests_rx", c.arp_requests_rx},
+      {"arp_replies_rx", c.arp_replies_rx},
+      {"arp_requests_tx", c.arp_requests_tx},
+      {"arp_replies_tx", c.arp_replies_tx},
+      {"icmp_generated", c.icmp_generated},
   };
-  line("rx_packets", c.rx_packets);
-  line("rx_bytes", c.rx_bytes);
-  line("tx_packets", c.tx_packets);
-  line("tx_bytes", c.tx_bytes);
-  line("forwarded", c.forwarded);
-  line("flooded", c.flooded);
-  line("to_host", c.to_host);
-  line("arp_requests_rx", c.arp_requests_rx);
-  line("arp_replies_rx", c.arp_replies_rx);
-  line("arp_requests_tx", c.arp_requests_tx);
-  line("arp_replies_tx", c.arp_replies_tx);
-  line("icmp_generated", c.icmp_generated);
   for (std::size_t r = 1; r < npf::kDropReasons; ++r) {
     const auto reason = static_cast<DropReason>(r);
-    line(npf::to_string(reason), c.drop(reason));
+    out.emplace_back(npf::to_string(reason), c.drop(reason));
   }
   std::size_t protocol = 0;
   for (const std::uint64_t n : c.by_protocol) {
     if (n != 0) {
-      line(std::format("ip_proto_{}", protocol), n);
+      out.emplace_back(std::format("ip_proto_{}", protocol), n);
     }
     ++protocol;
   }
-  line("pool_available", pool.available());
-  line("pool_capacity", pool.capacity());
+  out.emplace_back("pool_available", pool.available());
+  out.emplace_back("pool_capacity", pool.capacity());
   return out;
+}
+
+// One "name value" pair per line, so a script can pick out any counter with awk.
+std::string counter_table(const npf::stat::Counters& c, const PacketPool& pool) {
+  std::string out;
+  for (const auto& [name, value] : counter_list(c, pool)) {
+    out += std::format("{:<18}{}\n", name, value);
+  }
+  return out;
+}
+
+// The same, as one JSON object: a "name": value pair per line, in the same order.
+std::string counter_json(const npf::stat::Counters& c, const PacketPool& pool) {
+  std::string out = "{";
+  std::string_view separator = "\n";
+  for (const auto& [name, value] : counter_list(c, pool)) {
+    out += std::format("{}  \"{}\": {}", separator, name, value);
+    separator = ",\n";
+  }
+  return out + "\n}\n";
 }
 
 // Written aside and renamed into place, so `npf show stats` never reads half a table.
@@ -382,7 +430,7 @@ class Worker {
  public:
   using Pipeline = npf::pipe::Forwarder<npf::table::LinearLpm>;
 
-  Worker(npf::io::AfPacketBackend& backend, PacketPool& pool, Pipeline& pipeline,
+  Worker(npf::io::IoBackend& backend, PacketPool& pool, Pipeline& pipeline,
          npf::table::ArpCache& arp, ArpCacheEvents& arp_events, npf::stat::Counters& stats,
          std::vector<TxQueue>& requests, std::size_t burst)
       : backend_{&backend},
@@ -514,7 +562,7 @@ class Worker {
     return sent;
   }
 
-  npf::io::AfPacketBackend* backend_;  // all borrowed: run() owns them and outlives the worker
+  npf::io::IoBackend* backend_;  // all borrowed: their owner outlives the worker
   PacketPool* pool_;
   Pipeline* pipeline_;
   npf::table::ArpCache* arp_;
@@ -529,13 +577,17 @@ class Worker {
   std::size_t burst_;
 };
 
-// What this phase can run. The parser accepts more, for the phases that will implement it.
-void require_supported(const npf::core::Config& cfg) {
+// What this phase can run. The parser accepts more, for the phases that will implement it. io is
+// what the command reads and writes through: af_packet for npf run, pcap for npf replay.
+void require_supported(const npf::core::Config& cfg, npf::core::IoKind io) {
   if (cfg.interfaces.empty()) {
     throw std::runtime_error("the configuration has no interfaces");
   }
-  if (cfg.io != npf::core::IoKind::AfPacket) {
-    throw std::runtime_error("only 'io af_packet' is implemented so far");
+  if (cfg.io != io) {
+    throw std::runtime_error(io == npf::core::IoKind::Pcap
+                                 ? "npf replay needs 'io pcap' in the configuration"
+                                 : "npf run needs 'io af_packet': io mmap and io xdp are not "
+                                   "implemented yet, and io pcap is for npf replay");
   }
   if (cfg.fib != npf::core::FibKind::Linear) {
     throw std::runtime_error("only 'fib linear' is implemented so far");
@@ -548,14 +600,55 @@ void require_supported(const npf::core::Config& cfg) {
   }
 }
 
-npf::core::Config load_for_run(const std::filesystem::path& path) {
+npf::core::Config load_config_for(const std::filesystem::path& path, npf::core::IoKind io) {
   npf::core::ParseResult parsed = npf::core::load_config(path);
   if (!parsed.value) {
     throw std::runtime_error(std::format("{}: {}", path.string(), parsed.error));
   }
-  require_supported(*parsed.value);
+  require_supported(*parsed.value, io);
   return std::move(*parsed.value);
 }
+
+// Every interface's MAC as the backend has it: read from the interface for "mac auto", or else the
+// configuration's own.
+void take_macs(const npf::io::IoBackend& backend, npf::core::Config& cfg) {
+  for (npf::core::InterfaceConfig& iface : cfg.interfaces) {
+    iface.mac = backend.ports()[iface.port].mac;
+  }
+}
+
+// The router itself -- its tables, the pipeline, and the worker that drives them -- around the
+// backend and the pool that run() or replay() brings. cfg's interfaces must have their MACs.
+// Members are built in the order declared, each from those above it.
+struct Router {
+  Router(const npf::core::Config& cfg, npf::io::IoBackend& backend, PacketPool& pool)
+      : requests(cfg.interfaces.size()),
+        arp_events(pool, npf::pipe::make_port_table(cfg), requests, stats, kArpCapacity),
+        arp(arp_events, kArpCapacity),
+        macs(kMacCapacity),
+        filter({}, npf::pipe::Action::Allow),
+        pipeline(cfg, fib, arp, macs, filter, stats),
+        worker(backend, pool, pipeline, arp, arp_events, stats, requests, cfg.burst) {
+    for (const npf::table::Route& r : cfg.routes) {
+      if (!fib.add(r)) {
+        throw std::runtime_error("the FIB refused a route the parser accepted");
+      }
+    }
+    for (const npf::core::StaticArp& a : cfg.arp) {
+      arp.insert_static(a.ip, a.mac, a.port);
+    }
+  }
+
+  npf::table::LinearLpm fib;
+  npf::stat::Counters stats;
+  std::vector<TxQueue> requests;
+  ArpCacheEvents arp_events;
+  npf::table::ArpCache arp;
+  npf::table::MacTable macs;
+  npf::pipe::Filter filter;
+  Worker::Pipeline pipeline;
+  Worker worker;
+};
 
 void report(const npf::stat::Counters& stats, const PacketPool& pool,
             const std::filesystem::path& stats_file) {
@@ -613,35 +706,69 @@ void serve(const Options& o, const npf::io::AfPacketBackend& backend, const Pack
 }
 
 int run(const Options& o) {
-  npf::core::Config cfg = load_for_run(o.config);
+  npf::core::Config cfg = load_config_for(o.config, npf::core::IoKind::AfPacket);
   PacketPool pool(cfg.pool_size);
   npf::io::AfPacketBackend backend(cfg.interfaces, pool);
-  for (npf::core::InterfaceConfig& iface : cfg.interfaces) {
-    iface.mac = backend.ports()[iface.port].mac;  // "mac auto" resolved against the interface
+  take_macs(backend, cfg);
+  Router router(cfg, backend, pool);
+
+  serve(o, backend, pool, router.arp, router.stats, router.worker);
+
+  router.arp.flush();  // packets still waiting on ARP are dropped now, and so counted
+  print("npf: stopped; final counters:\n");
+  report(router.stats, pool, o.stats_file);
+  if (backend.rx_oversized() != 0) {
+    npf::core::log_warn("{} frames were too big for a buffer and never reached the pipeline",
+                        backend.rx_oversized());
   }
-  npf::table::LinearLpm fib;
-  for (const npf::table::Route& r : cfg.routes) {
-    if (!fib.add(r)) {
-      throw std::runtime_error("the FIB refused a route the parser accepted");
+  return 0;
+}
+
+// --- npf replay ----------------------------------------------------------------------------------
+
+// A replay's one moment. No clock is read, so the ICMP rate limiter and the ARP cache's timers see
+// no time pass, and the same input always makes the same output.
+constexpr npf::core::Clock::time_point kReplayTime{};
+
+void write_text(const std::filesystem::path& path, const std::string& text) {
+  std::ofstream out(path, std::ios::trunc);
+  out << text;
+  out.close();
+  if (!out) {
+    throw std::runtime_error("cannot write " + path.string());
+  }
+}
+
+int replay(const Options& o) {
+  const std::filesystem::path& in = o.files.at(0);
+  const std::filesystem::path& out = o.files.at(1);
+  npf::core::Config cfg = load_config_for(o.config, npf::core::IoKind::Pcap);
+  PacketPool pool(cfg.pool_size);
+  npf::io::PcapFileBackend backend({.in = in, .out = out}, cfg.interfaces, pool);
+  take_macs(backend, cfg);
+  Router router(cfg, backend, pool);
+
+  while (!backend.done()) {
+    const std::size_t read = backend.records_read();
+    router.worker.run_one_burst(kReplayTime);
+    // Between bursts only the ARP cache holds buffers, and a replay never answers its requests.
+    if (backend.records_read() == read) {
+      throw std::runtime_error(std::format(
+          "all {} packet buffers are waiting on ARP, which a replay never answers, and frames "
+          "are left to read: give the neighbours arp lines, or raise pool_size",
+          cfg.pool_size));
     }
   }
-  npf::stat::Counters stats;
-  std::vector<TxQueue> requests(cfg.interfaces.size());
-  ArpCacheEvents arp_events(pool, npf::pipe::make_port_table(cfg), requests, stats, kArpCapacity);
-  npf::table::ArpCache arp(arp_events, kArpCapacity);
-  for (const npf::core::StaticArp& a : cfg.arp) {
-    arp.insert_static(a.ip, a.mac, a.port);
+  router.arp.flush();  // packets still waiting on ARP are dropped now, and so counted
+  backend.tx_flush();
+  if (!backend.ok()) {
+    throw std::runtime_error("cannot write " + out.string());
   }
-  npf::table::MacTable macs(kMacCapacity);
-  const npf::pipe::Filter filter({}, npf::pipe::Action::Allow);
-  Worker::Pipeline pipeline(cfg, fib, arp, macs, filter, stats);
-  Worker worker(backend, pool, pipeline, arp, arp_events, stats, requests, cfg.burst);
-
-  serve(o, backend, pool, arp, stats, worker);
-
-  arp.flush();  // packets still waiting on ARP are dropped now, so the final counters include them
-  print("npf: stopped; final counters:\n");
-  report(stats, pool, o.stats_file);
+  if (!o.stats_json.empty()) {
+    write_text(o.stats_json, counter_json(router.stats, pool));
+  }
+  npf::core::log_info("replayed {} frames from {}, and wrote {} to {}", backend.records_read(),
+                      in.string(), backend.records_written(), out.string());
   if (backend.rx_oversized() != 0) {
     npf::core::log_warn("{} frames were too big for a buffer and never reached the pipeline",
                         backend.rx_oversized());
@@ -837,6 +964,9 @@ int main(int argc, char** argv) {
     }
     if (o.command == "dump") {
       return dump(o);
+    }
+    if (o.command == "replay") {
+      return replay(o);
     }
     return show(o);
   } catch (const UsageError& e) {

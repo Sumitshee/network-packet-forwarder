@@ -58,6 +58,15 @@ target_link_libraries(test_forward PRIVATE npf_pipe)
 npf_add_unit_test(test_icmp_gen unit/test_icmp_gen.cpp)
 target_link_libraries(test_icmp_gen PRIVATE npf_pipe)
 
+npf_add_unit_test(test_pcap_file unit/test_pcap_file.cpp)
+target_link_libraries(test_pcap_file PRIVATE npf_io)
+
+# The golden-file tests need no root, and so run everywhere, CI included: they run the npf binary
+# itself, `npf replay`, on every case in fixtures/golden.
+npf_add_unit_test(test_golden integration/test_golden.cpp)
+target_compile_definitions(test_golden PRIVATE NPF_BINARY="$<TARGET_FILE:npf>")
+add_dependencies(test_golden npf)
+
 # Integration tests that need root. Run by anyone else, each exits 77, which CTest reports as
 # skipped rather than failed -- so in CI they are skipped.
 foreach(name forward_netns traceroute arp_resolution)
