@@ -31,7 +31,8 @@ with the RFC 1624 incremental update; and the configuration file parser. Longest
 four ways: a deliberately simple linear table, the oracle, and a binary trie, a Patricia trie and
 DIR-24-8, each held to the oracle on a thousand adversarial random tables. `bench_lpm` times them on
 a full Internet routing table, a RouteViews snapshot of 1.13 million prefixes, which
-`scripts/fetch_bgp_table.sh` downloads. The router itself still uses the linear table.
+`scripts/fetch_bgp_table.sh` downloads; [`docs/performance.md`](docs/performance.md) has the
+results, and what they do not measure. The router itself still uses the linear table.
 
 ## How a frame is handled
 
