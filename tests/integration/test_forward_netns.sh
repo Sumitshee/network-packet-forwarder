@@ -86,8 +86,9 @@ expect_loss() { # expect_loss <assertion> <ping output file> <loss>
   fi
 }
 
-# Phase 6's ARP cache drops the packet that starts a resolution (phase 8 queues it instead), so
-# the first pings each way are lost until both hosts are resolved.
+# Both hosts resolved before the checks begin. Since phase 8 the first ping does it, its packets
+# waiting while the router asks; phase 6's ARP cache dropped the packet that started a resolution,
+# so it took a few.
 echo
 echo "--- warm-up"
 warm=0

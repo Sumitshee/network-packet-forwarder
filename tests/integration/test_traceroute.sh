@@ -62,8 +62,9 @@ if ! grep -q 'forwarding on' "$WORK/npf.log"; then
   exit 1
 fi
 
-# The ARP cache drops the packet that starts a resolution until phase 8 queues it, so a probe
-# sent before both hosts are resolved would be lost. Resolve them first.
+# Both hosts resolved before the trace begins, so that no probe waits on ARP. Since phase 8 the
+# first ping does it; before, the ARP cache dropped the packet that started a resolution, and a
+# probe sent then was lost.
 echo
 echo "--- warm-up"
 warm=0

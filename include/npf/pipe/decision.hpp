@@ -13,6 +13,8 @@ enum class Verdict : std::uint8_t {
   Flood,    // L2: transmit on every port in the bridge domain except in_port
   ToHost,   // addressed to this router itself (ICMP echo, ARP request for us)
   Drop,     // drop_reason is set
+  Queued,   // held by the ARP cache until the next hop resolves; out_port is set. The cache owns
+            // the packet now: the caller must neither transmit nor release it.
 };
 
 enum class DropReason : std::uint8_t {
@@ -40,7 +42,8 @@ inline constexpr std::size_t kDropReasons = static_cast<std::size_t>(DropReason:
 // Result of processing one packet. Fits in 4 bytes; returned by value.
 //
 // Invariant: every packet leaving the pipeline produces exactly one Decision, and a Drop always
-// carries a reason other than None. Forwarder::process() asserts it in debug builds.
+// carries a reason other than None. Forwarder::process() asserts it in debug builds. A Queued
+// packet has not left yet: it is counted when the ARP cache lets go of it, sent or dropped.
 struct Decision {
   Verdict verdict{Verdict::Drop};
   DropReason reason{DropReason::None};

@@ -40,7 +40,7 @@ namespace npf {
 
 // Found by argument-dependent lookup, so GoogleTest prints names instead of numbers.
 void PrintTo(Verdict v, std::ostream* os) {
-  constexpr std::array<const char*, 4> kNames{"Forward", "Flood", "ToHost", "Drop"};
+  constexpr std::array<const char*, 5> kNames{"Forward", "Flood", "ToHost", "Drop", "Queued"};
   *os << kNames.at(static_cast<std::size_t>(v));
 }
 
@@ -210,16 +210,23 @@ Config topology() {
   return c;
 }
 
+// Every packet in these tests is the fixture's, held until the test ends, so when the ARP cache
+// lets go of one, that is only written down.
 class RecordingEvents final : public npf::table::ArpEvents {
  public:
-  RecordingEvents() { requests.reserve(16); }  // so that asking never allocates in a test
+  RecordingEvents() {  // so that recording never allocates in a test
+    requests.reserve(16);
+    unresolved_heads.reserve(16);
+    discarded.reserve(16);
+  }
   void send_arp_request(std::uint32_t target_ip, std::uint16_t out_port) override {
     requests.emplace_back(target_ip, out_port);
   }
-  void unresolved(Packet* /*p*/) override {
-    ADD_FAILURE() << "the phase 6 ARP cache never gives up on a packet";
-  }
+  void unresolved(Packet* p) override { unresolved_heads.push_back(p); }
+  void discard(Packet* p) override { discarded.push_back(p); }
   std::vector<Request> requests;
+  std::vector<Packet*> unresolved_heads;
+  std::vector<Packet*> discarded;
 };
 
 class ForwarderTest : public ::testing::Test {
@@ -229,9 +236,11 @@ class ForwarderTest : public ::testing::Test {
     EXPECT_TRUE(fib_.add({{ip4(10, 0, 2, 0), 24}, 0, 1}));
     EXPECT_TRUE(fib_.add({{ip4(172, 16, 0, 0), 16}, kGateway, 1}));
     arp_.insert_static(kServer, kServerMac, 1);
+    arp_.tick(kNow);
   }
 
   ~ForwarderTest() override {
+    arp_.flush();  // what it still holds is in held_ too
     for (Packet* p : held_) {
       pool_.release(p);
     }
@@ -276,6 +285,22 @@ class ForwarderTest : public ::testing::Test {
       held_.push_back(error);
     }
     return error;
+  }
+
+  // host_unreachable(), the same way.
+  Packet* host_unreachable(Packet* p) {
+    Packet* error = fwd_.host_unreachable(*p, pool_, kNow);
+    if (error != nullptr) {
+      held_.push_back(error);
+    }
+    return error;
+  }
+
+  // Lets the ARP cache's clock run until it has given up on every neighbour it is asking for.
+  void wait_out_arp() {
+    for (std::uint8_t s = 1; s <= npf::table::kArpMaxProbes; ++s) {
+      arp_.tick(kNow + std::chrono::seconds{s});
+    }
   }
 
   // Packets the pipeline has counted itself: each Drop or ToHost adds exactly one, a Forward none.
@@ -382,21 +407,38 @@ TEST_F(ForwarderTest, Step11NoRoute) {
   expect_drop(process(ping({.dst = kNowhere})), DropReason::NoRoute);
 }
 
-TEST_F(ForwarderTest, Step12UnresolvedNeighbourIsAskedForThenDropped) {
+TEST_F(ForwarderTest, Step12AnUnresolvedNeighbourIsAskedForWhileThePacketWaits) {
   const Frame f = ping({.dst = ip4(10, 0, 2, 3)});
-  expect_drop(process(f), DropReason::ArpUnresolved);
+  const Decision d = process(f);
+  EXPECT_EQ(d.verdict, Verdict::Queued);
+  EXPECT_EQ(d.reason, DropReason::None);
+  EXPECT_EQ(d.out_port, 1);
   ASSERT_EQ(events_.requests.size(), 1U);
   EXPECT_EQ(events_.requests[0], (Request{ip4(10, 0, 2, 3), 1}));
-  // Once a second, not once a packet.
-  expect_drop(process(f), DropReason::ArpUnresolved);
+  // Two more wait with it, asking nothing: the cache repeats its question once a second.
+  EXPECT_EQ(process(f).verdict, Verdict::Queued);
+  EXPECT_EQ(process(f).verdict, Verdict::Queued);
   EXPECT_EQ(events_.requests.size(), 1U);
-  arp_.tick(std::chrono::steady_clock::time_point{} + npf::table::kArpProbeInterval);
-  expect_drop(process(f), DropReason::ArpUnresolved);
+  arp_.tick(kNow + npf::table::kArpProbeInterval);
   EXPECT_EQ(events_.requests.size(), 2U);
+  EXPECT_EQ(counted(), 0U);  // a queued packet is counted once the cache lets go of it
+}
+
+TEST_F(ForwarderTest, Step12AFullQueueDropsThePacketWithoutAnError) {
+  const Frame f = ping({.dst = ip4(10, 0, 2, 3)});
+  for (std::size_t i = 0; i < npf::table::kArpQueueDepth; ++i) {
+    ASSERT_EQ(process(f).verdict, Verdict::Queued);
+  }
+  Packet* p = packet(f);
+  const Decision d = fwd_.process(*p);
+  expect_drop(d, DropReason::ArpUnresolved);
+  EXPECT_EQ(stats_.drop(DropReason::ArpUnresolved), 1U);
+  // The neighbour may answer yet, so this is no reason to tell the sender it is unreachable.
+  EXPECT_EQ(error_for(p, d.reason), nullptr);
 }
 
 TEST_F(ForwarderTest, Step12ARouteViaAGatewayAsksForTheGateway) {
-  expect_drop(process(ping({.dst = ip4(172, 16, 5, 5)})), DropReason::ArpUnresolved);
+  EXPECT_EQ(process(ping({.dst = ip4(172, 16, 5, 5)})).verdict, Verdict::Queued);
   ASSERT_EQ(events_.requests.size(), 1U);
   EXPECT_EQ(events_.requests[0], (Request{kGateway, 1}));
 }
@@ -469,18 +511,18 @@ TEST_F(ForwarderTest, EveryPacketIsCountedExactlyOnce) {
       {ping(), 0},
       {ping({.src = ip4(10, 0, 3, 9), .eth_dst = kStrangerMac}), 2},
   };
-  std::size_t forwards = 0;
+  std::size_t not_yet = 0;  // forwarded or queued: counted by whoever sends or drops them
   for (const auto& [frame, port] : frames) {
     const std::uint64_t before = counted();
     const Decision d = process(frame, port);
-    if (d.verdict == Verdict::Forward) {
-      ++forwards;
+    if (d.verdict == Verdict::Forward || d.verdict == Verdict::Queued) {
+      ++not_yet;
       EXPECT_EQ(counted(), before);
     } else {
       EXPECT_EQ(counted(), before + 1);
     }
   }
-  EXPECT_EQ(counted() + forwards, frames.size());
+  EXPECT_EQ(counted() + not_yet, frames.size());
   EXPECT_EQ(stats_.drop(DropReason::None), 0U);
 }
 
@@ -533,11 +575,24 @@ TEST_F(ForwarderTest, EachPortAnswersOnlyForItsOwnAddress) {
   }
 }
 
-TEST_F(ForwarderTest, ArpReplyCompletesTheEntryTheCacheAskedFor) {
+// An ARP reply from a neighbour of port 1's, to the router.
+Frame reply_on_port1(std::uint32_t spa, MacAddr sha) {
+  return arp({.oper = ArpView::kOpReply,
+              .eth_dst = kPort1Mac,
+              .sha = sha,
+              .spa = spa,
+              .tha = kPort1Mac,
+              .tpa = kPort1Ip});
+}
+
+TEST_F(ForwarderTest, ArpReplyReleasesThePacketThatWaitedForIt) {
   // The server answering the client: the router does not know the client's MAC yet.
   const Frame back =
       ethernet(kPort1Mac, kServerMac, kEtherTypeIpv4, ipv4(kServer, kClient, 64, echo_request()));
-  expect_drop(process(back, 1), DropReason::ArpUnresolved);
+  Packet* waiting = packet(back, 1);
+  const Decision d = fwd_.process(*waiting);
+  ASSERT_EQ(d.verdict, Verdict::Queued);
+  EXPECT_EQ(d.out_port, 0);
   ASSERT_EQ(events_.requests.size(), 1U);
   EXPECT_EQ(events_.requests[0], (Request{kClient, 0}));
 
@@ -546,12 +601,78 @@ TEST_F(ForwarderTest, ArpReplyCompletesTheEntryTheCacheAskedFor) {
   ASSERT_EQ(fwd_.process(*reply).verdict, Verdict::ToHost);
   EXPECT_FALSE(answer(reply).has_value());
   EXPECT_EQ(stats_.arp_replies_rx, 1U);
+  ASSERT_EQ(fwd_.released().size(), 1U);
+  EXPECT_EQ(fwd_.released()[0].packet, waiting);
+  EXPECT_EQ(fwd_.released()[0].port, 0);
+  // Steps 13 and 14, now: the client's MAC, port 0's, one hop less to live.
+  const std::optional<EthView> eth = EthView::parse(std::as_const(*waiting).data());
+  ASSERT_TRUE(eth.has_value());
+  EXPECT_EQ(eth->dst(), kClientMac);
+  EXPECT_EQ(eth->src(), kPort0Mac);
+  const std::optional<Ipv4View> ip = Ipv4View::parse(eth->payload());
+  ASSERT_TRUE(ip.has_value());
+  EXPECT_EQ(ip->ttl(), 63);
+  EXPECT_TRUE(npf::proto::ipv4_checksum_valid(ip->header()));
+  EXPECT_EQ(waiting->l3_offset(), 14);
 
+  // The next packet goes straight through.
   Packet* p = packet(back, 1);
-  const Decision d = fwd_.process(*p);
-  ASSERT_EQ(d.verdict, Verdict::Forward);
-  EXPECT_EQ(d.out_port, 0);
+  const Decision next = fwd_.process(*p);
+  ASSERT_EQ(next.verdict, Verdict::Forward);
+  EXPECT_EQ(next.out_port, 0);
   EXPECT_EQ(EthView::parse(std::as_const(*p).data())->dst(), kClientMac);
+}
+
+TEST_F(ForwarderTest, TheWaitingPacketsLeaveInTheOrderTheyCame) {
+  std::array<Packet*, npf::table::kArpQueueDepth> waiting{};
+  std::uint8_t ttl = 10;  // tells them apart
+  for (Packet*& p : waiting) {
+    p = packet(ping({.dst = ip4(10, 0, 2, 3), .ttl = ttl++}));
+    ASSERT_EQ(fwd_.process(*p).verdict, Verdict::Queued);
+  }
+  Packet* reply = packet(reply_on_port1(ip4(10, 0, 2, 3), kStrangerMac), 1);
+  ASSERT_EQ(fwd_.process(*reply).verdict, Verdict::ToHost);
+  EXPECT_FALSE(answer(reply).has_value());
+  const std::span<const Reply> released = fwd_.released();
+  ASSERT_EQ(released.size(), waiting.size());
+  for (std::size_t i = 0; i < waiting.size(); ++i) {
+    EXPECT_EQ(released[i].packet, waiting.at(i));
+    EXPECT_EQ(released[i].port, 1);
+    const std::optional<Ipv4View> ip =
+        Ipv4View::parse(EthView::parse(std::as_const(*waiting.at(i)).data())->payload());
+    ASSERT_TRUE(ip.has_value());
+    EXPECT_EQ(ip->ttl(), static_cast<std::uint8_t>(9 + i));
+  }
+}
+
+// The cache is keyed by address alone. Were an answer taken from any port, a station on another
+// segment could answer for a neighbour, and steer its traffic.
+TEST_F(ForwarderTest, AnArpAnswerCountsOnlyFromThePortTheCacheAskedOn) {
+  const std::uint32_t neighbour = ip4(10, 0, 2, 3);  // asked for on port 1
+  Packet* waiting = packet(ping({.dst = neighbour}));
+  ASSERT_EQ(fwd_.process(*waiting).verdict, Verdict::Queued);
+  const std::array<Frame, 2> from_port0{
+      arp({.oper = ArpView::kOpReply,
+           .eth_dst = kPort0Mac,
+           .sha = kStrangerMac,
+           .spa = neighbour,
+           .tha = kPort0Mac,
+           .tpa = kPort0Ip}),
+      arp({.sha = kStrangerMac, .spa = neighbour, .tpa = neighbour}),  // an announcement
+  };
+  for (const Frame& f : from_port0) {
+    Packet* p = packet(f, 0);
+    ASSERT_EQ(fwd_.process(*p).verdict, Verdict::ToHost);
+    EXPECT_FALSE(answer(p).has_value());
+    EXPECT_TRUE(fwd_.released().empty());
+  }
+  EXPECT_EQ(arp_.peek(neighbour)->state, npf::table::ArpState::Incomplete);
+
+  Packet* real = packet(reply_on_port1(neighbour, kServerMac), 1);
+  ASSERT_EQ(fwd_.process(*real).verdict, Verdict::ToHost);
+  EXPECT_FALSE(answer(real).has_value());
+  ASSERT_EQ(fwd_.released().size(), 1U);
+  EXPECT_EQ(EthView::parse(std::as_const(*waiting).data())->dst(), kServerMac);
 }
 
 TEST_F(ForwarderTest, ArpReplyNobodyAskedForIsIgnored) {
@@ -565,26 +686,29 @@ TEST_F(ForwarderTest, ArpReplyNobodyAskedForIsIgnored) {
   ASSERT_EQ(fwd_.process(*reply).verdict, Verdict::ToHost);
   EXPECT_FALSE(answer(reply).has_value());
   EXPECT_EQ(arp_.size(), 1U);  // the static entry for the server, and nothing else
-  expect_drop(process(ping({.dst = ip4(10, 0, 1, 99)})), DropReason::ArpUnresolved);
+  EXPECT_EQ(process(ping({.dst = ip4(10, 0, 1, 99)})).verdict, Verdict::Queued);  // still asks
 }
 
 TEST_F(ForwarderTest, GratuitousArpRefreshesButNeverCreates) {
-  const auto gratuitous = [this](MacAddr sha, std::uint32_t addr) {
-    Packet* p = packet(arp({.sha = sha, .spa = addr, .tpa = addr}));
+  const auto gratuitous = [this](MacAddr sha, std::uint32_t addr, std::uint16_t in_port) {
+    Packet* p = packet(arp({.sha = sha, .spa = addr, .tpa = addr}), in_port);
     ASSERT_EQ(fwd_.process(*p).verdict, Verdict::ToHost);
     EXPECT_FALSE(answer(p).has_value());
   };
-  gratuitous(kStrangerMac, ip4(10, 0, 1, 77));  // unknown: not created
+  gratuitous(kStrangerMac, ip4(10, 0, 1, 77), 0);  // unknown: not created
   EXPECT_EQ(arp_.size(), 1U);
-  gratuitous(kStrangerMac, kServer);  // static: not overwritten
+  gratuitous(kStrangerMac, kServer, 1);  // static: not overwritten
   EXPECT_EQ(arp_.lookup(kServer), kServerMac);
 
-  expect_drop(process(ping({.dst = kClient})), DropReason::ArpUnresolved);  // now the cache asks...
-  gratuitous(kClientMac, kClient);  // ...and an announcement may complete what it asked for
+  Packet* waiting = packet(ping({.dst = kClient}));
+  ASSERT_EQ(fwd_.process(*waiting).verdict, Verdict::Queued);  // now the cache asks...
+  gratuitous(kClientMac, kClient, 0);  // ...and an announcement answers, freeing what waited
+  ASSERT_EQ(fwd_.released().size(), 1U);
+  EXPECT_EQ(fwd_.released()[0].packet, waiting);
   EXPECT_EQ(arp_.lookup(kClient), kClientMac);
+  gratuitous(kStrangerMac, kClient, 0);  // once known, an announcement refreshes it
+  EXPECT_EQ(arp_.lookup(kClient), kStrangerMac);
 }
-
-// --- the rules every datapath function lives by --------------------------------------------------
 
 // --- ICMP: what the router says back -------------------------------------------------------------
 
@@ -663,7 +787,6 @@ TEST_F(ForwarderTest, OtherDropsEarnNoError) {
       {bad_sum, DropReason::BadChecksum},
       {ping({.src = ip4(127, 0, 0, 1)}), DropReason::MartianSource},
       {ping({.eth_dst = kStrangerMac}), DropReason::UnknownDestPort},
-      {ping({.dst = ip4(10, 0, 2, 3)}), DropReason::ArpUnresolved},  // Host Unreachable: phase 8
   };
   for (const auto& [frame, reason] : cases) {
     Packet* p = packet(frame);
@@ -688,6 +811,43 @@ TEST_F(ForwarderTest, NoErrorWhereRfc1812ForbidsOne) {
     EXPECT_EQ(error_for(p, d.reason), nullptr);
   }
   EXPECT_EQ(stats_.icmp_generated, 0U);
+}
+
+TEST_F(ForwarderTest, ANeighbourThatNeverAnswersEarnsHostUnreachable) {
+  Packet* p = packet(ping({.dst = ip4(10, 0, 2, 3)}));
+  ASSERT_EQ(fwd_.process(*p).verdict, Verdict::Queued);
+  wait_out_arp();
+  ASSERT_EQ(events_.unresolved_heads, std::vector<Packet*>{p});
+  Packet* error = host_unreachable(p);
+  ASSERT_NE(error, nullptr);
+  const std::optional<IcmpFrame> m = parse_icmp(*error);
+  ASSERT_TRUE(m.has_value());
+  EXPECT_EQ(m->icmp.type(), npf::proto::kIcmpDestUnreachable);
+  EXPECT_EQ(m->icmp.code(), 1);
+  EXPECT_EQ(m->ip.src(), kPort0Ip);  // from the port the packet came in on, back out of it
+  EXPECT_EQ(m->ip.dst(), kClient);
+  EXPECT_EQ(m->eth.src(), kPort0Mac);
+  EXPECT_EQ(m->eth.dst(), kClientMac);
+  // The original as it arrived: a queued packet is rewritten only once its neighbour answers.
+  const std::optional<Ipv4View> orig =
+      Ipv4View::parse(EthView::parse(std::as_const(*p).data())->payload());
+  ASSERT_TRUE(orig.has_value());
+  EXPECT_EQ(orig->ttl(), 64);
+  EXPECT_TRUE(std::ranges::equal(m->icmp.payload().first(20), orig->header()));
+  EXPECT_EQ(stats_.icmp_generated, 1U);
+}
+
+// RFC 1812 §4.3.2.7: no error for a packet to a broadcast address. No host answers ARP for a
+// subnet's broadcast address, so the cache always gives up on one.
+TEST_F(ForwarderTest, NoHostUnreachableForTheBroadcastAddressOfAnAttachedSubnet) {
+  Packet* broadcast = packet(ping({.dst = ip4(10, 0, 2, 255)}));
+  ASSERT_EQ(fwd_.process(*broadcast).verdict, Verdict::Queued);
+  Packet* host = packet(ping({.dst = ip4(10, 0, 2, 254)}));
+  ASSERT_EQ(fwd_.process(*host).verdict, Verdict::Queued);
+  wait_out_arp();
+  ASSERT_EQ(events_.unresolved_heads.size(), 2U);
+  EXPECT_EQ(host_unreachable(broadcast), nullptr);
+  EXPECT_NE(host_unreachable(host), nullptr);
 }
 
 TEST_F(ForwarderTest, ErrorsAreLimitedToAHundredASecond) {
@@ -837,20 +997,26 @@ TEST_F(ForwarderTest, ProcessBurstAndTheControlPlaneNeverAllocate) {
       packet(ping()),                           // forwarded
       packet(ping({.ttl = 1})),                 // expired: earns a Time Exceeded
       packet(ping({.dst = kNowhere})),          // no route: earns a Net Unreachable
-      packet(ping({.dst = ip4(10, 0, 2, 3)})),  // ARP miss: a request goes out
+      packet(ping({.dst = ip4(10, 0, 2, 3)})),  // ARP miss: queued, and a request goes out
       packet(arp()),                            // to the host, answered in place
       packet(ping({.dst = kPort0Ip})),          // to the host, answered with an Echo Reply
+      packet(ping({.dst = ip4(10, 0, 2, 4)})),  // ARP miss, never answered: Host Unreachable
+      packet(reply_on_port1(ip4(10, 0, 2, 3), kStrangerMac), 1),  // frees the first miss
   };
-  std::array<Decision, 6> out{};
+  std::array<Decision, 8> out{};
   AllocCounter::reset();
   fwd_.process_burst(burst.data(), burst.size(), out.data());
   Packet* time_exceeded = fwd_.error_for(*burst[1], out[1].reason, pool_, kNow);
   Packet* net_unreachable = fwd_.error_for(*burst[2], out[2].reason, pool_, kNow);
   const std::optional<Reply> arp_reply = fwd_.deliver_to_host(*burst[4], pool_, kNow);
   const std::optional<Reply> echo_reply = fwd_.deliver_to_host(*burst[5], pool_, kNow);
+  const std::optional<Reply> no_answer = fwd_.deliver_to_host(*burst[7], pool_, kNow);
+  const std::span<const Reply> freed = fwd_.released();
+  wait_out_arp();
+  Packet* host_unreachable = fwd_.host_unreachable(*burst[6], pool_, kNow);
   EXPECT_EQ(AllocCounter::allocations(), 0U);
   EXPECT_EQ(AllocCounter::deallocations(), 0U);
-  for (Packet* made : {time_exceeded, net_unreachable,
+  for (Packet* made : {time_exceeded, net_unreachable, host_unreachable,
                        echo_reply ? echo_reply->packet : static_cast<Packet*>(nullptr)}) {
     EXPECT_NE(made, nullptr);
     if (made != nullptr) {
@@ -861,12 +1027,19 @@ TEST_F(ForwarderTest, ProcessBurstAndTheControlPlaneNeverAllocate) {
   EXPECT_EQ(out[0].verdict, Verdict::Forward);
   EXPECT_EQ(out[1].reason, DropReason::TtlExpired);
   EXPECT_EQ(out[2].reason, DropReason::NoRoute);
-  EXPECT_EQ(out[3].reason, DropReason::ArpUnresolved);
+  EXPECT_EQ(out[3].verdict, Verdict::Queued);
   EXPECT_EQ(out[4].verdict, Verdict::ToHost);
   EXPECT_EQ(out[5].verdict, Verdict::ToHost);
+  EXPECT_EQ(out[6].verdict, Verdict::Queued);
+  EXPECT_EQ(out[7].verdict, Verdict::ToHost);
   ASSERT_TRUE(arp_reply.has_value());
   EXPECT_EQ(arp_reply->packet, burst[4]);
-  EXPECT_EQ(events_.requests.size(), 1U);
+  EXPECT_FALSE(no_answer.has_value());
+  ASSERT_EQ(freed.size(), 1U);
+  EXPECT_EQ(freed[0].packet, burst[3]);
+  EXPECT_EQ(events_.unresolved_heads, std::vector<Packet*>{burst[6]});
+  // One request each, and two more for the neighbour that never answered.
+  EXPECT_EQ(events_.requests.size(), 4U);
 
   // Those zeros mean something only if this binary counts allocations at all.
   AllocCounter::reset();
@@ -886,6 +1059,21 @@ TEST(PortTable, NeedsPortIdsFromZeroAndEveryMac) {
   unresolved.interfaces[1].mac.reset();
   EXPECT_THROW((void)npf::pipe::make_port_table(unresolved), std::invalid_argument);
   EXPECT_EQ(npf::pipe::make_port_table(topology()).size(), 3U);
+}
+
+TEST(PortTable, ADirectedBroadcastIsAllOnesInTheHostPartOfAnAttachedSubnet) {
+  Config c = topology();
+  c.interfaces.push_back({"p2p", 3, ip4(192, 0, 2, 0), 31, PortMode::Routed, kPort0Mac});
+  c.interfaces.push_back({"host", 4, ip4(198, 51, 100, 7), 32, PortMode::Routed, kPort0Mac});
+  const std::vector<npf::pipe::PortState> ports = npf::pipe::make_port_table(c);
+  using npf::pipe::is_directed_broadcast;
+  EXPECT_TRUE(is_directed_broadcast(ports, ip4(10, 0, 1, 255)));
+  EXPECT_TRUE(is_directed_broadcast(ports, ip4(10, 0, 3, 255)));  // a bridged port's subnet too
+  EXPECT_FALSE(is_directed_broadcast(ports, ip4(10, 0, 1, 254)));
+  EXPECT_FALSE(is_directed_broadcast(ports, ip4(10, 0, 9, 255)));    // not attached
+  EXPECT_FALSE(is_directed_broadcast(ports, ip4(192, 0, 2, 1)));     // a /31 has none (RFC 3021)
+  EXPECT_FALSE(is_directed_broadcast(ports, ip4(198, 51, 100, 7)));  // nor has a /32
+  EXPECT_FALSE(is_directed_broadcast(ports, npf::pipe::kLimitedBroadcast));  // not a subnet's
 }
 
 TEST(Filter, TheStubRefusesRulesRatherThanIgnoreThem) {

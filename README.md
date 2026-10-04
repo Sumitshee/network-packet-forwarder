@@ -4,17 +4,20 @@ A userspace Layer-2/Layer-3 packet forwarding engine — a software router — w
 Linux. It receives raw Ethernet frames from network interfaces, parses them, makes forwarding
 decisions, rewrites headers and transmits them out of the correct interface.
 
-**Status: phase 7 of 19.** `npf` routes IPv4 between Linux interfaces. It has one AF_PACKET socket
+**Status: phase 8 of 19.** `npf` routes IPv4 between Linux interfaces. It has one AF_PACKET socket
 per port and runs every packet through a fixed fourteen-step pipeline: parse, validate, route,
 resolve the next hop, rewrite the MAC addresses, decrement the TTL and patch the checksum. Every
-packet it drops is counted under a reason. It answers like a router: ICMP Time Exceeded when a
-packet's TTL runs out, so `traceroute` works through it; Destination Unreachable when there is no
-route; and echo replies when it is pinged itself. Integration tests run it between three network
-namespaces: pings cross it with their TTL decremented exactly once, traceroute shows it as the
-first hop, no buffer leaks, and every packet received is accounted for as forwarded, delivered to
-the router itself, or dropped. [`docs/rfc1812-conformance.md`](docs/rfc1812-conformance.md) lists
-which requirements of RFC 1812, *Requirements for IP Version 4 Routers*, it meets and which it
-does not yet.
+packet it drops is counted under a reason. It resolves its neighbours with ARP itself: a packet
+for a neighbour it has not resolved yet waits, up to three per neighbour, while it asks, and goes
+out when the answer comes; entries age, and are checked again before they are trusted for long.
+It answers like a router: ICMP Time Exceeded when a packet's TTL runs out, so `traceroute` works
+through it; Destination Unreachable when there is no route, or when a neighbour never answers ARP;
+and echo replies when it is pinged itself. Integration tests run it between three network
+namespaces: the first ping through a router that knows no one gets its answer, pings cross it with
+their TTL decremented exactly once, traceroute shows it as the first hop, no buffer leaks, and
+every packet received is accounted for as forwarded, delivered to the router itself, or dropped.
+[`docs/rfc1812-conformance.md`](docs/rfc1812-conformance.md) lists which requirements of RFC 1812,
+*Requirements for IP Version 4 Routers*, it meets and which it does not yet.
 
 Underneath are a zero-allocation packet buffer pool; bounds-checked, fuzz-tested parsers for
 Ethernet, ARP, IPv4 and the TCP, UDP and ICMP headers; the Internet checksum with the RFC 1624
@@ -72,7 +75,8 @@ sudo ./scripts/cleanup_netns.sh
 ```
 
 `npf run` prints a stats line every 5 seconds. `npf show stats` signals it (`SIGUSR1`) to write out
-every counter, and Ctrl-C stops it and prints them one last time.
+every counter, and Ctrl-C stops it and prints them one last time. `SIGUSR2` empties its ARP cache
+of everything but the static entries, which is how a test starts it from cold.
 `npf dump --iface <name>` prints the parsed headers of every frame an interface receives.
 
 The integration tests set all of this up, make their checks and tear it down again:
@@ -85,19 +89,25 @@ sudo tests/integration/test_forward_netns.sh build/dev/npf
 sudo tests/integration/test_traceroute.sh build/dev/npf
 ```
 
+```bash
+sudo tests/integration/test_arp_resolution.sh build/dev/npf
+```
+
 ## Not implemented
 
-- **Some of ICMP.** No Host Unreachable when a neighbour never answers ARP (phase 8), and no
-  Redirect, Parameter Problem or Fragmentation Needed. ICMP errors quote the original header and
-  8 bytes of its data, not as much as fits in 576 bytes. A ping that arrives fragmented goes
-  unanswered.
+- **Some of ICMP.** No Redirect, Parameter Problem or Fragmentation Needed. ICMP errors quote the
+  original header and 8 bytes of its data, not as much as fits in 576 bytes. A ping that arrives
+  fragmented goes unanswered.
 - **Some of RFC 1812.** Besides the above: IP options are passed through but never interpreted;
   packets are never fragmented or reassembled; and a packet to a martian destination such as
   127.0.0.1 is routed if a route, a default route say, covers it. The full list is in
   [`docs/rfc1812-conformance.md`](docs/rfc1812-conformance.md).
-- **Queueing during ARP resolution.** The packet that starts a resolution is dropped, not queued,
-  so the first packet to a neighbour the router has not resolved yet is lost. Entries never expire,
-  and a request is only repeated when more traffic for the neighbour arrives (phase 8).
+- **Some of ARP.** Its timers are fixed: an entry is checked again after 30 s, deleted after 60 s
+  unused, and given up on after three requests a second apart. When three packets already wait on
+  a neighbour, the next one is dropped, not the oldest. The router learns a neighbour's address
+  from its replies and announcements, never from its requests, and creates an entry only for a
+  neighbour it has asked about itself. Requests are always broadcast, even when checking an entry
+  it already has. One cache serves every port, searched entry by entry. No proxy ARP.
 - **Packet filtering.** There are no filter rules; everything that can be routed is (phase 11).
 - **Switching.** Bridged ports drop transit frames (phase 12).
 - **Threads.** One worker forwards everything (phase 13).

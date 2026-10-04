@@ -40,7 +40,8 @@ std::vector<PortState> make_port_table(const core::Config& cfg) {
           iface.name));
     }
     seen[iface.port] = true;
-    ports[iface.port] = PortState{.mac = *iface.mac, .ip = iface.ip, .mode = iface.mode};
+    ports[iface.port] = PortState{
+        .mac = *iface.mac, .ip = iface.ip, .prefix_len = iface.prefix_len, .mode = iface.mode};
   }
   return ports;
 }
@@ -52,12 +53,13 @@ ControlPlane::ControlPlane(const core::Config& cfg, table::ArpCache& arp, stat::
 
 std::optional<Reply> ControlPlane::deliver_to_host(core::Packet& p, core::PacketPool& pool,
                                                    core::Clock::time_point now) noexcept {
+  n_released_ = 0;
   const std::optional<proto::EthView> eth = proto::EthView::parse(p.data());
   if (!eth || p.in_port() >= ports_.size()) {
     return std::nullopt;
   }
   if (eth->ethertype() == proto::kEtherTypeArp) {
-    return answer_arp(p, *eth);
+    return answer_arp(p, *eth, pool);
   }
   const std::optional<proto::Ipv4View> ip = proto::Ipv4View::parse(eth->payload());
   if (!ip || !is_router_address(ports_, ip->dst())) {
@@ -97,7 +99,9 @@ core::Packet* ControlPlane::error_for(const core::Packet& p, DropReason reason,
       err = IcmpError::NetUnreachable;
       break;
     default:
-      return nullptr;  // TODO(phase-8): Host Unreachable, once the ARP cache gives up on a host
+      // ArpUnresolved among them: a full queue says nothing about whether the neighbour is there.
+      // A neighbour that never answers earns its Host Unreachable from host_unreachable().
+      return nullptr;
   }
   // Steps 1 to 8 passed before either of those drops, so both headers parse again.
   const std::optional<proto::EthView> eth = proto::EthView::parse(p.data());
@@ -106,6 +110,20 @@ core::Packet* ControlPlane::error_for(const core::Packet& p, DropReason reason,
   }
   const std::optional<proto::Ipv4View> ip = proto::Ipv4View::parse(eth->payload());
   return ip ? make_error(p, *eth, *ip, err, pool, now) : nullptr;
+}
+
+core::Packet* ControlPlane::host_unreachable(const core::Packet& p, core::PacketPool& pool,
+                                             core::Clock::time_point now) noexcept {
+  // A queued packet passed steps 1 to 12 and was left untouched, so both headers parse again.
+  const std::optional<proto::EthView> eth = proto::EthView::parse(p.data());
+  if (!eth || p.in_port() >= ports_.size()) {
+    return nullptr;
+  }
+  const std::optional<proto::Ipv4View> ip = proto::Ipv4View::parse(eth->payload());
+  if (!ip || is_directed_broadcast(ports_, ip->dst())) {
+    return nullptr;
+  }
+  return make_error(p, *eth, *ip, IcmpError::HostUnreachable, pool, now);
 }
 
 core::Packet* ControlPlane::make_error(const core::Packet& p, const proto::EthView& eth,
@@ -134,7 +152,8 @@ core::Packet* ControlPlane::make_error(const core::Packet& p, const proto::EthVi
   return out;
 }
 
-std::optional<Reply> ControlPlane::answer_arp(core::Packet& p, const proto::EthView& eth) noexcept {
+std::optional<Reply> ControlPlane::answer_arp(core::Packet& p, const proto::EthView& eth,
+                                              core::PacketPool& pool) noexcept {
   const std::optional<proto::ArpView> msg = proto::ArpView::parse(eth.payload());
   if (!msg) {
     return std::nullopt;  // malformed: nothing to answer, nothing to learn
@@ -149,12 +168,7 @@ std::optional<Reply> ControlPlane::answer_arp(core::Packet& p, const proto::EthV
 
   if (msg->oper() == proto::ArpView::kOpReply) {
     ++stats_->arp_replies_rx;
-    if (gratuitous) {
-      arp_->on_unsolicited(spa, sha);
-    } else {
-      arp_->on_reply(spa, sha, ready_);
-      assert(ready_.empty() && "the phase 6 cache never queues");  // TODO(phase-8): send them
-    }
+    learn(p.in_port(), *msg, pool);
     return std::nullopt;
   }
   if (msg->oper() != proto::ArpView::kOpRequest) {
@@ -162,7 +176,7 @@ std::optional<Reply> ControlPlane::answer_arp(core::Packet& p, const proto::EthV
   }
   ++stats_->arp_requests_rx;
   if (gratuitous) {
-    arp_->on_unsolicited(spa, sha);
+    learn(p.in_port(), *msg, pool);
     return std::nullopt;
   }
   // Each port answers for its own address only, like Linux with arp_ignore=1.
@@ -182,6 +196,46 @@ std::optional<Reply> ControlPlane::answer_arp(core::Packet& p, const proto::EthV
   core::wr_be32(body, 24, spa);
   p.resize(eth.header_len() + proto::ArpView::kMinSize);  // the request's padding is not sent back
   return Reply{&p, p.in_port()};
+}
+
+// What a reply, or an announcement, arriving on port tells the cache about its sender. Only news
+// from the port the cache asks for that neighbour on counts: the cache is keyed by address alone,
+// and a station on another segment must not steer the neighbour's traffic. A reply answers the
+// cache's question, and so does an announcement while the cache is still waiting for an answer;
+// either completes the entry and frees the packets queued on it. Otherwise an announcement only
+// refreshes.
+void ControlPlane::learn(std::uint16_t port, const proto::ArpView& msg,
+                         core::PacketPool& pool) noexcept {
+  const std::uint32_t neighbour = msg.spa();
+  const proto::MacAddr mac = msg.sha();
+  const std::optional<table::ArpNeighbour> known = arp_->peek(neighbour);
+  if (!known || known->port != port) {
+    return;
+  }
+  const bool answer = msg.oper() == proto::ArpView::kOpReply && msg.tpa() != neighbour;
+  if (!answer && known->state != table::ArpState::Incomplete) {
+    arp_->on_unsolicited(neighbour, mac);
+    return;
+  }
+  arp_->on_reply(neighbour, mac, ready_);
+  const PortState& out = ports_[port];
+  for (core::Packet* q : ready_) {
+    // Steps 1 to 12 passed before it was queued, and nothing has touched it since.
+    const std::optional<proto::EthView> eth = proto::EthView::parse(q->data());
+    const std::optional<proto::Ipv4View> ip =
+        eth ? proto::Ipv4View::parse(eth->payload()) : std::nullopt;
+    if (!eth || !ip) {
+      pool.release(q);
+      ++stats_->drop(DropReason::ArpUnresolved);
+      continue;
+    }
+    rewrite_for_forwarding(*q, *eth, *ip, mac, out);
+    assert(n_released_ < released_.size() && "one entry's queue at most");
+    // The assertion is the bounds check: on_reply() hands back at most one queue.
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-constant-array-index)
+    released_[n_released_++] = Reply{q, port};
+  }
+  ready_.clear();
 }
 
 // Compiled here once, and checked here by clang-tidy, which only reads src/.

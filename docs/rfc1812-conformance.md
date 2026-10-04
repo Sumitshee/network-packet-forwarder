@@ -1,8 +1,9 @@
 # RFC 1812 conformance
 
 Where `npf` stands on the requirements of RFC 1812, *Requirements for IP Version 4 Routers*, that
-bear on what it does so far: forwarding IPv4 between Ethernet ports, answering ARP and pings, and
-sending ICMP errors. Section numbers are RFC 1812's own.
+bear on what it does so far: forwarding IPv4 between Ethernet ports, resolving its neighbours with
+ARP, answering ARP and pings, and sending ICMP errors. Section numbers are RFC 1812's own, except
+where a row names RFC 1122, whose ARP requirements RFC 1812 §3.3.2 adopts.
 
 - **implemented** — met by the code named in the last column, and tested.
 - **deferred** — not met. The note says why, and which phase of `docs/BUILD_PLAN.md` meets it, if
@@ -24,6 +25,19 @@ The pipeline steps named below are those of `docs/ARCHITECTURE.md` §11.
 | Interpret the options it understands, in datagrams addressed to it | 4.2.2.1 | MUST | deferred | No option is understood: the build plan's phase 7 fence is "no IP option processing beyond skipping them". |
 | Source routing, in forwarded packets | 5.3.13.4 | MUST | deferred | A source-routed packet is forwarded by its destination address, its option ignored. Honouring the option needs the option processing above, and source routing is commonly filtered as a security risk anyway. |
 
+## Address resolution (ARP)
+
+| Requirement | § | Level | Status | Where, or why not |
+|---|---|---|---|---|
+| Never report a destination unreachable just for want of an ARP entry: queue a few packets while asking | 3.3.2 | MUST NOT, SHOULD | implemented | Step 12 queues up to 3 packets per neighbour (`ArpCache::resolve_and_queue`, `Verdict::Queued`), and sends them when it answers. `test_arp_cache`, `test_forward`, ARP exit test: the first ping through a router that knows no one gets an answer |
+| Report the destination unreachable for one of the queued packets, and only once asking has failed | 3.3.2 | SHOULD | implemented | A Host Unreachable for the head of the queue, after three requests a second apart go unanswered. `test_arp_cache`, `test_forward`, ARP exit test |
+| Never believe an ARP message giving another station a broadcast or multicast MAC | 3.3.2 | MUST NOT | implemented | `ArpCache::on_reply` and `on_unsolicited` ignore one. `test_arp_cache` `NoAnswerNamingABroadcastOrMulticastMacIsBelieved` |
+| Flush out-of-date entries | RFC 1122 2.3.2.1 | MUST | implemented | An entry not heard from for 30 s is asked about again the next time it is used, and deleted if three requests go unanswered. One not used for 60 s is deleted. `test_arp_cache` |
+| Make that timeout configurable | RFC 1122 2.3.2.1 | SHOULD | deferred | Fixed at 30 s and 60 s. |
+| Prevent ARP flooding: at most one request a second per destination | RFC 1122 2.3.2.1 | MUST | implemented | One request a second per neighbour, however many packets wait on it or use it. `test_arp_cache` |
+| Keep a packet for an address being resolved, and send it once resolved | RFC 1122 2.3.2.2 | SHOULD | implemented | The first three. |
+| ...and of the packets kept, keep the latest | RFC 1122 2.3.2.2 | SHOULD | deferred | A full queue refuses the newest packet, as `docs/BUILD_PLAN.md` phase 8 specifies; Linux drops the oldest instead. |
+
 ## TTL and Time Exceeded
 
 | Requirement | § | Level | Status | Where, or why not |
@@ -37,7 +51,7 @@ The pipeline steps named below are those of `docs/ARCHITECTURE.md` §11.
 | Requirement | § | Level | Status | Where, or why not |
 |---|---|---|---|---|
 | Network Unreachable (code 0) when there is no route at all | 4.3.3.1, 5.2.7.1 | MUST | implemented | Step 11 (`NoRoute`), `ControlPlane::error_for`; `test_forward`; netns exit test |
-| Host Unreachable (code 1) when a directly connected host does not answer ARP | 4.3.3.1, 5.2.7.1 | MUST | deferred | Phase 8. Until the ARP cache gives up on a host, a packet waiting on ARP is dropped as `ArpUnresolved`, with no message. |
+| Host Unreachable (code 1) when a directly connected host does not answer ARP | 4.3.3.1, 5.2.7.1 | MUST | implemented | When three ARP requests a second apart go unanswered: `ArpCache::tick`, `ControlPlane::host_unreachable`. `test_arp_cache`, `test_forward` `ANeighbourThatNeverAnswersEarnsHostUnreachable`, ARP exit test |
 | Protocol Unreachable (code 2) for a transport protocol the destination lacks | 5.2.7.1 | (definition) | implemented | For any packet to one of the router's addresses but ICMP: it runs no transport protocol. `test_forward` |
 | Port Unreachable (code 3) | 5.2.7.1 | (definition) | n-a | Without a transport layer, code 2 is the true answer. |
 | Fragmentation Needed (code 4) | 5.2.7.1 | MUST, when sent | deferred | No MTU check: see fragmentation, below. |
@@ -56,7 +70,7 @@ The pipeline steps named below are those of `docs/ARCHITECTURE.md` §11.
 | Replies: the request's TOS and precedence | 4.3.2.5 | SHOULD, MUST | implemented | `build_echo_reply`; `test_icmp_gen` |
 | No error for an ICMP error message | 4.3.2.7 | MUST NOT | implemented | `may_send_icmp_error`: types 3, 4, 5, 11 and 12; `test_icmp_gen`, `test_forward` |
 | No error for a packet that fails header validation | 4.3.2.7 | MUST NOT | implemented | Such a packet is dropped at step 5 or 6, and those drops never earn one. `test_forward` `OtherDropsEarnNoError` |
-| No error for a packet to an IP broadcast or multicast address | 4.3.2.7 | MUST NOT | implemented | `may_send_icmp_error` covers the limited broadcast and multicast. A directed broadcast to an attached subnet ends as `ArpUnresolved`, which earns no error; phase 8's Host Unreachable must keep it that way. |
+| No error for a packet to an IP broadcast or multicast address | 4.3.2.7 | MUST NOT | implemented | `may_send_icmp_error` covers the limited broadcast and multicast. A directed broadcast to an attached subnet waits for an ARP answer no host gives, and `ControlPlane::host_unreachable` sends no error when the cache gives up on it (`is_directed_broadcast`). `test_forward` `NoHostUnreachableForTheBroadcastAddressOfAnAttachedSubnet` |
 | No error for a packet received as a link-layer broadcast or multicast | 4.3.2.7 | MUST NOT | implemented | The L2/L3 rule (`docs/ARCHITECTURE.md` §2) routes such a frame only when it is for the router itself, which never earns an error. |
 | No error for a source that is not one host: network 0, 127/8, multicast, class E, all ones | 4.3.2.7 | MUST NOT | implemented | `may_send_icmp_error`; step 7 drops such sources before any error could be considered. |
 | No error for a fragment other than the first | 4.3.2.7 | MUST NOT | implemented | `may_send_icmp_error`; `test_icmp_gen`, `test_forward` |
@@ -84,7 +98,7 @@ The pipeline steps named below are those of `docs/ARCHITECTURE.md` §11.
 | Deliver to the router a packet to the limited broadcast, 255.255.255.255 | 5.2.3, 5.3.5.1 | MUST | implemented | Steps 4 and 8, `is_local_destination`. Nothing on the router listens for one, so it is consumed there. `test_forward` `TheLimitedBroadcastIsDeliveredLocallyAndNeverForwarded` |
 | Never forward the limited broadcast | 5.3.5.1 | MUST NOT | implemented | As above, even when a default route covers it. |
 | Never forward a packet received as a link-layer broadcast or multicast, unless it is to an IP multicast address | 5.3.4 | MUST NOT | implemented | The L2/L3 rule routes such a frame only when it is for the router itself, and never forwards one, IP multicast included. `test_forward` |
-| Forward directed broadcasts by default, with a switch to stop | 5.3.5.2 | MUST | deferred | RFC 2644 (BCP 34) later reversed the default to not forwarding them. Here a directed broadcast to an attached subnet ends as `ArpUnresolved`, since no host answers ARP for a broadcast address. Delivering one locally on its own subnet (§5.2.3) is not done either. |
+| Forward directed broadcasts by default, with a switch to stop | 5.3.5.2 | MUST | deferred | RFC 2644 (BCP 34) later reversed the default to not forwarding them. Here a directed broadcast to an attached subnet ends as `ArpUnresolved`, since no host answers ARP for a broadcast address, and earns no error. Delivering one locally on its own subnet (§5.2.3) is not done either. |
 | Do not forward a packet from a martian source: network 0, 127/8, multicast, class E, the limited broadcast | 5.3.7 | SHOULD NOT | implemented | Step 7, `is_martian_source` (`MartianSource`); `test_ipv4`, `test_forward` |
 | Do not forward a packet to a martian destination: network 0, 127/8, class E | 5.3.7 | SHOULD NOT | deferred | A packet to 127/8, say, is routed if a route covers it, as the default route in `configs/router.conf` does. The same goes for an IP multicast destination reached through the router's own MAC. Dropping them needs a drop reason that `docs/ARCHITECTURE.md` §1 does not have. |
 | Never reassemble a datagram before forwarding it | 5.2.6 | MUST NOT | implemented | Every fragment is forwarded as it is. `test_forward` `FragmentsAreForwardedAsTheyAre` |

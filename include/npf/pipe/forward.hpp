@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
@@ -12,6 +13,7 @@
 #include <npf/pipe/decision.hpp>
 #include <npf/pipe/filter.hpp>
 #include <npf/pipe/icmp_gen.hpp>
+#include <npf/proto/arp.hpp>
 #include <npf/proto/checksum.hpp>
 #include <npf/proto/ethernet.hpp>
 #include <npf/proto/ipv4.hpp>
@@ -31,6 +33,7 @@ namespace npf::pipe {
 struct PortState {
   proto::MacAddr mac;
   std::uint32_t ip{0};  // host order
+  std::uint8_t prefix_len{0};
   PortMode mode{PortMode::Routed};
 };
 
@@ -54,6 +57,19 @@ inline constexpr std::uint32_t kLimitedBroadcast = 0xFFFFFFFFU;
   return ip == kLimitedBroadcast || is_router_address(ports, ip);
 }
 
+// True if ip is the broadcast address of a subnet the router is attached to: all ones in the host
+// part of a port's prefix. A /31 (RFC 3021) or a /32 has no broadcast address.
+[[nodiscard]] inline bool is_directed_broadcast(std::span<const PortState> ports,
+                                                std::uint32_t ip) noexcept {
+  return std::ranges::any_of(ports, [ip](const PortState& s) {
+    if (s.ip == 0 || s.prefix_len >= 31) {
+      return false;
+    }
+    const std::uint32_t host = ~table::prefix_mask(s.prefix_len);
+    return (ip & ~host) == (s.ip & ~host) && (ip & host) == host;
+  });
+}
+
 // A packet the router sends in answer to one it received: `packet` leaves from `port`.
 struct Reply {
   core::Packet* packet;
@@ -61,22 +77,33 @@ struct Reply {
 };
 
 // The part of the pipeline that answers packets instead of forwarding them -- ARP for the
-// router's addresses, echo replies, ICMP errors -- run by the caller after process() has decided.
-// Compiled once, in forward.cpp; every Forwarder owns one. Nothing here allocates: a new packet
-// comes from the pool the caller passes in, and goes out of the port the original arrived on.
+// router's addresses, echo replies, ICMP errors -- run by the caller after process() has decided,
+// and the way out of the ARP cache for the packets that waited in it. Compiled once, in
+// forward.cpp; every Forwarder owns one. Nothing here allocates: a new packet comes from the pool
+// the caller passes in, and goes out of the port the original arrived on.
 class ControlPlane {
  public:
   ControlPlane(const core::Config& cfg, table::ArpCache& arp, stat::Counters& stats);
 
   // For a packet process() returned as ToHost.
   //  - An ARP request for the port's own address is turned into its reply in place: the Reply's
-  //    packet is p itself. ARP replies, and gratuitous ARP, update the cache.
+  //    packet is p itself.
+  //  - An ARP reply, or an announcement (gratuitous ARP), updates what the cache holds for its
+  //    sender, if it arrived on the port the cache asks for that neighbour on. One the cache was
+  //    waiting for frees the packets queued on it: see released().
   //  - An echo request to any of the router's addresses gets an Echo Reply, and a packet of any
   //    protocol but ICMP a Protocol Unreachable: a new packet, with p still the caller's.
   //  - Anything else is consumed silently, other ICMP types included (RFC 1812 §4.3.2.1).
   // nullopt: no answer, and the caller releases p.
   [[nodiscard]] std::optional<Reply> deliver_to_host(core::Packet& p, core::PacketPool& pool,
                                                      core::Clock::time_point now) noexcept;
+
+  // The packets the last deliver_to_host() took back from the ARP cache, oldest first, each
+  // rewritten for its next hop (step 13) and to be sent from `port`. They are the caller's now:
+  // it takes them before calling deliver_to_host() again, and counts each as it would a Forward.
+  [[nodiscard]] std::span<const Reply> released() const noexcept {
+    return {released_.data(), n_released_};
+  }
 
   // For a packet process() dropped: Time Exceeded for TtlExpired, Net Unreachable for NoRoute --
   // if RFC 1812 §4.3.2.7 allows an error and the rate limiter has a token -- as a new packet to
@@ -86,11 +113,19 @@ class ControlPlane {
                                         core::PacketPool& pool,
                                         core::Clock::time_point now) noexcept;
 
+  // For the head of a queue the ARP cache gave up on (ArpEvents::unresolved): a Host Unreachable,
+  // on the same terms as error_for(), except for a packet to the broadcast address of an attached
+  // subnet, which no host answers ARP for and which may earn no error (RFC 1812 §4.3.2.7). p is
+  // still the caller's either way.
+  [[nodiscard]] core::Packet* host_unreachable(const core::Packet& p, core::PacketPool& pool,
+                                               core::Clock::time_point now) noexcept;
+
   [[nodiscard]] std::span<const PortState> ports() const noexcept { return ports_; }
 
  private:
-  [[nodiscard]] std::optional<Reply> answer_arp(core::Packet& p,
-                                                const proto::EthView& eth) noexcept;
+  [[nodiscard]] std::optional<Reply> answer_arp(core::Packet& p, const proto::EthView& eth,
+                                                core::PacketPool& pool) noexcept;
+  void learn(std::uint16_t port, const proto::ArpView& msg, core::PacketPool& pool) noexcept;
   [[nodiscard]] core::Packet* make_error(const core::Packet& p, const proto::EthView& eth,
                                          const proto::Ipv4View& ip, IcmpError err,
                                          core::PacketPool& pool,
@@ -100,7 +135,9 @@ class ControlPlane {
   table::ArpCache* arp_;          // borrowed, like the counters
   stat::Counters* stats_;
   std::vector<core::Packet*> ready_;  // ArpCache::on_reply's out-parameter, reserved once
-  IcmpRateLimiter limiter_;           // RFC 1812 §4.3.2.8: errors only, not echo replies
+  std::array<Reply, table::kArpQueueDepth> released_{};
+  std::size_t n_released_{0};
+  IcmpRateLimiter limiter_;  // RFC 1812 §4.3.2.8: errors only, not echo replies
 };
 
 // Step 13 on a frame that passed steps 1 to 12: the next hop's MAC as destination, the output
@@ -138,8 +175,9 @@ class Forwarder {
 
   // The whole datapath for one packet: the fourteen steps of ARCHITECTURE.md §11, in order. No
   // allocation, no locks, no system calls. It counts its own drops and ToHost packets; a Forward
-  // is counted by the caller, once the backend has accepted the packet. ICMP is not sent from
-  // here: the Decision carries the reason, and the caller asks error_for() for the message.
+  // is counted by the caller, once the backend has accepted the packet, and a Queued packet when
+  // the ARP cache lets go of it. ICMP is not sent from here: the Decision carries the reason, and
+  // the caller asks error_for() for the message.
   [[nodiscard]] Decision process(core::Packet& p) noexcept {
     const Decision d = steps(p);
     assert((d.verdict == Verdict::Drop) == (d.reason != DropReason::None) &&
@@ -159,10 +197,15 @@ class Forwarder {
                                                      core::Clock::time_point now) noexcept {
     return control_.deliver_to_host(p, pool, now);
   }
+  [[nodiscard]] std::span<const Reply> released() const noexcept { return control_.released(); }
   [[nodiscard]] core::Packet* error_for(const core::Packet& p, DropReason reason,
                                         core::PacketPool& pool,
                                         core::Clock::time_point now) noexcept {
     return control_.error_for(p, reason, pool, now);
+  }
+  [[nodiscard]] core::Packet* host_unreachable(const core::Packet& p, core::PacketPool& pool,
+                                               core::Clock::time_point now) noexcept {
+    return control_.host_unreachable(p, pool, now);
   }
 
   [[nodiscard]] std::span<const PortState> ports() const noexcept { return control_.ports(); }
@@ -278,15 +321,15 @@ Decision Forwarder<FibT>::steps(core::Packet& p) noexcept {
   }
 
   // 12. The next hop's MAC. A next hop of 0 is a directly connected route: deliver to the
-  // destination itself.
+  // destination itself. Unresolved, the packet waits in the ARP cache, which owns it from then on;
+  // deliver_to_host() takes it back when the neighbour answers, and rewrites it then.
   const std::uint32_t neighbour = next->ip != 0 ? next->ip : ip->dst();
   const std::optional<proto::MacAddr> neighbour_mac = arp_->lookup(neighbour);
   if (!neighbour_mac) {
-    // The phase 6 cache sends a request but never keeps the packet. TODO(phase-8): a queued
-    // packet belongs to the cache from then on, and needs a verdict of its own.
-    [[maybe_unused]] const bool queued = arp_->resolve_and_queue(neighbour, next->port, &p);
-    assert(!queued);
-    return drop(DropReason::ArpUnresolved);
+    if (!arp_->resolve_and_queue(neighbour, next->port, &p)) {
+      return drop(DropReason::ArpUnresolved);  // its queue is full, or the cache is
+    }
+    return {Verdict::Queued, DropReason::None, next->port};
   }
 
   // 13. Rewrite, and 14. forward.

@@ -1,6 +1,7 @@
-// The phase 6 stub; see arp_cache.hpp for what it does and does not do. Phase 8 rewrites this file.
+// The neighbour cache's state machine. arp_cache.hpp states the rules this follows.
 
 #include <algorithm>
+#include <cassert>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -8,80 +9,143 @@
 #include <npf/proto/mac.hpp>
 #include <npf/table/arp_cache.hpp>
 #include <optional>
+#include <span>
 #include <vector>
 
 namespace npf::table {
+namespace {
 
-ArpCache::ArpCache(ArpEvents& ev, std::size_t capacity) : events_{&ev}, capacity_{capacity} {
-  entries_.reserve(capacity);
+// RFC 1812 §3.3.2: a router MUST NOT believe an ARP message that gives another station a broadcast
+// or multicast MAC. Sent there, a neighbour's traffic would reach every station on the segment.
+bool believable(proto::MacAddr mac) noexcept {
+  return !mac.is_multicast();  // the broadcast address among them
+}
+
+}  // namespace
+
+ArpCache::ArpCache(ArpEvents& ev, std::size_t capacity) : events_{&ev}, entries_(capacity) {}
+
+ArpCache::~ArpCache() {
+  flush();
 }
 
 ArpCache::Entry* ArpCache::find(std::uint32_t ip) noexcept {
-  const auto it = std::ranges::find(entries_, ip, &Entry::ip);
-  return it == entries_.end() ? nullptr : &*it;
+  const std::span<Entry> live(entries_.data(), size_);
+  const auto it = std::ranges::find(live, ip, &Entry::ip);
+  return it == live.end() ? nullptr : &*it;
+}
+
+const ArpCache::Entry* ArpCache::find(std::uint32_t ip) const noexcept {
+  const std::span<const Entry> live(entries_.data(), size_);
+  const auto it = std::ranges::find(live, ip, &Entry::ip);
+  return it == live.end() ? nullptr : &*it;
 }
 
 std::optional<proto::MacAddr> ArpCache::lookup(std::uint32_t ip) noexcept {
-  const Entry* e = find(ip);
+  Entry* e = find(ip);
   if (e == nullptr || e->state == ArpState::Incomplete) {
     return std::nullopt;
+  }
+  e->used = now_;
+  // Forward on the MAC the cache has, and ask in the background whether it still holds. tick()
+  // sends the rest of the revalidation's probes, so a stream of packets is not a stream of them.
+  if (e->state == ArpState::Stale && e->probes == 0) {
+    probe(*e);
   }
   return e->mac;
 }
 
+// NOLINTNEXTLINE(bugprone-easily-swappable-parameters): ARCHITECTURE.md §6's signature
 bool ArpCache::resolve_and_queue(std::uint32_t ip, std::uint16_t out_port,
-                                 [[maybe_unused]] core::Packet* p) noexcept {
+                                 core::Packet* p) noexcept {
   Entry* e = find(ip);
   if (e == nullptr) {
-    if (entries_.size() == capacity_) {
-      return false;  // no room to remember the question, so a reply could not be accepted
+    if (size_ == entries_.size()) {
+      return false;  // no room to remember the question, so its answer could not be taken
     }
-    e = &entries_.emplace_back();
+    e = &entries_[size_++];
+    *e = Entry{};
     e->ip = ip;
     e->port = out_port;
+    e->used = now_;
+    probe(*e);
   }
-  // One request a second is enough: a packet stream to a silent neighbour must not become a
-  // stream of broadcasts.
-  if (!e->probed || now_ - e->last_probe >= kArpProbeInterval) {
-    e->probed = true;
-    e->last_probe = now_;
-    events_->send_arp_request(ip, out_port);
+  assert(e->state == ArpState::Incomplete && "lookup() would have answered for this neighbour");
+  if (e->state != ArpState::Incomplete || e->queued == kArpQueueDepth) {
+    return false;
   }
-  return false;  // TODO(phase-8): queue p (up to kArpQueueDepth) instead of dropping it
+  // The check above is the bounds check.
+  // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-constant-array-index)
+  e->queue[e->queued++] = p;
+  return true;
 }
 
 void ArpCache::on_reply(std::uint32_t ip, proto::MacAddr mac,
-                        [[maybe_unused]] std::vector<core::Packet*>& ready) noexcept {
+                        std::vector<core::Packet*>& ready) noexcept {
+  ready.clear();
   Entry* e = find(ip);
   // A reply to a question this cache never asked is not one to learn from, and a static entry is
-  // fixed by the configuration. Nothing is ever queued, so nothing goes into `ready`.
-  if (e == nullptr || e->is_static) {
+  // fixed by the configuration.
+  if (e == nullptr || e->is_static || !believable(mac)) {
     return;
   }
-  e->mac = mac;
-  e->state = ArpState::Reachable;
+  confirm(*e, mac);
+  if (e->queued != 0) {
+    e->used = now_;  // the packets handed back are about to be sent to it
+  }
+  const std::span<core::Packet* const> waiting = std::span(e->queue).first(e->queued);
+  assert(ready.capacity() >= waiting.size() && "reserve kArpQueueDepth in 'ready' once");
+  ready.assign(waiting.begin(), waiting.end());
+  e->queued = 0;
 }
 
 void ArpCache::on_unsolicited(std::uint32_t ip, proto::MacAddr mac) noexcept {
   Entry* e = find(ip);
-  if (e == nullptr || e->is_static) {
+  if (e == nullptr || e->is_static || e->state == ArpState::Incomplete || !believable(mac)) {
     return;
   }
-  e->mac = mac;
-  e->state = ArpState::Reachable;
+  confirm(*e, mac);
 }
 
 void ArpCache::tick(std::chrono::steady_clock::time_point now) noexcept {
-  now_ = now;  // TODO(phase-8): retransmit probes, age entries, fail exhausted ones
+  now_ = now;
+  for (std::size_t i = 0; i < size_;) {
+    Entry& e = entries_[i];
+    if (e.is_static) {
+      ++i;
+      continue;
+    }
+    if (e.probes != 0 && now - e.last_probe >= kArpProbeInterval) {
+      if (e.probes < kArpMaxProbes) {
+        probe(e);
+      } else {
+        give_up(e);
+        erase(i);
+        continue;
+      }
+    }
+    if (e.state == ArpState::Reachable && now - e.answered >= kArpReachable) {
+      e.state = ArpState::Stale;
+    }
+    if (e.state != ArpState::Incomplete && now - e.used >= kArpStaleTimeout) {
+      erase(i);
+      continue;
+    }
+    ++i;
+  }
 }
 
 void ArpCache::insert_static(std::uint32_t ip, proto::MacAddr mac, std::uint16_t port) noexcept {
   Entry* e = find(ip);
   if (e == nullptr) {
-    if (entries_.size() == capacity_) {
-      return;  // the caller sizes the cache for its static entries before inserting them
+    if (size_ == entries_.size()) {
+      return;
     }
-    e = &entries_.emplace_back();
+    e = &entries_[size_++];
+  } else {
+    // Packets waiting on a resolution this replaces are dropped: on_reply() is the only way
+    // back out for them. Static entries are made at start-up, before any packet could wait.
+    discard_queue(*e);
   }
   *e = Entry{};
   e->ip = ip;
@@ -89,6 +153,67 @@ void ArpCache::insert_static(std::uint32_t ip, proto::MacAddr mac, std::uint16_t
   e->port = port;
   e->state = ArpState::Reachable;
   e->is_static = true;
+}
+
+void ArpCache::flush() noexcept {
+  for (std::size_t i = 0; i < size_;) {
+    if (entries_[i].is_static) {
+      ++i;
+      continue;
+    }
+    discard_queue(entries_[i]);
+    erase(i);
+  }
+}
+
+std::optional<ArpNeighbour> ArpCache::peek(std::uint32_t ip) const noexcept {
+  const Entry* e = find(ip);
+  if (e == nullptr) {
+    return std::nullopt;
+  }
+  return ArpNeighbour{.mac = e->mac,
+                      .port = e->port,
+                      .state = e->state,
+                      .is_static = e->is_static,
+                      .queued = e->queued};
+}
+
+void ArpCache::probe(Entry& e) noexcept {
+  ++e.probes;
+  e.last_probe = now_;
+  events_->send_arp_request(e.ip, e.port);
+}
+
+void ArpCache::confirm(Entry& e, proto::MacAddr mac) noexcept {
+  e.mac = mac;
+  e.state = ArpState::Reachable;
+  e.answered = now_;
+  e.probes = 0;
+}
+
+// RFC 1812 §3.3.2: when resolution fails, tell the sender of one of the queued packets that its
+// destination is unreachable. That one is the head; the packets behind it are dropped silently.
+void ArpCache::give_up(Entry& e) noexcept {
+  const std::span<core::Packet* const> waiting = std::span(e.queue).first(e.queued);
+  if (!waiting.empty()) {
+    events_->unresolved(waiting.front());
+    for (core::Packet* p : waiting.subspan(1)) {
+      events_->discard(p);
+    }
+  }
+  e.queued = 0;
+}
+
+void ArpCache::discard_queue(Entry& e) noexcept {
+  for (core::Packet* p : std::span(e.queue).first(e.queued)) {
+    events_->discard(p);
+  }
+  e.queued = 0;
+}
+
+// The last entry in use takes the erased one's place: entries keep no order.
+void ArpCache::erase(std::size_t i) noexcept {
+  entries_[i] = entries_[--size_];
 }
 
 }  // namespace npf::table

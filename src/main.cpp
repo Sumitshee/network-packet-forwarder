@@ -3,6 +3,7 @@
 //   npf run --config <file> [--pidfile <path>] [--stats-file <path>] [--busy-poll]
 //       Forwards until SIGINT or SIGTERM, with a stats line every 5 s. SIGUSR1 prints the whole
 //       counter table and writes it to the stats file, which is how `npf show stats` reads it.
+//       SIGUSR2 empties the ARP cache of all but its static entries, for tests.
 //   npf dump --iface <name>
 //       Prints the parsed headers of every frame received on one interface.
 //   npf show stats [--pidfile <path>] [--stats-file <path>]
@@ -316,13 +317,21 @@ class TxQueue {
   std::size_t size_{0};
 };
 
-// Where the ARP cache's requests go: built in a fresh buffer and queued on the port, to leave
-// with the rest of the burst.
-class ArpRequester final : public npf::table::ArpEvents {
+// What the ARP cache asks of the worker. A request is built in a fresh buffer and queued on its
+// port, to leave with the rest of the burst. A packet the cache gives up on is released and
+// counted as ArpUnresolved -- but the head of a queue first earns its sender a Host Unreachable,
+// which takes the control plane, built after the cache. So a head waits here, and the worker
+// answers it straight after the tick() that gave it up.
+class ArpCacheEvents final : public npf::table::ArpEvents {
  public:
-  ArpRequester(PacketPool& pool, std::vector<npf::pipe::PortState> ports,
-               std::vector<TxQueue>& queues)
-      : pool_{&pool}, ports_{std::move(ports)}, queues_{&queues} {}
+  // capacity: the ARP cache's. One tick() gives up on each entry at most once.
+  ArpCacheEvents(PacketPool& pool, std::vector<npf::pipe::PortState> ports,
+                 std::vector<TxQueue>& queues, npf::stat::Counters& stats, std::size_t capacity)
+      : pool_{&pool},
+        ports_{std::move(ports)},
+        queues_{&queues},
+        stats_{&stats},
+        unresolved_(capacity) {}
 
   void send_arp_request(std::uint32_t target_ip, std::uint16_t out_port) noexcept override {
     if (out_port >= ports_.size()) {
@@ -339,26 +348,48 @@ class ArpRequester final : public npf::table::ArpEvents {
     }
   }
 
-  // TODO(phase-8): send ICMP Host Unreachable for the head packet first. The phase 6 cache never
-  // gives up on a packet, so this is not called yet.
-  void unresolved(Packet* p) noexcept override { pool_->release(p); }
+  void unresolved(Packet* p) noexcept override {
+    if (n_unresolved_ == unresolved_.size()) {
+      discard(p);  // not reached: see the constructor
+      return;
+    }
+    unresolved_[n_unresolved_++] = p;
+  }
+
+  void discard(Packet* p) noexcept override {
+    pool_->release(p);
+    ++stats_->drop(DropReason::ArpUnresolved);
+  }
+
+  // The heads given up on since the last clear_unresolved(), still to be answered and dropped.
+  [[nodiscard]] std::span<Packet* const> unresolved_heads() const noexcept {
+    return {unresolved_.data(), n_unresolved_};
+  }
+  void clear_unresolved() noexcept { n_unresolved_ = 0; }
 
  private:
   PacketPool* pool_;  // borrowed, like everything the worker uses
   std::vector<npf::pipe::PortState> ports_;
   std::vector<TxQueue>* queues_;
+  npf::stat::Counters* stats_;
+  std::vector<Packet*> unresolved_;  // sized once; the first n_unresolved_ are waiting
+  std::size_t n_unresolved_{0};
 };
 
-// The one worker: receive a burst, decide every packet, send the answers and the forwarded.
+// The one worker: run the ARP cache's timers, receive a burst, decide every packet, send the
+// answers and the forwarded.
 class Worker {
  public:
   using Pipeline = npf::pipe::Forwarder<npf::table::LinearLpm>;
 
   Worker(npf::io::AfPacketBackend& backend, PacketPool& pool, Pipeline& pipeline,
-         npf::stat::Counters& stats, std::vector<TxQueue>& requests, std::size_t burst)
+         npf::table::ArpCache& arp, ArpCacheEvents& arp_events, npf::stat::Counters& stats,
+         std::vector<TxQueue>& requests, std::size_t burst)
       : backend_{&backend},
         pool_{&pool},
         pipeline_{&pipeline},
+        arp_{&arp},
+        arp_events_{&arp_events},
         stats_{&stats},
         requests_{&requests},
         forward_(requests.size()),
@@ -367,6 +398,8 @@ class Worker {
         burst_{burst} {}
 
   void run_one_burst(npf::core::Clock::time_point now) noexcept {
+    arp_->tick(now);
+    answer_unresolved(now);
     const std::size_t n = backend_->rx_burst(rx_.data(), burst_);
     const std::span<Packet* const> got(rx_.data(), n);
     for (const Packet* p : got) {
@@ -382,36 +415,59 @@ class Worker {
   }
 
  private:
-  // Every packet leaves here queued for transmission or released: never both, never neither. So
-  // does every answer the control plane hands back.
+  // The heads of the queues tick() gave up on: a Host Unreachable each, out of the port each
+  // arrived on, then dropped, as the packets queued behind them already were.
+  void answer_unresolved(npf::core::Clock::time_point now) noexcept {
+    for (Packet* p : arp_events_->unresolved_heads()) {
+      if (Packet* error = pipeline_->host_unreachable(*p, *pool_, now); error != nullptr) {
+        queue(icmp_[p->in_port()], error);
+      }
+      pool_->release(p);
+      ++stats_->drop(DropReason::ArpUnresolved);
+    }
+    arp_events_->clear_unresolved();
+  }
+
+  // Every packet leaves here queued for transmission, released, or held by the ARP cache: exactly
+  // one of those. So does every answer the control plane hands back.
   void dispatch(Packet* p, npf::Decision d, npf::core::Clock::time_point now) noexcept {
     switch (d.verdict) {
       case Verdict::Forward:
-        if (!forward_[d.out_port].push(p)) {
-          pool_->release(p);
-          ++stats_->drop(DropReason::TxFull);
-        }
+        forward(p, d.out_port);
         return;
-      case Verdict::ToHost:
-        if (const std::optional<npf::pipe::Reply> reply =
-                pipeline_->deliver_to_host(*p, *pool_, now)) {
-          if (reply->packet == p) {  // an ARP request, turned into its reply in place
-            queue(arp_replies_[reply->port], p);
-            return;
-          }
+      case Verdict::ToHost: {
+        const std::optional<npf::pipe::Reply> reply = pipeline_->deliver_to_host(*p, *pool_, now);
+        for (const npf::pipe::Reply& freed : pipeline_->released()) {  // an ARP answer's doing
+          forward(freed.packet, freed.port);
+        }
+        if (reply && reply->packet == p) {  // an ARP request, turned into its reply in place
+          queue(arp_replies_[reply->port], p);
+          return;
+        }
+        if (reply) {
           queue(icmp_[reply->port], reply->packet);
         }
         pool_->release(p);
         return;
+      }
       case Verdict::Drop:
         if (Packet* error = pipeline_->error_for(*p, d.reason, *pool_, now); error != nullptr) {
           queue(icmp_[p->in_port()], error);
         }
         pool_->release(p);
         return;
+      case Verdict::Queued:  // the ARP cache's now, until deliver_to_host() or tick() lets it go
+        return;
       case Verdict::Flood:  // nothing floods before phase 12
         pool_->release(p);
         return;
+    }
+  }
+
+  void forward(Packet* p, std::uint16_t port) noexcept {
+    if (!forward_[port].push(p)) {
+      pool_->release(p);
+      ++stats_->drop(DropReason::TxFull);
     }
   }
 
@@ -461,8 +517,10 @@ class Worker {
   npf::io::AfPacketBackend* backend_;  // all borrowed: run() owns them and outlives the worker
   PacketPool* pool_;
   Pipeline* pipeline_;
+  npf::table::ArpCache* arp_;
+  ArpCacheEvents* arp_events_;
   npf::stat::Counters* stats_;
-  std::vector<TxQueue>* requests_;    // per port, filled by the ARP cache through ArpRequester
+  std::vector<TxQueue>* requests_;    // per port, filled by the ARP cache through ArpCacheEvents
   std::vector<TxQueue> forward_;      // per port
   std::vector<TxQueue> arp_replies_;  // per port: the ARP requests deliver_to_host() turned around
   std::vector<TxQueue> icmp_;         // per port: echo replies and ICMP errors
@@ -506,10 +564,11 @@ void report(const npf::stat::Counters& stats, const PacketPool& pool,
   write_stats_file(stats_file, table);
 }
 
-// The loop: forwards until SIGINT or SIGTERM, and answers SIGUSR1 with the counters.
+// The loop: forwards until SIGINT or SIGTERM, answers SIGUSR1 with the counters, and SIGUSR2 by
+// flushing the ARP cache.
 void serve(const Options& o, const npf::io::AfPacketBackend& backend, const PacketPool& pool,
            npf::table::ArpCache& arp, const npf::stat::Counters& stats, Worker& worker) {
-  const SignalFd signals{SIGINT, SIGTERM, SIGUSR1};
+  const SignalFd signals{SIGINT, SIGTERM, SIGUSR1, SIGUSR2};
   const Pidfile pidfile(o.pidfile);
   std::vector<pollfd> fds;
   for (const int fd : backend.fds()) {
@@ -533,12 +592,14 @@ void serve(const Options& o, const npf::io::AfPacketBackend& backend, const Pack
       }
       if (*sig == SIGUSR1) {
         report(stats, pool, o.stats_file);
+      } else if (*sig == SIGUSR2) {
+        arp.flush();
+        npf::core::log_info("ARP cache flushed; {} static entries kept", arp.size());
       } else {
         running = false;
       }
     }
     const auto now = npf::core::Clock::now();
-    arp.tick(now);
     worker.run_one_burst(now);
     if (now >= next_report) {
       next_report += kStatsPeriod;
@@ -564,20 +625,21 @@ int run(const Options& o) {
       throw std::runtime_error("the FIB refused a route the parser accepted");
     }
   }
+  npf::stat::Counters stats;
   std::vector<TxQueue> requests(cfg.interfaces.size());
-  ArpRequester requester(pool, npf::pipe::make_port_table(cfg), requests);
-  npf::table::ArpCache arp(requester, kArpCapacity);
+  ArpCacheEvents arp_events(pool, npf::pipe::make_port_table(cfg), requests, stats, kArpCapacity);
+  npf::table::ArpCache arp(arp_events, kArpCapacity);
   for (const npf::core::StaticArp& a : cfg.arp) {
     arp.insert_static(a.ip, a.mac, a.port);
   }
   npf::table::MacTable macs(kMacCapacity);
   const npf::pipe::Filter filter({}, npf::pipe::Action::Allow);
-  npf::stat::Counters stats;
   Worker::Pipeline pipeline(cfg, fib, arp, macs, filter, stats);
-  Worker worker(backend, pool, pipeline, stats, requests, cfg.burst);
+  Worker worker(backend, pool, pipeline, arp, arp_events, stats, requests, cfg.burst);
 
   serve(o, backend, pool, arp, stats, worker);
 
+  arp.flush();  // packets still waiting on ARP are dropped now, so the final counters include them
   print("npf: stopped; final counters:\n");
   report(stats, pool, o.stats_file);
   if (backend.rx_oversized() != 0) {
