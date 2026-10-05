@@ -437,6 +437,12 @@ class Filter {
   // limitation with a security implication — see README "Known limitations".
   [[nodiscard]] Action evaluate(const proto::Ipv4View& ip, const proto::L4Info& l4,
                                 std::uint16_t in_port) const noexcept;
+
+  // [phase 11] True if any rule constrains sport or dport. While it is, the pipeline denies a
+  // TCP or UDP packet whose header parse_l4 rejects (§11, step 10) rather than let it fall
+  // through those rules for want of ports: a first fragment too short to hold the TCP header is
+  // RFC 1858's tiny-fragment attack on exactly such rules.
+  [[nodiscard]] bool has_port_rules() const noexcept;
 };
 
 }  // namespace npf::pipe
@@ -599,7 +605,8 @@ Order of operations inside `process()` — do not reorder, each step depends on 
  7. martian source check               -> MartianSource
  8. destination is ours? -> ToHost (ICMP echo)
  9. TTL <= 1                           -> TtlExpired  (+ generate ICMP 11/0)
-10. parse_l4 + Filter::evaluate        -> FilterDeny
+10. parse_l4 + Filter::evaluate        -> FilterDeny  (also, while the filter has port rules, a
+                                          TCP or UDP header that parse_l4 rejects, §8)
 11. fib.lookup                         -> NoRoute     (+ generate ICMP 3/0)
 12. resolve next-hop MAC via ArpCache  -> Queued, or ArpUnresolved if the queue is full
                                           (a queue the cache gives up on: ICMP 3/1, §6)
