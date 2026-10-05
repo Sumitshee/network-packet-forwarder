@@ -609,6 +609,21 @@ npf::core::Config load_config_for(const std::filesystem::path& path, npf::core::
   return std::move(*parsed.value);
 }
 
+// The packet filter cfg, read from config_file, names; without one, no rules, and every packet is
+// allowed.
+npf::core::FilterConfig load_filter_for(const npf::core::Config& cfg,
+                                        const std::filesystem::path& config_file) {
+  const std::filesystem::path path = npf::core::filter_path(cfg, config_file);
+  if (path.empty()) {
+    return {};
+  }
+  npf::core::FilterParseResult parsed = npf::core::load_filter(path, cfg);
+  if (!parsed.value) {
+    throw std::runtime_error(std::format("{}: {}", path.string(), parsed.error));
+  }
+  return std::move(*parsed.value);
+}
+
 // Every interface's MAC as the backend has it: read from the interface for "mac auto", or else the
 // configuration's own.
 void take_macs(const npf::io::IoBackend& backend, npf::core::Config& cfg) {
@@ -621,12 +636,13 @@ void take_macs(const npf::io::IoBackend& backend, npf::core::Config& cfg) {
 // backend and the pool that run() or replay() brings. cfg's interfaces must have their MACs.
 // Members are built in the order declared, each from those above it.
 struct Router {
-  Router(const npf::core::Config& cfg, npf::io::IoBackend& backend, PacketPool& pool)
+  Router(const npf::core::Config& cfg, const npf::core::FilterConfig& rules,
+         npf::io::IoBackend& backend, PacketPool& pool)
       : requests(cfg.interfaces.size()),
         arp_events(pool, npf::pipe::make_port_table(cfg), requests, stats, kArpCapacity),
         arp(arp_events, kArpCapacity),
         macs(kMacCapacity),
-        filter({}, npf::pipe::Action::Allow),
+        filter(rules.rules, rules.policy),
         pipeline(cfg, fib, arp, macs, filter, stats),
         worker(backend, pool, pipeline, arp, arp_events, stats, requests, cfg.burst) {
     for (const npf::table::Route& r : cfg.routes) {
@@ -707,10 +723,16 @@ void serve(const Options& o, const npf::io::AfPacketBackend& backend, const Pack
 
 int run(const Options& o) {
   npf::core::Config cfg = load_config_for(o.config, npf::core::IoKind::AfPacket);
+  const npf::core::FilterConfig rules = load_filter_for(cfg, o.config);
+  if (!cfg.filter.empty()) {
+    npf::core::log_info("packet filter: {} rules from {}, policy {}", rules.rules.size(),
+                        npf::core::filter_path(cfg, o.config).string(),
+                        rules.policy == npf::pipe::Action::Allow ? "allow" : "deny");
+  }
   PacketPool pool(cfg.pool_size);
   npf::io::AfPacketBackend backend(cfg.interfaces, pool);
   take_macs(backend, cfg);
-  Router router(cfg, backend, pool);
+  Router router(cfg, rules, backend, pool);
 
   serve(o, backend, pool, router.arp, router.stats, router.worker);
 
@@ -743,10 +765,11 @@ int replay(const Options& o) {
   const std::filesystem::path& in = o.files.at(0);
   const std::filesystem::path& out = o.files.at(1);
   npf::core::Config cfg = load_config_for(o.config, npf::core::IoKind::Pcap);
+  const npf::core::FilterConfig rules = load_filter_for(cfg, o.config);
   PacketPool pool(cfg.pool_size);
   npf::io::PcapFileBackend backend({.in = in, .out = out}, cfg.interfaces, pool);
   take_macs(backend, cfg);
-  Router router(cfg, backend, pool);
+  Router router(cfg, rules, backend, pool);
 
   while (!backend.done()) {
     const std::size_t read = backend.records_read();

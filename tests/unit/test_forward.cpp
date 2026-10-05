@@ -36,6 +36,10 @@
 #include "support/alloc_counter.hpp"
 #include "support/proto_helpers.hpp"
 
+// Filter rules here are designated initializers naming only the fields a rule constrains. C++20
+// gives the rest their default, nullopt, which is "any" -- but GCC 13 warns of each.
+#pragma GCC diagnostic ignored "-Wmissing-field-initializers"
+
 namespace npf {
 
 // Found by argument-dependent lookup, so GoogleTest prints names instead of numbers.
@@ -64,8 +68,12 @@ using npf::core::rd_be16;
 using npf::core::wr_be16;
 using npf::core::wr_be32;
 using npf::core::wr_u8;
+using npf::pipe::Action;
+using npf::pipe::Filter;
 using npf::pipe::Forwarder;
+using npf::pipe::PortRange;
 using npf::pipe::Reply;
+using npf::pipe::Rule;
 using npf::proto::ArpView;
 using npf::proto::EthView;
 using npf::proto::IcmpView;
@@ -76,6 +84,7 @@ using npf::proto::kEtherTypeIpv4;
 using npf::proto::MacAddr;
 using npf::stat::Counters;
 using npf::table::LinearLpm;
+using npf::table::Prefix;
 using npf::test::AllocCounter;
 using npf::test::ip4;
 
@@ -395,12 +404,75 @@ TEST_F(ForwarderTest, Step9TtlOfOneOrZeroExpires) {
   EXPECT_EQ(process(ping({.ttl = 2})).verdict, Verdict::Forward);
 }
 
-TEST_F(ForwarderTest, Step10MalformedL4HeaderIsStillForwardedUntilPhase11) {
+TEST_F(ForwarderTest, Step10ADeniedPacketIsDroppedAsFilterDeny) {
+  filter_ = Filter({{.action = Action::Deny, .protocol = npf::proto::kIpProtoIcmp}}, Action::Allow);
+  expect_drop(process(ping()), DropReason::FilterDeny);
+  EXPECT_EQ(stats_.drop(DropReason::FilterDeny), 1U);
+  EXPECT_EQ(counted(), 1U);
+}
+
+TEST_F(ForwarderTest, Step10TheFilterSeesThePortAPacketArrivedOn) {
+  filter_ = Filter({{.action = Action::Deny, .in_port = std::uint16_t{1}}}, Action::Allow);
+  expect_drop(process(ping({.eth_dst = kPort1Mac}), 1), DropReason::FilterDeny);
+  EXPECT_EQ(process(ping()).verdict, Verdict::Forward);  // the same ping, on port 0
+}
+
+// A UDP datagram whose length field is below its own header's size: parse_l4 refuses it.
+Frame malformed_udp() {
   Frame udp(8);
-  wr_be16(udp, 4, 4);  // a UDP length below its own header: parse_l4 refuses it
-  const Frame f = ethernet(kPort0Mac, kClientMac, kEtherTypeIpv4,
-                           ipv4(kClient, kServer, 64, udp, npf::proto::kIpProtoUdp));
-  EXPECT_EQ(process(f).verdict, Verdict::Forward);
+  wr_be16(udp, 2, 53);
+  wr_be16(udp, 4, 4);
+  return ethernet(kPort0Mac, kClientMac, kEtherTypeIpv4,
+                  ipv4(kClient, kServer, 64, udp, npf::proto::kIpProtoUdp));
+}
+
+TEST_F(ForwarderTest, Step10AMalformedHeaderIsDeniedWhileThereArePortRules) {
+  // The port rule is for another port, and the policy allows: only the malformed header denies it.
+  filter_ = Filter({{.action = Action::Deny, .dport = PortRange{9, 9}}}, Action::Allow);
+  expect_drop(process(malformed_udp()), DropReason::FilterDeny);
+}
+
+TEST_F(ForwarderTest, Step10AMalformedHeaderIsForwardedWithoutPortRules) {
+  EXPECT_EQ(process(malformed_udp()).verdict, Verdict::Forward);  // no rules at all
+  filter_ = Filter({{.action = Action::Deny, .src = Prefix{kNowhere, 32}}}, Action::Allow);
+  EXPECT_EQ(process(malformed_udp()).verdict, Verdict::Forward);
+}
+
+TEST_F(ForwarderTest, Step10AMalformedIcmpHeaderIsNotDeniedForPortRules) {
+  // ICMP has no ports, so no port rule could have matched it anyway.
+  filter_ = Filter({{.action = Action::Deny, .dport = PortRange{9, 9}}}, Action::Allow);
+  const Frame truncated(4, std::byte{0});  // an ICMP header needs 8
+  EXPECT_EQ(process(ethernet(kPort0Mac, kClientMac, kEtherTypeIpv4,
+                             ipv4(kClient, kServer, 64, truncated)))
+                .verdict,
+            Verdict::Forward);
+}
+
+TEST_F(ForwarderTest, Step10Rfc1858sTinyFragmentIsDeniedNotLetThrough) {
+  // The first fragment of a telnet SYN, cut after 8 bytes of TCP header: the ports, no flags. A
+  // filter that relied on the port rule alone would let it through to "allow tcp".
+  Frame tcp(8);
+  wr_be16(tcp, 0, 40000);
+  wr_be16(tcp, 2, 23);
+  const Frame tiny =
+      with_flags_frag(ethernet(kPort0Mac, kClientMac, kEtherTypeIpv4,
+                               ipv4(kClient, kServer, 64, tcp, npf::proto::kIpProtoTcp)),
+                      0x2000);  // more fragments, offset 0
+  const Rule allow_tcp{.action = Action::Allow, .protocol = npf::proto::kIpProtoTcp};
+  filter_ = Filter(
+      {{.action = Action::Deny, .protocol = npf::proto::kIpProtoTcp, .dport = PortRange{23, 23}},
+       allow_tcp},
+      Action::Deny);
+  expect_drop(process(tiny), DropReason::FilterDeny);
+  filter_ = Filter({allow_tcp}, Action::Deny);  // with no port rules, nothing to evade
+  EXPECT_EQ(process(tiny).verdict, Verdict::Forward);
+}
+
+TEST_F(ForwarderTest, Step10ComesAfterPacketsForTheRouterAndExpiringOnes) {
+  filter_ = Filter({}, Action::Deny);
+  EXPECT_EQ(process(ping({.dst = kPort0Ip})).verdict, Verdict::ToHost);  // step 8
+  expect_drop(process(ping({.ttl = 1})), DropReason::TtlExpired);        // step 9
+  expect_drop(process(ping({.ttl = 2})), DropReason::FilterDeny);        // step 10
 }
 
 TEST_F(ForwarderTest, Step11NoRoute) {
@@ -1074,11 +1146,6 @@ TEST(PortTable, ADirectedBroadcastIsAllOnesInTheHostPartOfAnAttachedSubnet) {
   EXPECT_FALSE(is_directed_broadcast(ports, ip4(192, 0, 2, 1)));     // a /31 has none (RFC 3021)
   EXPECT_FALSE(is_directed_broadcast(ports, ip4(198, 51, 100, 7)));  // nor has a /32
   EXPECT_FALSE(is_directed_broadcast(ports, npf::pipe::kLimitedBroadcast));  // not a subnet's
-}
-
-TEST(Filter, TheStubRefusesRulesRatherThanIgnoreThem) {
-  EXPECT_THROW(npf::pipe::Filter({npf::pipe::Rule{}}, npf::pipe::Action::Allow),
-               std::invalid_argument);
 }
 
 TEST(Counters, MergeAddsEveryCounter) {

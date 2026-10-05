@@ -13,13 +13,16 @@ test_l4.cpp come from the constants here; change both together.
 
 A golden case is four files: <case>.pcap, the frames npf replay reads; <case>.conf, the router it
 replays them through; and what it must produce -- <case>.expected.pcap, the frames it must write,
-and <case>.expected.json, the counters it must end with. tests/integration/test_golden.cpp runs
-every case and compares. The expected files are built here, by a model of what a router must do
-to each frame written from docs/BUILD_PLAN.md's description of the case, never from npf's own
-output: a golden file copied from the code under test would only pin today's behaviour, bugs and
-all. When the two disagree, one of them is wrong; find out which before changing either.
+and <case>.expected.json, the counters it must end with. A case with a packet filter has a fifth,
+<case>.filter, which its .conf names. tests/integration/test_golden.cpp runs every case and
+compares. The expected files are built here, by a model of what a router must do to each frame
+written from docs/BUILD_PLAN.md's description of the case, never from npf's own output: a golden
+file copied from the code under test would only pin today's behaviour, bugs and all. When the two
+disagree, one of them is wrong; find out which before changing either.
 """
 
+import dataclasses
+import ipaddress
 import json
 import pathlib
 import socket
@@ -163,11 +166,14 @@ def counters(inputs: list[bytes], outputs: list[bytes], protocols: dict[int, int
 
 
 def write_golden(name: str, what: str, inputs: list[bytes], outputs: list[tuple[int, bytes]],
-                 expected: dict[str, int]) -> None:
+                 expected: dict[str, int], filter_text: str | None = None) -> None:
     """One case. outputs pairs each frame the router must write with the input it answers, whose
-    timestamp it must carry."""
-    (GOLDEN / f"{name}.conf").write_text(GOLDEN_CONF.format(name=name, what=what,
-                                                            pool_size=POOL_SIZE))
+    timestamp it must carry. filter_text, if given, is the case's filter file."""
+    conf = GOLDEN_CONF.format(name=name, what=what, pool_size=POOL_SIZE)
+    if filter_text is not None:
+        (GOLDEN / f"{name}.filter").write_text(filter_text)
+        conf += f"filter {name}.filter\n"
+    (GOLDEN / f"{name}.conf").write_text(conf)
     stamp = [T0_US + 1000 * i for i in range(len(inputs))]
     (GOLDEN / f"{name}.pcap").write_bytes(pcap_bytes(list(zip(stamp, inputs))))
     (GOLDEN / f"{name}.expected.pcap").write_bytes(
@@ -240,6 +246,125 @@ def golden_cases() -> None:
                  counters([tagged], [forwarded(tagged)], {17: 1}, forwarded=1))
 
 
+# --- the packet filter (phase 11) -----------------------------------------------------------------
+
+@dataclasses.dataclass(frozen=True)
+class FilterRule:
+    """One line of a filter file. None is any; an address without a length is a /32."""
+    action: str  # "allow" or "deny"
+    protocol: int | None = None
+    src: str | None = None
+    sport: tuple[int, int] | None = None
+    dst: str | None = None
+    dport: tuple[int, int] | None = None
+    in_port: int | None = None
+
+    def line(self) -> str:
+        def side(address: str | None, ports: tuple[int, int] | None) -> str:
+            text = address or "any"
+            if ports:
+                text += f" port {ports[0]}" if ports[0] == ports[1] else f" port {ports[0]}-{ports[1]}"
+            return text
+        protocol = {None: "any", 1: "icmp", 6: "tcp", 17: "udp"}.get(self.protocol, str(self.protocol))
+        line = f"{self.action} {protocol} {side(self.src, self.sport)} -> {side(self.dst, self.dport)}"
+        return line + (f" in-port {self.in_port}" if self.in_port is not None else "")
+
+
+def filter_verdict(frame: bytes, rules: list[FilterRule], policy: str, in_port: int = 0) -> str:
+    """What the filter must do with an untagged IPv4 frame, as docs/BUILD_PLAN.md phase 11 and
+    docs/ARCHITECTURE.md §8 and §11 describe it: the first rule that matches decides, and a packet no
+    rule matches gets the policy. A rule with ports cannot match a packet without readable ones -- a
+    non-initial fragment above all, whose first bytes are data. And while any rule has ports, a TCP
+    or UDP packet whose header cannot be read is denied before any rule is tried."""
+    l3 = frame[14:]
+    header_len = (l3[0] & 0x0F) * 4
+    total_len = struct.unpack("!H", l3[2:4])[0]
+    first_fragment = struct.unpack("!H", l3[6:8])[0] & 0x1FFF == 0
+    protocol = l3[9]
+    src, dst = ipaddress.IPv4Address(l3[12:16]), ipaddress.IPv4Address(l3[16:20])
+    l4 = l3[header_len:total_len]
+    unreadable = False
+    if first_fragment and protocol == 6:
+        unreadable = len(l4) < 20 or not 20 <= (l4[12] >> 4) * 4 <= len(l4)
+    elif first_fragment and protocol == 17:
+        unreadable = len(l4) < 8 or struct.unpack("!H", l4[4:6])[0] < 8
+    if unreadable and any(r.sport or r.dport for r in rules):
+        return "deny"
+    readable_ports = first_fragment and protocol in (6, 17) and not unreadable
+    ports = struct.unpack("!HH", l4[:4]) if readable_ports else None
+    for r in rules:
+        if ((r.in_port is not None and r.in_port != in_port)
+                or (r.protocol is not None and r.protocol != protocol)
+                or (r.src and src not in ipaddress.IPv4Network(r.src))
+                or (r.dst and dst not in ipaddress.IPv4Network(r.dst))):
+            continue
+        if r.sport or r.dport:
+            if (ports is None or (r.sport and not r.sport[0] <= ports[0] <= r.sport[1])
+                    or (r.dport and not r.dport[0] <= ports[1] <= r.dport[1])):
+                continue
+        return r.action
+    return policy
+
+
+def filter_case() -> None:
+    """docs/BUILD_PLAN.md phase 11's golden case: a default-deny filter that denies by port, by
+    protocol and by default, and lets one kind of fragment through a port rule but not the other."""
+    rules = [
+        FilterRule("deny", 17, None, None, SERVER_IP, (53, 53)),
+        FilterRule("deny", 6, None, None, SERVER_IP, (23, 23)),
+        FilterRule("allow", 6, "10.0.1.0/24", None, "10.0.2.0/24"),
+        FilterRule("deny", 1, "10.0.3.0/24"),
+        FilterRule("allow", None, "10.0.1.0/24", in_port=0),
+    ]
+    policy = "deny"
+    payload = Raw(b"npf-golden")
+
+    def syn(dport: int, ident: int) -> bytes:
+        return to_router(IP(src=CLIENT_IP, dst=SERVER_IP, ttl=64, id=ident, flags="DF")
+                         / TCP(sport=40001, dport=dport, seq=0x10000000 + dport, flags="S"))
+
+    dns = to_router(IP(src=CLIENT_IP, dst=SERVER_IP, ttl=64, id=0x5001)
+                    / UDP(sport=40000, dport=53) / payload)
+    # A DNS query in two fragments, of which only the second is sent. Its data begins with what
+    # reads as a UDP header for 40000 -> 53; a filter that believed it would deny the fragment.
+    lookalike = struct.pack("!HHHH", 40000, 53, 8, 0) + bytes(range(16))
+    dns_tail = to_router(fragment(IP(src=CLIENT_IP, dst=SERVER_IP, ttl=64, id=0x5002)
+                                  / UDP(sport=40000, dport=53) / Raw(lookalike), fragsize=8)[1])
+    # RFC 1858's tiny fragment: the first fragment of a telnet SYN, cut after 8 bytes of TCP.
+    tiny = to_router(IP(src=CLIENT_IP, dst=SERVER_IP, ttl=64, id=0x5005, flags="MF", proto=6)
+                     / Raw(struct.pack("!HHI", 40003, 23, 0x10000017)))
+    stray = to_router(IP(src="10.0.3.5", dst=SERVER_IP, ttl=64, id=0x5006)
+                      / ICMP(type=8, id=7, seq=1) / payload)
+    stray_tail = to_router(fragment(IP(src="10.0.3.5", dst=SERVER_IP, ttl=64, id=0x5007)
+                                    / ICMP(type=8, id=7, seq=2) / Raw(bytes(range(32))),
+                                    fragsize=16)[1])
+    stranger = to_router(IP(src="192.168.7.7", dst=SERVER_IP, ttl=64, id=0x5008)
+                         / UDP(sport=5000, dport=9999) / payload)
+    # Each frame, with what the plan says must happen to it: the model must agree.
+    plan = [(dns, "deny"),           # the port rule
+            (dns_tail, "allow"),     # past the port rule, to the last rule
+            (syn(443, 0x5003), "allow"),
+            (syn(23, 0x5004), "deny"),
+            (tiny, "deny"),          # unreadable TCP, while there are port rules
+            (stray, "deny"),         # the protocol rule
+            (stray_tail, "deny"),    # the protocol rule matches a fragment too
+            (stranger, "deny")]      # no rule: the policy
+    inputs = [frame for frame, _ in plan]
+    for frame, verdict in plan:
+        assert filter_verdict(frame, rules, policy) == verdict, (Ether(frame).summary(), verdict)
+    outputs = [(i, forwarded(frame)) for i, frame in enumerate(inputs)
+               if filter_verdict(frame, rules, policy) == "allow"]
+    sent = [frame for _, frame in outputs]
+    text = ("# Golden case filter_deny's packet filter, which filter_deny.conf names.\n"
+            "# Written by scripts/make_fixtures.py.\n"
+            f"policy {policy}\n" + "".join(r.line() + "\n" for r in rules))
+    write_golden("filter_deny", "a filter that denies by port, by protocol and by default",
+                 inputs, outputs,
+                 counters(inputs, sent, {1: 2, 6: 3, 17: 3}, forwarded=len(sent),
+                          FilterDeny=len(inputs) - len(sent)),
+                 filter_text=text)
+
+
 def main() -> None:
     FIXTURES.mkdir(parents=True, exist_ok=True)
     print(f"writing {FIXTURES}")
@@ -304,6 +429,7 @@ def main() -> None:
         src="10.0.1.1", dst="10.0.1.2", ttl=64, id=0x0002) / ICMP(type=11, code=0) / Raw(expired)))
 
     golden_cases()
+    filter_case()
 
 
 if __name__ == "__main__":

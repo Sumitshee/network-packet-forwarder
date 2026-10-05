@@ -213,6 +213,19 @@ class Forwarder {
  private:
   [[nodiscard]] Decision steps(core::Packet& p) noexcept;
 
+  // Step 10. A header parse_l4 rejects leaves a packet no ports, which would carry a TCP or UDP
+  // packet past every rule about ports; while there are such rules, it is denied instead (§8).
+  [[nodiscard]] bool filter_denies(const proto::Ipv4View& ip,
+                                   std::uint16_t in_port) const noexcept {
+    const std::optional<proto::L4Info> l4 = proto::parse_l4(ip);
+    if (!l4 && filter_->has_port_rules() &&
+        (ip.protocol() == proto::kIpProtoTcp || ip.protocol() == proto::kIpProtoUdp)) {
+      return true;
+    }
+    return filter_->evaluate(ip, l4.value_or(proto::L4Info{.protocol = ip.protocol()}), in_port) ==
+           Action::Deny;
+  }
+
   [[nodiscard]] const PortState* port(std::uint16_t id) const noexcept {
     const std::span<const PortState> ports = control_.ports();
     return id < ports.size() ? &ports[id] : nullptr;
@@ -303,10 +316,8 @@ Decision Forwarder<FibT>::steps(core::Packet& p) noexcept {
     return drop(DropReason::TtlExpired);
   }
 
-  // 10. Filter. A malformed L4 header still has a protocol, only no ports for a rule to match.
-  // TODO(phase-11): decide whether the filter drops such a packet outright.
-  const proto::L4Info l4 = proto::parse_l4(*ip).value_or(proto::L4Info{.protocol = ip->protocol()});
-  if (filter_->evaluate(*ip, l4, p.in_port()) == Action::Deny) {
+  // 10. Filter.
+  if (filter_denies(*ip, p.in_port())) {
     return drop(DropReason::FilterDeny);
   }
 

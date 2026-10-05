@@ -5,13 +5,12 @@
 #include <npf/proto/l4.hpp>
 #include <npf/table/fib.hpp>
 #include <optional>
-#include <stdexcept>
-#include <utility>
 #include <vector>
 
 namespace npf::pipe {
 
-// ARCHITECTURE.md §8.
+// ARCHITECTURE.md §8. The rules are scanned in order, every packet: no classification structure
+// until a benchmark shows the filter matters (phase 15).
 
 enum class Action : std::uint8_t { Allow, Deny };
 struct PortRange {
@@ -26,29 +25,30 @@ struct Rule {
   std::optional<std::uint16_t> in_port;
 };
 
-// PHASE 6 STUB: phase 11 adds the matching. It holds no rules -- the constructor refuses any,
-// rather than accept rules it would silently ignore -- so every packet gets the default action,
-// which the pipeline sets to Allow.
 class Filter {
  public:
-  explicit Filter(std::vector<Rule> rules, Action default_action)
-      : rules_{std::move(rules)}, default_{default_action} {
-    if (!rules_.empty()) {
-      throw std::invalid_argument("packet filter rules are not implemented yet (phase 11)");
-    }
-  }
+  // Throws std::invalid_argument for a rule that is malformed -- an action or default that is
+  // neither Allow nor Deny, a prefix with bits set past its length, a port range whose lo is above
+  // its hi -- or that could never match: one constraining the ports of a protocol other than TCP
+  // or UDP, the only two whose ports parse_l4 reads.
+  explicit Filter(std::vector<Rule> rules, Action default_action);
 
-  // TODO(phase-11): first match wins, and a rule that constrains sport or dport cannot match a
-  // packet whose l4.ports_valid is false (a non-initial fragment).
-  [[nodiscard]] Action evaluate([[maybe_unused]] const proto::Ipv4View& ip,
-                                [[maybe_unused]] const proto::L4Info& l4,
-                                [[maybe_unused]] std::uint16_t in_port) const noexcept {
-    return default_;
-  }
+  // First match wins. If l4.ports_valid is false (a non-initial fragment), any rule that
+  // constrains sport or dport CANNOT match and is skipped. This is a deliberate, documented
+  // limitation with a security implication -- see README "Known limitations".
+  [[nodiscard]] Action evaluate(const proto::Ipv4View& ip, const proto::L4Info& l4,
+                                std::uint16_t in_port) const noexcept;
+
+  // True if any rule constrains sport or dport. While it is, the pipeline denies a TCP or UDP
+  // packet whose header parse_l4 rejects (§11, step 10) rather than let it fall through those
+  // rules for want of ports: a first fragment too short to hold the TCP header is RFC 1858's
+  // tiny-fragment attack on exactly such rules.
+  [[nodiscard]] bool has_port_rules() const noexcept { return port_rules_; }
 
  private:
-  std::vector<Rule> rules_;  // always empty until phase 11
+  std::vector<Rule> rules_;
   Action default_;
+  bool port_rules_;
 };
 
 }  // namespace npf::pipe

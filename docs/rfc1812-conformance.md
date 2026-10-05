@@ -2,8 +2,9 @@
 
 Where `npf` stands on the requirements of RFC 1812, *Requirements for IP Version 4 Routers*, that
 bear on what it does so far: forwarding IPv4 between Ethernet ports, resolving its neighbours with
-ARP, answering ARP and pings, and sending ICMP errors. Section numbers are RFC 1812's own, except
-where a row names RFC 1122, whose ARP requirements RFC 1812 §3.3.2 adopts.
+ARP, answering ARP and pings, sending ICMP errors, and filtering what it forwards. Section numbers
+are RFC 1812's own, except where a row names RFC 1122, whose ARP requirements RFC 1812 §3.3.2
+adopts.
 
 - **implemented** — met by the code named in the last column, and tested.
 - **deferred** — not met. The note says why, and which phase of `docs/BUILD_PLAN.md` meets it, if
@@ -55,7 +56,7 @@ The pipeline steps named below are those of `docs/ARCHITECTURE.md` §11.
 | Protocol Unreachable (code 2) for a transport protocol the destination lacks | 5.2.7.1 | (definition) | implemented | For any packet to one of the router's addresses but ICMP: it runs no transport protocol. `test_forward` |
 | Port Unreachable (code 3) | 5.2.7.1 | (definition) | n-a | Without a transport layer, code 2 is the true answer. |
 | Fragmentation Needed (code 4) | 5.2.7.1 | MUST, when sent | deferred | No MTU check: see fragmentation, below. |
-| Communication Administratively Prohibited (code 13) for filtered packets | 5.2.7.1 | SHOULD | deferred | Phase 11, the packet filter. |
+| Communication Administratively Prohibited (code 13) for filtered packets | 5.2.7.1 | SHOULD | deferred | A packet the filter denies is dropped silently, which §5.3.9 requires a router to be able to do (see packet filtering, below). §5.2.7.1 itself allows a configuration option that stops code 13 being sent; `npf` behaves as if that option were always on. |
 
 ## ICMP in general
 
@@ -104,3 +105,17 @@ The pipeline steps named below are those of `docs/ARCHITECTURE.md` §11.
 | Never reassemble a datagram before forwarding it | 5.2.6 | MUST NOT | implemented | Every fragment is forwarded as it is. `test_forward` `FragmentsAreForwardedAsTheyAre` |
 | Fragment a datagram too large for the next link | 4.2.2.7, 5.2.6 | MUST | deferred | No MTU check: every port of the test topology has the same MTU, so nothing arrives too large to send. The build plan defers path MTU work beyond this phase. |
 | Reassemble datagrams addressed to the router | 4.2.2.8 | MUST | deferred | The router only answers pings, and a ping too large for one frame is rare. Reassembly needs buffers held across packets, with timers and limits: a design of its own. |
+
+## Packet filtering
+
+| Requirement | § | Level | Status | Where, or why not |
+|---|---|---|---|---|
+| Be able to filter what is forwarded, or to forward everything | 5.3.9 | SHOULD | implemented | `Filter`, step 10 (`FilterDeny`), with the rules of the filter file a configuration names; without one, everything is forwarded. `test_filter`, `test_forward`, golden case `filter_deny` |
+| Filter on source and destination prefixes, of any length | 5.3.9 | SHOULD | implemented | A rule's source and destination are each any prefix from /0 to /32; `test_filter` `RuleMatrix` |
+| Accept a value matching any address: the keyword any, or a prefix of length zero | 5.3.9 | MUST | implemented | Both, `any` and `0.0.0.0/0`; `test_config`, `test_filter` |
+| Be configurable as an include list or as an exclude list | 5.3.9 | SHOULD | implemented | `policy deny` with `allow` rules is an include list, and `policy allow` with `deny` rules an exclude list; a file may mix the two, the first matching rule deciding. |
+| Filter on protocol and ports as well | 5.3.9 | MAY | implemented | Any IP protocol number, and TCP and UDP ports, one or a range. A non-initial fragment carries no ports, so no rule with ports matches one: the README's "Known limitations" says what that allows. |
+| Be able to discard packets silently | 5.3.9 | MUST | implemented | A denied packet is dropped and counted, and nothing is sent. |
+| Be able to send Destination Unreachable, code 13, for a discarded packet, configurably per rule | 5.3.9 | SHOULD | deferred | No ICMP is sent for a filtered packet, as for code 13 above. |
+| Count the packets not forwarded | 5.3.9 | SHOULD | implemented | The `FilterDeny` counter: one total, not one per rule. |
+| Selective logging of the packets not forwarded | 5.3.9 | SHOULD | deferred | No packet is logged, for the reason given under header validation: any sender could flood the log. |

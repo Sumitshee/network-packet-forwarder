@@ -9,7 +9,9 @@
 #include <fstream>
 #include <limits>
 #include <npf/core/config.hpp>
+#include <npf/pipe/filter.hpp>
 #include <npf/proto/format.hpp>
+#include <npf/proto/l4.hpp>
 #include <npf/proto/mac.hpp>
 #include <npf/table/fib.hpp>
 #include <optional>
@@ -66,6 +68,16 @@ constexpr std::array<Word<FibKind>, 4> kFibKinds{{
 
 constexpr std::array<std::string_view, 6> kSettings{"pool_size", "burst", "mode",
                                                     "workers",   "io",    "fib"};
+
+constexpr std::array<Word<pipe::Action>, 2> kActions{{
+    {"allow", pipe::Action::Allow},
+    {"deny", pipe::Action::Deny},
+}};
+constexpr std::array<Word<std::uint8_t>, 3> kProtocols{{
+    {"tcp", proto::kIpProtoTcp},
+    {"udp", proto::kIpProtoUdp},
+    {"icmp", proto::kIpProtoIcmp},
+}};
 
 constexpr std::uint64_t kMaxCount = std::numeric_limits<std::uint32_t>::max();
 
@@ -260,19 +272,25 @@ std::pair<std::uint32_t, std::uint8_t> take_interface_address(Words& w) {
   w.fail(std::format("expected an address and prefix length such as 10.0.1.1/24, got '{}'", word));
 }
 
-table::Prefix take_route_prefix(Words& w) {
-  const std::string_view word = w.take("a prefix");
-  const auto parsed = to_address_and_len(word);
-  if (!parsed) {
-    w.fail(std::format("expected a prefix such as 10.0.1.0/24, got '{}'", word));
-  }
-  const auto [addr, len] = *parsed;
+// word, read as addr/len, as a prefix. Bits set past len are refused, not cleared: more often than
+// not they are a typo, in the address or the length.
+table::Prefix exact_prefix(const Words& w, std::string_view word, std::uint32_t addr,
+                           std::uint8_t len) {
   const table::Prefix prefix{addr & table::prefix_mask(len), len};
   if (prefix.addr != addr) {
     w.fail(std::format("{} has bits set past its prefix length; did you mean {}?", word,
                        format_prefix(prefix)));
   }
   return prefix;
+}
+
+table::Prefix take_route_prefix(Words& w) {
+  const std::string_view word = w.take("a prefix");
+  const auto parsed = to_address_and_len(word);
+  if (!parsed) {
+    w.fail(std::format("expected a prefix such as 10.0.1.0/24, got '{}'", word));
+  }
+  return exact_prefix(w, word, parsed->first, parsed->second);
 }
 
 proto::MacAddr take_mac(Words& w) {
@@ -306,6 +324,68 @@ E take_word(Words& w, const std::array<Word<E>, N>& words, std::string_view what
   w.fail(std::format("expected {} ({}), got '{}'", what, list_of(words), word));
 }
 
+// A filter rule's protocol: nullopt for any.
+std::optional<std::uint8_t> take_protocol(Words& w) {
+  const std::string_view word = w.take("a protocol");
+  if (word == "any") {
+    return std::nullopt;
+  }
+  for (const Word<std::uint8_t>& p : kProtocols) {
+    if (p.text == word) {
+      return p.value;
+    }
+  }
+  if (const auto number = to_number(word, std::numeric_limits<std::uint8_t>::max())) {
+    return static_cast<std::uint8_t>(*number);
+  }
+  w.fail(std::format(
+      "expected a protocol (any, tcp, udp, icmp or a number from 0 to 255), got '{}'", word));
+}
+
+// A filter rule's source or destination: nullopt for any, and a bare address is a /32.
+std::optional<table::Prefix> take_match(Words& w, std::string_view what) {
+  const std::string_view word = w.take(what);
+  if (word == "any") {
+    return std::nullopt;
+  }
+  if (word.find('/') == std::string_view::npos) {
+    if (const auto addr = to_ipv4(word)) {
+      return table::Prefix{*addr, 32};
+    }
+  } else if (const auto parsed = to_address_and_len(word)) {
+    return exact_prefix(w, word, parsed->first, parsed->second);
+  }
+  w.fail(std::format(
+      "expected {}: any, an address such as 10.0.2.10 or a prefix such as 10.0.1.0/24, got '{}'",
+      what, word));
+}
+
+// A port, or an inclusive range of them: 53, 1024-65535.
+pipe::PortRange take_ports(Words& w) {
+  const std::string_view word = w.take("a port or a range of ports");
+  constexpr std::uint64_t kMaxPort = std::numeric_limits<std::uint16_t>::max();
+  const std::size_t dash = word.find('-');
+  const auto lo = to_number(word.substr(0, dash), kMaxPort);
+  const auto hi = dash == std::string_view::npos ? lo : to_number(word.substr(dash + 1), kMaxPort);
+  if (!lo || !hi) {
+    w.fail(std::format("expected a port such as 53 or a range such as 1024-65535, got '{}'", word));
+  }
+  if (*lo > *hi) {
+    w.fail(std::format("the port range {} ends before it starts", word));
+  }
+  return {static_cast<std::uint16_t>(*lo), static_cast<std::uint16_t>(*hi)};
+}
+
+// "icmp", or "protocol 47": what the file would have said.
+std::string protocol_name(std::uint8_t protocol) {
+  for (const Word<std::uint8_t>& p : kProtocols) {
+    if (p.value == protocol) {
+      return std::string{p.text};
+    }
+  }
+  return std::format("protocol {}", protocol);
+}
+
 // --- the whole file ------------------------------------------------------------------------------
 
 class Parser {
@@ -318,12 +398,14 @@ class Parser {
       route_line(w);
     } else if (keyword == "arp") {
       arp_line(w);
+    } else if (keyword == "filter") {
+      filter_line(w);
     } else if (std::ranges::find(kSettings, keyword) != kSettings.end()) {
       setting_line(w, keyword);
     } else {
       w.fail(
-          std::format("unknown keyword '{}'; expected interface, route, arp, pool_size, burst, "
-                      "mode, workers, io or fib",
+          std::format("unknown keyword '{}'; expected interface, route, arp, filter, pool_size, "
+                      "burst, mode, workers, io or fib",
                       keyword));
     }
   }
@@ -424,13 +506,24 @@ class Parser {
     arp_lines_.push_back(w.line());
   }
 
-  void setting_line(Words& w, std::string_view key) {
+  // A line for a setting the file may give once.
+  void once(const Words& w, std::string_view key) {
     for (const auto& [seen, seen_on] : settings_) {
       if (seen == key) {
         w.fail(std::format("'{}' is already set on line {}", key, seen_on));
       }
     }
     settings_.emplace_back(key, w.line());
+  }
+
+  void filter_line(Words& w) {
+    once(w, "filter");
+    cfg_.filter = w.take("a filter file's path");
+    w.expect_end();
+  }
+
+  void setting_line(Words& w, std::string_view key) {
+    once(w, key);
     if (key == "pool_size") {
       cfg_.pool_size = take_number(w, "a packet count", {1, kMaxCount});
     } else if (key == "burst") {
@@ -456,22 +549,109 @@ class Parser {
   std::vector<std::pair<std::string_view, int>> settings_;
 };
 
+// --- a filter file -------------------------------------------------------------------------------
+
+class FilterParser {
+ public:
+  explicit FilterParser(const Config& router) : router_{&router} {}
+
+  void parse_line(Words& w) {
+    const std::string_view keyword = w.take("a keyword");
+    if (keyword == "policy") {
+      policy_line(w);
+    } else if (keyword == "allow" || keyword == "deny") {
+      rule_line(w, keyword == "allow" ? pipe::Action::Allow : pipe::Action::Deny);
+    } else {
+      w.fail(std::format("unknown keyword '{}'; expected policy, allow or deny", keyword));
+    }
+  }
+
+  [[nodiscard]] bool has_policy() const noexcept { return policy_line_ != 0; }
+  FilterConfig result() { return std::move(filter_); }
+
+ private:
+  void policy_line(Words& w) {
+    if (has_policy()) {
+      w.fail(std::format("'policy' is already set on line {}", policy_line_));
+    }
+    policy_line_ = w.line();
+    filter_.policy = take_word(w, kActions, "a policy");
+    w.expect_end();
+  }
+
+  void rule_line(Words& w, pipe::Action action) {
+    pipe::Rule r;
+    r.action = action;
+    r.protocol = take_protocol(w);
+    r.src = take_match(w, "a source");
+    if (w.accept("port")) {
+      r.sport = take_ports(w);
+    }
+    w.expect("->");
+    r.dst = take_match(w, "a destination");
+    if (w.accept("port")) {
+      r.dport = take_ports(w);
+    }
+    if (w.accept("in-port")) {
+      const std::uint16_t port = take_port(w);
+      if (std::ranges::none_of(router_->interfaces,
+                               [port](const InterfaceConfig& i) { return i.port == port; })) {
+        w.fail(std::format("the rule is for in-port {}, but no interface has port {}", port, port));
+      }
+      r.in_port = port;
+    }
+    w.expect_end();
+    if ((r.sport || r.dport) && r.protocol && *r.protocol != proto::kIpProtoTcp &&
+        *r.protocol != proto::kIpProtoUdp) {
+      w.fail(
+          std::format("only tcp and udp have ports, so a rule for {} with a port could never "
+                      "match",
+                      protocol_name(*r.protocol)));
+    }
+    filter_.rules.push_back(r);
+  }
+
+  const Config* router_;  // borrowed, for its interfaces
+  FilterConfig filter_;
+  int policy_line_{0};  // 0 until the policy line
+};
+
+// --- both files ----------------------------------------------------------------------------------
+
+// Hands parse_line the words of each line of text that has any, its comment removed. Line numbers
+// count from 1.
+template <class F>
+void each_line(std::string_view text, const F& parse_line) {
+  int line = 0;
+  while (!text.empty()) {
+    ++line;
+    const std::size_t eol = std::min(text.find('\n'), text.size());
+    const std::string_view content = text.substr(0, eol);
+    text.remove_prefix(std::min(eol + 1, text.size()));
+    Words words(content.substr(0, content.find('#')), line);
+    if (!words.at_end()) {
+      parse_line(words);
+    }
+  }
+}
+
+// The file's whole text, or nullopt if it cannot be opened.
+std::optional<std::string> read_text(const std::filesystem::path& path) {
+  std::ifstream in(path, std::ios::binary);
+  if (!in) {
+    return std::nullopt;
+  }
+  std::ostringstream text;
+  text << in.rdbuf();
+  return std::move(text).str();
+}
+
 }  // namespace
 
 ParseResult parse_config(std::string_view text) {
   try {
     Parser parser;
-    int line = 0;
-    while (!text.empty()) {
-      ++line;
-      const std::size_t eol = std::min(text.find('\n'), text.size());
-      const std::string_view content = text.substr(0, eol);
-      text.remove_prefix(std::min(eol + 1, text.size()));
-      Words words(content.substr(0, content.find('#')), line);
-      if (!words.at_end()) {
-        parser.parse_line(words);
-      }
-    }
+    each_line(text, [&parser](Words& w) { parser.parse_line(w); });
     return {parser.result(), {}, 0};
   } catch (const ConfigError& e) {
     return {std::nullopt, e.what(), e.line()};
@@ -479,13 +659,43 @@ ParseResult parse_config(std::string_view text) {
 }
 
 ParseResult load_config(const std::filesystem::path& path) {
-  std::ifstream in(path, std::ios::binary);
-  if (!in) {
+  const std::optional<std::string> text = read_text(path);
+  if (!text) {
     return {std::nullopt, std::format("cannot open {}", path.string()), 0};
   }
-  std::ostringstream text;
-  text << in.rdbuf();
-  return parse_config(text.view());
+  return parse_config(*text);
+}
+
+std::filesystem::path filter_path(const Config& cfg, const std::filesystem::path& config_file) {
+  if (cfg.filter.empty()) {
+    return {};
+  }
+  const std::filesystem::path path{cfg.filter};
+  return path.is_absolute() ? path : config_file.parent_path() / path;
+}
+
+FilterParseResult parse_filter(std::string_view text, const Config& router) {
+  try {
+    FilterParser parser(router);
+    each_line(text, [&parser](Words& w) { parser.parse_line(w); });
+    if (!parser.has_policy()) {
+      return {std::nullopt,
+              "no 'policy allow' or 'policy deny' line: a filter file must say what happens to a "
+              "packet that no rule matches",
+              0};
+    }
+    return {parser.result(), {}, 0};
+  } catch (const ConfigError& e) {
+    return {std::nullopt, e.what(), e.line()};
+  }
+}
+
+FilterParseResult load_filter(const std::filesystem::path& path, const Config& router) {
+  const std::optional<std::string> text = read_text(path);
+  if (!text) {
+    return {std::nullopt, std::format("cannot open {}", path.string()), 0};
+  }
+  return parse_filter(*text, router);
 }
 
 std::string to_string(const Config& cfg) {
@@ -507,6 +717,14 @@ std::string to_string(const Config& cfg) {
   }
   for (const StaticArp& a : cfg.arp) {
     out += std::format("arp {} {} dev {}\n", format_ipv4(a.ip), format_mac(a.mac), a.port);
+  }
+  if (!cfg.filter.empty()) {
+    if (cfg.filter.find_first_of(" \t\r\v\f\n#") != std::string::npos) {
+      throw std::invalid_argument(
+          "to_string: a filter path with whitespace or '#' in it cannot "
+          "be written in the file format");
+    }
+    out += std::format("filter {}\n", cfg.filter);
   }
   out += std::format("pool_size {}\nburst {}\nmode {}\nworkers {}\nio {}\nfib {}\n", cfg.pool_size,
                      cfg.burst, word_for(kRunModes, cfg.mode), cfg.workers,

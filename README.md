@@ -4,7 +4,7 @@ A userspace Layer-2/Layer-3 packet forwarding engine — a software router — w
 Linux. It receives raw Ethernet frames from network interfaces, parses them, makes forwarding
 decisions, rewrites headers and transmits them out of the correct interface.
 
-**Status: phase 10 of 19.** `npf` routes IPv4 between Linux interfaces. It has one AF_PACKET socket
+**Status: phase 11 of 19.** `npf` routes IPv4 between Linux interfaces. It has one AF_PACKET socket
 per port and runs every packet through a fixed fourteen-step pipeline: parse, validate, route,
 resolve the next hop, rewrite the MAC addresses, decrement the TTL and patch the checksum. Every
 packet it drops is counted under a reason. It resolves its neighbours with ARP itself: a packet
@@ -18,6 +18,11 @@ their TTL decremented exactly once, traceroute shows it as the first hop, no buf
 every packet received is accounted for as forwarded, delivered to the router itself, or dropped.
 [`docs/rfc1812-conformance.md`](docs/rfc1812-conformance.md) lists which requirements of RFC 1812,
 *Requirements for IP Version 4 Routers*, it meets and which it does not yet.
+
+It filters what it forwards, when its configuration names a filter file. Rules match source and
+destination prefixes, the protocol, TCP and UDP ports, and the port a packet arrived on; they are
+tried in order until one matches, and a policy decides the rest. What a rule about ports cannot do
+with a fragment is under [Known limitations](#known-limitations).
 
 `npf replay` runs the same router over a pcap file instead of live interfaces, and writes what it
 sends to another: deterministically, and with no root. The golden-file tests use it in CI. Each
@@ -84,6 +89,11 @@ sudo ./build/dev/npf show stats
 sudo ./scripts/cleanup_netns.sh
 ```
 
+To filter, uncomment `filter filter.conf` in `configs/router.conf`:
+[`configs/filter.conf`](configs/filter.conf) has the rules, and the comments in
+`include/npf/core/config.hpp` give the format. A packet the filter denies is counted as
+`FilterDeny`.
+
 `npf run` prints a stats line every 5 seconds. `npf show stats` signals it (`SIGUSR1`) to write out
 every counter, and Ctrl-C stops it and prints them one last time. `SIGUSR2` empties its ARP cache
 of everything but the static entries, which is how a test starts it from cold.
@@ -140,7 +150,13 @@ ctest --preset dev -R golden --output-on-failure
   does not record which port a frame left by. No time passes during a replay, so an ARP request is
   never answered or repeated, and at most 100 ICMP errors are sent, the rate limiter's allowance
   for one second.
-- **Packet filtering.** There are no filter rules; everything that can be routed is (phase 11).
+- **Some of packet filtering.** The filter keeps no state: a reply is judged like any other packet,
+  so it needs a rule of its own. Rules match addresses, the protocol, ports and the port a packet
+  arrived on, not TCP flags or ICMP types, and are tried one at a time, in order. The filter sees
+  only what the router forwards: not packets addressed to the router itself, not ARP, and not a
+  packet whose TTL runs out, which is answered with Time Exceeded before the filter would see it.
+  A denied packet is dropped silently, with no ICMP Communication Administratively Prohibited, and
+  counted in total, not per rule; nothing is logged.
 - **Switching.** Bridged ports drop transit frames (phase 12).
 - **Threads.** One worker forwards everything (phase 13).
 - **IPv6.** Not routed: an IPv6 frame is dropped as an unsupported EtherType. The longest-prefix
@@ -159,6 +175,19 @@ ctest --preset dev -R golden --output-on-failure
   defines, but `npf run` runs only `io af_packet`, and `npf replay` only `io pcap`; both only with
   `fib linear`, `mode rtc` and `workers 1`. They refuse the rest: `fib trie`, `patricia` and
   `dir24_8` name tables that exist and are tested, but the router is not built on them yet.
+
+## Known limitations
+
+Non-initial fragments carry no L4 header, so port-based filter rules cannot apply to them. This
+forwarder does not reassemble, so an attacker can evade a port rule by fragmenting the packet. Real
+firewalls reassemble before classification precisely for this reason. The trade-off here is
+deliberate: reassembly is stateful, memory-unbounded without careful limits, and out of scope.
+
+One fragment attack is closed off. A TCP or UDP packet whose header cannot be read is denied while
+any rule constrains ports, rather than falling through those rules for want of ports; that covers
+RFC 1858's tiny fragment, a first fragment cut too short to hold the whole TCP header. RFC 1858's
+other attack, overlapping fragments that rewrite the TCP header when the destination reassembles
+them, is not covered.
 
 ## Building
 

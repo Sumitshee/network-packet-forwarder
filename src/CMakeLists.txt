@@ -19,6 +19,7 @@ add_library(npf_io
 target_link_libraries(npf_io PUBLIC npf_core PRIVATE npf_warnings)
 
 add_library(npf_pipe
+  pipe/filter.cpp
   pipe/forward.cpp
   pipe/icmp_gen.cpp)
 target_link_libraries(npf_pipe PUBLIC npf_table npf_core PRIVATE npf_warnings)

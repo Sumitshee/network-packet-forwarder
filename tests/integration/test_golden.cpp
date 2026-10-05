@@ -275,11 +275,11 @@ INSTANTIATE_TEST_SUITE_P(golden, Golden, ::testing::ValuesIn(cases()),
                            return test.param;
                          });
 
-// The plan's eight. Later phases add cases; none may go missing.
+// The plan's eight of phase 9, and phase 11's. Later phases add cases; none may go missing.
 TEST(golden, EveryCaseThePlanNamesIsThere) {
   const std::vector<std::string> found = cases();
   for (const std::string name : {"basic_fwd", "ttl_expired", "no_route", "bad_checksum", "martian",
-                                 "fragment", "arp_request", "vlan"}) {
+                                 "fragment", "arp_request", "vlan", "filter_deny"}) {
     EXPECT_TRUE(std::ranges::find(found, name) != found.end()) << name << ".conf is missing";
     for (const std::string_view suffix : {".pcap", ".expected.pcap", ".expected.json"}) {
       EXPECT_TRUE(std::filesystem::exists(golden_dir() / (name + std::string{suffix})))
