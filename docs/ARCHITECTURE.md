@@ -17,7 +17,7 @@ namespace npf {
 
 enum class Verdict : std::uint8_t {
   Forward,   // out_port is set; transmit it
-  Flood,     // L2: transmit on every port in the bridge domain except in_port
+  Flood,     // L2: transmit on every port in the bridge domain except in_port (those that are up)
   ToHost,    // addressed to this router itself (ICMP echo, ARP request for us)
   Drop,      // drop_reason is set
   Queued,    // [phase 8] held by the ARP cache until the next hop resolves; out_port is set.
@@ -37,6 +37,7 @@ enum class DropReason : std::uint8_t {
   FilterDeny,        // packet filter said no
   NoOutPort,         // route named a port that does not exist or is down
   UnknownDestPort,   // L2 lookup miss on a port with no bridge domain
+  SamePort,          // [phase 12] L2: the destination was learned on the port the frame came in on
   TxFull,            // transmit ring or socket buffer full
   PoolExhausted,     // no free packet buffer
   _Count
@@ -80,7 +81,15 @@ enum class PortMode : std::uint8_t { Routed, Bridged };
 //
 // ARP frames addressed to this router's MAC or to broadcast go to the ARP handler
 // before either path.
+//
+// [phase 12] On a bridged port, "broadcast" in both places means a broadcast that asks for
+// that port's own address: an ARP request for its IP, or an IPv4 packet to it. A port with
+// no address has none to ask for. Every other frame on a bridged port that is not addressed
+// to the port's MAC -- any broadcast, any multicast, and any EtherType -- takes the L2 path.
 ```
+
+A bridged port's broadcast cannot go both ways: a frame takes one path. Switching wins, because a
+broadcast on a bridge is the other stations' business, the router's only when it asks for the router.
 
 Write this rule verbatim in the README. You will be asked to explain it.
 
@@ -399,16 +408,18 @@ class ArpCache {
 ```cpp
 class MacTable {
  public:
-  explicit MacTable(std::size_t capacity);   // rounded up to a power of two
+  explicit MacTable(std::size_t capacity,    // rounded up to a power of two
+                    std::chrono::seconds max_age = std::chrono::seconds{300});  // [phase 12]
   void learn(MacAddr src, std::uint16_t port, std::chrono::steady_clock::time_point now) noexcept;
   [[nodiscard]] std::optional<std::uint16_t> lookup(MacAddr dst) const noexcept;
-  void age(std::chrono::steady_clock::time_point now) noexcept;   // default 300 s
+  void age(std::chrono::steady_clock::time_point now) noexcept;   // drops entries older than max_age
   [[nodiscard]] std::size_t size() const noexcept;
 };
 ```
 
 Open-addressed, linear probing, power-of-two capacity, entries stored inline. No
 `std::unordered_map` — node-per-entry means an allocation and a pointer chase per learn.
+`max_age` is the configuration's `mac_age`: 300 s by default, a real switch's default.
 
 ---
 
@@ -583,6 +594,10 @@ class Forwarder {
 
   // Batched entry point used by the worker loop.
   void process_burst(core::Packet** pkts, std::size_t n, Decision* out) noexcept;
+
+  // [phase 12] The time MAC learning stamps entries with. The worker sets it once per burst,
+  // as it ticks the ARP cache, since process() is given no clock.
+  void set_time(std::chrono::steady_clock::time_point now) noexcept;
 };
 
 }  // namespace npf::pipe
@@ -612,6 +627,23 @@ Order of operations inside `process()` — do not reorder, each step depends on 
                                           (a queue the cache gives up on: ICMP 3/1, §6)
 13. rewrite: dst MAC, src MAC, TTL--, checksum_update16
 14. return Forward with out_port
+```
+
+[phase 12] On a bridged port the L2/L3 rule is applied straight after step 1, so that the L2 path
+switches a frame whatever its EtherType, before step 2 could refuse it:
+
+```
+ 1. EthView::parse                     -> ShortFrame
+ 1a. learn eth.src() -> in_port in the MacTable, unless it is a group address
+ 1b. L2/L3 rule (§2); the L2 path:
+       broadcast, multicast, or a destination never learned
+                                       -> Flood
+       a destination learned on in_port
+                                       -> Drop(SamePort)
+       a destination learned on another port of the same bridge domain
+                                       -> Forward to it, the frame unchanged
+       (one learned on a port of another domain counts as never learned)
+ 2. onwards, for a frame the rule sends to the router, as on a routed port
 ```
 
 ---
