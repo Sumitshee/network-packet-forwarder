@@ -10,7 +10,7 @@ namespace npf {
 
 enum class Verdict : std::uint8_t {
   Forward,  // out_port is set; transmit it
-  Flood,    // L2: transmit on every port in the bridge domain except in_port
+  Flood,    // L2: transmit on every port in the bridge domain except in_port (those that are up)
   ToHost,   // addressed to this router itself (ICMP echo, ARP request for us)
   Drop,     // drop_reason is set
   Queued,   // held by the ARP cache until the next hop resolves; out_port is set. The cache owns
@@ -30,6 +30,7 @@ enum class DropReason : std::uint8_t {
   FilterDeny,       // packet filter said no
   NoOutPort,        // route named a port that does not exist or is down
   UnknownDestPort,  // L2 lookup miss on a port with no bridge domain
+  SamePort,         // L2: the destination was learned on the port the frame came in on
   TxFull,           // transmit ring or socket buffer full
   PoolExhausted,    // no free packet buffer
   // ARCHITECTURE.md §1 fixes this name. An underscore and a capital reserve an identifier for the
@@ -79,6 +80,8 @@ static_assert(sizeof(Decision) == 4);
       return "NoOutPort";
     case DropReason::UnknownDestPort:
       return "UnknownDestPort";
+    case DropReason::SamePort:
+      return "SamePort";
     case DropReason::TxFull:
       return "TxFull";
     case DropReason::PoolExhausted:

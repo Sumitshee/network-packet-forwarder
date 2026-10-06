@@ -3,11 +3,14 @@
 //   npf run --config <file> [--pidfile <path>] [--stats-file <path>] [--busy-poll]
 //       Forwards until SIGINT or SIGTERM, with a stats line every 5 s. SIGUSR1 prints the whole
 //       counter table and writes it to the stats file, which is how `npf show stats` reads it.
-//       SIGUSR2 empties the ARP cache of all but its static entries, for tests.
+//       SIGRTMIN and SIGRTMIN+1 write the MAC table and the ARP cache next to it, with the
+//       extensions .mac and .arp, for `npf show mac` and `npf show arp`. SIGUSR2 empties the ARP
+//       cache of all but its static entries, for tests.
 //   npf dump --iface <name>
 //       Prints the parsed headers of every frame received on one interface.
-//   npf show stats [--pidfile <path>] [--stats-file <path>]
-//       Asks the running `npf run` for its counters, and prints them.
+//   npf show stats|mac|arp [--pidfile <path>] [--stats-file <path>]
+//       Asks the running `npf run` for its counters, its MAC table or its ARP cache, and prints
+//       them.
 //   npf replay <in.pcap> <out.pcap> --config <file> [--stats-json <path>]
 //       Runs every frame of in.pcap through the router, as if it had arrived on port 0, and writes
 //       every frame the router sends to out.pcap. No clock is read and no ARP request is ever
@@ -22,6 +25,7 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <array>
 #include <cerrno>
 #include <chrono>
@@ -83,13 +87,14 @@ using npf::proto::format_mac;
 constexpr std::string_view kUsage =
     "usage: npf run --config <file> [--pidfile <path>] [--stats-file <path>] [--busy-poll]\n"
     "       npf dump --iface <name>\n"
-    "       npf show stats [--pidfile <path>] [--stats-file <path>]\n"
+    "       npf show stats|mac|arp [--pidfile <path>] [--stats-file <path>]\n"
     "       npf replay <in.pcap> <out.pcap> --config <file> [--stats-json <path>]\n";
 
 constexpr auto kStatsPeriod = std::chrono::seconds{5};
 constexpr int kPollTimeoutMs = 100;  // long enough that an idle router does not spin a core
 constexpr std::size_t kArpCapacity = 1024;
 constexpr std::size_t kMacCapacity = 4096;
+constexpr auto kMacAgeInterval = std::chrono::seconds{1};  // how often the MAC table is aged
 constexpr std::size_t kDumpPoolSize = 256;
 constexpr auto kShowTimeout = std::chrono::seconds{2};
 
@@ -110,6 +115,7 @@ void print(const std::string& text) {
 
 struct Options {
   std::string command;
+  std::string what;  // show's: stats, mac or arp
   std::filesystem::path config;
   std::filesystem::path pidfile{"/run/npf.pid"};
   std::filesystem::path stats_file{"/run/npf.stats"};
@@ -169,9 +175,10 @@ Options parse_args(std::span<char* const> argv) {
   o.command = args.front();
   std::size_t i = 1;
   if (o.command == "show") {
-    if (args.size() < 2 || args[1] != "stats") {
-      throw UsageError("show what? The only thing to show is: npf show stats");
+    if (args.size() < 2 || (args[1] != "stats" && args[1] != "mac" && args[1] != "arp")) {
+      throw UsageError("show what? npf show stats, npf show mac, or npf show arp");
     }
+    o.what = args[1];
     i = 2;
   } else if (o.command != "run" && o.command != "dump" && o.command != "replay") {
     throw UsageError(std::format("unknown command '{}'", o.command));
@@ -324,8 +331,71 @@ std::string counter_json(const npf::stat::Counters& c, const PacketPool& pool) {
   return out + "\n}\n";
 }
 
-// Written aside and renamed into place, so `npf show stats` never reads half a table.
-void write_stats_file(const std::filesystem::path& path, const std::string& table) {
+// The MAC table, a station a line, by port and then MAC: what `npf show mac` prints. Lines
+// starting with '#' are notes, not stations.
+std::string mac_table_text(const npf::table::MacTable& macs, npf::core::Clock::time_point now) {
+  std::vector<npf::table::MacTable::Station> stations = macs.list();
+  std::ranges::sort(stations, {}, [](const npf::table::MacTable::Station& s) {
+    return std::pair{s.port, s.mac.b};
+  });
+  std::string out = std::format("# {:<17} {:>5} {:>8}\n", "mac", "port", "age (s)");
+  for (const npf::table::MacTable::Station& s : stations) {
+    out += std::format("{:<19} {:>5} {:>8}\n", format_mac(s.mac), s.port,
+                       std::chrono::duration_cast<std::chrono::seconds>(now - s.last_seen).count());
+  }
+  out += std::format("# {} of {} entries; a station is forgotten {} s after it last sent\n",
+                     stations.size(), macs.capacity(), macs.max_age().count());
+  return out;
+}
+
+// The ARP cache, a neighbour a line, by address: what `npf show arp` prints.
+std::string arp_cache_text(const npf::table::ArpCache& arp) {
+  std::vector<std::pair<std::uint32_t, npf::table::ArpNeighbour>> entries = arp.list();
+  std::ranges::sort(entries, {}, [](const auto& e) { return e.first; });
+  const auto state = [](const npf::table::ArpNeighbour& n) -> std::string_view {
+    if (n.is_static) {
+      return "static";
+    }
+    switch (n.state) {
+      case npf::table::ArpState::Incomplete:
+        return "incomplete";
+      case npf::table::ArpState::Reachable:
+        return "reachable";
+      case npf::table::ArpState::Stale:
+        return "stale";
+    }
+    return "?";
+  };
+  std::string out = std::format("# {:<15} {:<17} {:>5} {:<10} {}\n", "address", "mac", "port",
+                                "state", "waiting");
+  for (const auto& [ip, n] : entries) {
+    const bool incomplete = !n.is_static && n.state == npf::table::ArpState::Incomplete;
+    out += std::format("{:<17} {:<17} {:>5} {:<10} {}\n", format_ipv4(ip),
+                       incomplete ? "-" : format_mac(n.mac), n.port, state(n), n.queued);
+  }
+  return out;
+}
+
+// What `npf show` asks of the running `npf run`: the signal that asks, and the file that the answer
+// is written to. The MAC table and the ARP cache go next to the stats file, as <name>.mac and
+// <name>.arp.
+struct ShowRequest {
+  int signal;
+  std::filesystem::path file;
+};
+
+ShowRequest show_request(std::string_view what, const std::filesystem::path& stats_file) {
+  if (what == "mac") {
+    return {SIGRTMIN, std::filesystem::path{stats_file}.replace_extension(".mac")};
+  }
+  if (what == "arp") {
+    return {SIGRTMIN + 1, std::filesystem::path{stats_file}.replace_extension(".arp")};
+  }
+  return {SIGUSR1, stats_file};
+}
+
+// Written aside and renamed into place, so `npf show` never reads half a table.
+void write_snapshot(const std::filesystem::path& path, const std::string& table) {
   std::filesystem::path tmp = path;
   tmp += ".tmp";
   {
@@ -424,29 +494,39 @@ class ArpCacheEvents final : public npf::table::ArpEvents {
   std::size_t n_unresolved_{0};
 };
 
-// The one worker: run the ARP cache's timers, receive a burst, decide every packet, send the
-// answers and the forwarded.
+// The one worker: run the ARP cache's and the MAC table's timers, receive a burst, decide every
+// packet, send the answers, the forwarded and the flooded.
 class Worker {
  public:
   using Pipeline = npf::pipe::Forwarder<npf::table::LinearLpm>;
+  using FloodSets = std::vector<std::vector<std::uint16_t>>;  // make_flood_sets()'
 
   Worker(npf::io::IoBackend& backend, PacketPool& pool, Pipeline& pipeline,
-         npf::table::ArpCache& arp, ArpCacheEvents& arp_events, npf::stat::Counters& stats,
-         std::vector<TxQueue>& requests, std::size_t burst)
+         npf::table::ArpCache& arp, ArpCacheEvents& arp_events, npf::table::MacTable& macs,
+         npf::stat::Counters& stats, std::vector<TxQueue>& requests, FloodSets flood_sets,
+         std::size_t burst)
       : backend_{&backend},
         pool_{&pool},
         pipeline_{&pipeline},
         arp_{&arp},
         arp_events_{&arp_events},
+        macs_{&macs},
         stats_{&stats},
         requests_{&requests},
+        flood_sets_{std::move(flood_sets)},
         forward_(requests.size()),
+        flood_(requests.size()),
         arp_replies_(requests.size()),
         icmp_(requests.size()),
         burst_{burst} {}
 
   void run_one_burst(npf::core::Clock::time_point now) noexcept {
+    pipeline_->set_time(now);
     arp_->tick(now);
+    if (now >= next_mac_age_) {  // a scan of the whole table: once a second is plenty
+      macs_->age(now);
+      next_mac_age_ = now + kMacAgeInterval;
+    }
     answer_unresolved(now);
     const std::size_t n = backend_->rx_burst(rx_.data(), burst_);
     const std::span<Packet* const> got(rx_.data(), n);
@@ -506,10 +586,34 @@ class Worker {
         return;
       case Verdict::Queued:  // the ARP cache's now, until deliver_to_host() or tick() lets it go
         return;
-      case Verdict::Flood:  // nothing floods before phase 12
-        pool_->release(p);
+      case Verdict::Flood:
+        flood(p);
         return;
     }
+  }
+
+  // Out of every port of the frame's flood set: a copy each for all but the last, which takes the
+  // frame itself. The pipeline counted the frame, once, as flooded; a copy that finds no free
+  // buffer is not made, and shows only as one transmission fewer. A flood queue cannot overflow:
+  // a burst gives each port at most one copy of each frame.
+  void flood(Packet* p) noexcept {
+    const std::span<const std::uint16_t> out = flood_sets_[p->in_port()];
+    if (out.empty()) {  // the only port of its bridge domain that is up
+      pool_->release(p);
+      return;
+    }
+    for (const std::uint16_t port : out.first(out.size() - 1)) {
+      Packet* copy = pool_->acquire();
+      if (copy == nullptr) {
+        continue;
+      }
+      copy->resize(p->size());
+      std::ranges::copy(p->data(), copy->data().begin());
+      copy->set_in_port(p->in_port());
+      copy->set_rx_tsc(p->rx_tsc());  // a replay stamps what it writes with the input's time
+      queue(flood_[port], copy);
+    }
+    queue(flood_[out.back()], p);
   }
 
   void forward(Packet* p, std::uint16_t port) noexcept {
@@ -537,6 +641,7 @@ class Worker {
       const std::size_t sent = send(port, forward_[i]);
       stats_->forwarded += sent;
       stats_->drop(DropReason::TxFull) += queued - sent;
+      send(port, flood_[i]);  // counted as flooded already, and in tx_packets once sent
     }
     backend_->tx_flush();
   }
@@ -567,14 +672,18 @@ class Worker {
   Pipeline* pipeline_;
   npf::table::ArpCache* arp_;
   ArpCacheEvents* arp_events_;
+  npf::table::MacTable* macs_;
   npf::stat::Counters* stats_;
   std::vector<TxQueue>* requests_;    // per port, filled by the ARP cache through ArpCacheEvents
+  FloodSets flood_sets_;              // per port: where a frame it floods goes
   std::vector<TxQueue> forward_;      // per port
+  std::vector<TxQueue> flood_;        // per port: flooded frames and their copies
   std::vector<TxQueue> arp_replies_;  // per port: the ARP requests deliver_to_host() turned around
   std::vector<TxQueue> icmp_;         // per port: echo replies and ICMP errors
   std::array<Packet*, npf::core::kMaxBurst> rx_{};
   std::array<npf::Decision, npf::core::kMaxBurst> decisions_{};
   std::size_t burst_;
+  npf::core::Clock::time_point next_mac_age_;
 };
 
 // What this phase can run. The parser accepts more, for the phases that will implement it. io is
@@ -632,6 +741,15 @@ void take_macs(const npf::io::IoBackend& backend, npf::core::Config& cfg) {
   }
 }
 
+// Whether each port's link was up when the backend opened it, by port id.
+std::vector<bool> link_states(const npf::io::IoBackend& backend) {
+  std::vector<bool> up;
+  for (const npf::io::PortInfo& port : backend.ports()) {
+    up.push_back(port.up);
+  }
+  return up;
+}
+
 // The router itself -- its tables, the pipeline, and the worker that drives them -- around the
 // backend and the pool that run() or replay() brings. cfg's interfaces must have their MACs.
 // Members are built in the order declared, each from those above it.
@@ -641,10 +759,11 @@ struct Router {
       : requests(cfg.interfaces.size()),
         arp_events(pool, npf::pipe::make_port_table(cfg), requests, stats, kArpCapacity),
         arp(arp_events, kArpCapacity),
-        macs(kMacCapacity),
+        macs(kMacCapacity, cfg.mac_age),
         filter(rules.rules, rules.policy),
         pipeline(cfg, fib, arp, macs, filter, stats),
-        worker(backend, pool, pipeline, arp, arp_events, stats, requests, cfg.burst) {
+        worker(backend, pool, pipeline, arp, arp_events, macs, stats, requests,
+               npf::pipe::make_flood_sets(pipeline.ports(), link_states(backend)), cfg.burst) {
     for (const npf::table::Route& r : cfg.routes) {
       if (!fib.add(r)) {
         throw std::runtime_error("the FIB refused a route the parser accepted");
@@ -670,15 +789,19 @@ void report(const npf::stat::Counters& stats, const PacketPool& pool,
             const std::filesystem::path& stats_file) {
   const std::string table = counter_table(stats, pool);
   print(table);
-  write_stats_file(stats_file, table);
+  write_snapshot(stats_file, table);
 }
 
-// The loop: forwards until SIGINT or SIGTERM, answers SIGUSR1 with the counters, and SIGUSR2 by
-// flushing the ARP cache.
+// The loop: forwards until SIGINT or SIGTERM; answers SIGUSR1 with the counters, SIGRTMIN with the
+// MAC table and SIGRTMIN+1 with the ARP cache, and SIGUSR2 by flushing the ARP cache.
 void serve(const Options& o, const npf::io::AfPacketBackend& backend, const PacketPool& pool,
-           npf::table::ArpCache& arp, const npf::stat::Counters& stats, Worker& worker) {
-  const SignalFd signals{SIGINT, SIGTERM, SIGUSR1, SIGUSR2};
+           Router& router) {
+  const int show_mac = SIGRTMIN;
+  const int show_arp = SIGRTMIN + 1;
+  const SignalFd signals{SIGINT, SIGTERM, SIGUSR1, SIGUSR2, show_mac, show_arp};
   const Pidfile pidfile(o.pidfile);
+  npf::table::ArpCache& arp = router.arp;
+  const npf::stat::Counters& stats = router.stats;
   std::vector<pollfd> fds;
   for (const int fd : backend.fds()) {
     fds.push_back({fd, POLLIN, 0});
@@ -701,6 +824,11 @@ void serve(const Options& o, const npf::io::AfPacketBackend& backend, const Pack
       }
       if (*sig == SIGUSR1) {
         report(stats, pool, o.stats_file);
+      } else if (*sig == show_mac) {
+        write_snapshot(show_request("mac", o.stats_file).file,
+                       mac_table_text(router.macs, npf::core::Clock::now()));
+      } else if (*sig == show_arp) {
+        write_snapshot(show_request("arp", o.stats_file).file, arp_cache_text(arp));
       } else if (*sig == SIGUSR2) {
         arp.flush();
         npf::core::log_info("ARP cache flushed; {} static entries kept", arp.size());
@@ -709,14 +837,15 @@ void serve(const Options& o, const npf::io::AfPacketBackend& backend, const Pack
       }
     }
     const auto now = npf::core::Clock::now();
-    worker.run_one_burst(now);
+    router.worker.run_one_burst(now);
     if (now >= next_report) {
       next_report += kStatsPeriod;
       print(std::format(
-          "npf: {:>6}s  rx {}  forwarded {}  to_host {}  dropped {}  tx {}  pool {}/{}\n",
+          "npf: {:>6}s  rx {}  forwarded {}  flooded {}  to_host {}  dropped {}  tx {}  pool "
+          "{}/{}\n",
           std::chrono::duration_cast<std::chrono::seconds>(now - start).count(), stats.rx_packets,
-          stats.forwarded, stats.to_host, stats.total_drops(), stats.tx_packets, pool.available(),
-          pool.capacity()));
+          stats.forwarded, stats.flooded, stats.to_host, stats.total_drops(), stats.tx_packets,
+          pool.available(), pool.capacity()));
     }
   }
 }
@@ -734,7 +863,7 @@ int run(const Options& o) {
   take_macs(backend, cfg);
   Router router(cfg, rules, backend, pool);
 
-  serve(o, backend, pool, router.arp, router.stats, router.worker);
+  serve(o, backend, pool, router);
 
   router.arp.flush();  // packets still waiting on ARP are dropped now, and so counted
   print("npf: stopped; final counters:\n");
@@ -949,15 +1078,16 @@ int show(const Options& o) {
     throw std::runtime_error(
         std::format("no npf is running: there is no pid in {}", o.pidfile.string()));
   }
-  const std::optional<std::filesystem::file_time_type> before = modified(o.stats_file);
-  if (::kill(*pid, SIGUSR1) != 0) {
+  const ShowRequest request = show_request(o.what, o.stats_file);
+  const std::optional<std::filesystem::file_time_type> before = modified(request.file);
+  if (::kill(*pid, request.signal) != 0) {
     throw_errno(std::format("cannot signal npf (pid {})", *pid));
   }
   // It answers between two bursts, so within milliseconds unless it is wedged.
   const auto deadline = npf::core::Clock::now() + kShowTimeout;
   while (npf::core::Clock::now() < deadline) {
-    if (const auto now = modified(o.stats_file); now && now != before) {
-      std::ifstream in(o.stats_file);
+    if (const auto now = modified(request.file); now && now != before) {
+      std::ifstream in(request.file);
       std::ostringstream text;
       text << in.rdbuf();
       print(text.str());
@@ -966,7 +1096,7 @@ int show(const Options& o) {
     std::this_thread::sleep_for(std::chrono::milliseconds{10});
   }
   throw std::runtime_error(std::format("npf (pid {}) did not update {} within {} s", *pid,
-                                       o.stats_file.string(), kShowTimeout.count()));
+                                       request.file.string(), kShowTimeout.count()));
 }
 
 // Usable while handling an exception: no allocation, nothing that can throw.

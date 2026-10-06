@@ -20,6 +20,7 @@
 #include <npf/table/arp_cache.hpp>
 #include <npf/table/lpm_linear.hpp>
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <vector>
 
@@ -40,10 +41,36 @@ std::vector<PortState> make_port_table(const core::Config& cfg) {
           iface.name));
     }
     seen[iface.port] = true;
-    ports[iface.port] = PortState{
-        .mac = *iface.mac, .ip = iface.ip, .prefix_len = iface.prefix_len, .mode = iface.mode};
+    ports[iface.port] = PortState{.mac = *iface.mac,
+                                  .ip = iface.ip,
+                                  .prefix_len = iface.prefix_len,
+                                  .mode = iface.mode,
+                                  .bridge_domain = iface.bridge_domain};
   }
   return ports;
+}
+
+std::vector<std::vector<std::uint16_t>> make_flood_sets(std::span<const PortState> ports,
+                                                        const std::vector<bool>& up) {
+  if (up.size() != ports.size()) {
+    throw std::invalid_argument(
+        std::format("{} link states for {} ports", up.size(), ports.size()));
+  }
+  const auto bridged_in = [ports](std::size_t i, std::uint16_t domain) {
+    return ports[i].mode == PortMode::Bridged && ports[i].bridge_domain == domain;
+  };
+  std::vector<std::vector<std::uint16_t>> sets(ports.size());
+  for (std::size_t i = 0; i < ports.size(); ++i) {
+    if (ports[i].mode != PortMode::Bridged) {
+      continue;
+    }
+    for (std::size_t j = 0; j < ports.size(); ++j) {
+      if (j != i && up[j] && bridged_in(j, ports[i].bridge_domain)) {
+        sets[i].push_back(static_cast<std::uint16_t>(j));
+      }
+    }
+  }
+  return sets;
 }
 
 ControlPlane::ControlPlane(const core::Config& cfg, table::ArpCache& arp, stat::Counters& stats)

@@ -10,7 +10,8 @@ add_library(npf_table
   table/lpm_dir24_8.cpp
   table/lpm_linear.cpp
   table/lpm_patricia.cpp
-  table/lpm_trie.cpp)
+  table/lpm_trie.cpp
+  table/mac_table.cpp)
 target_link_libraries(npf_table PUBLIC npf_core PRIVATE npf_warnings)
 
 add_library(npf_io

@@ -7,6 +7,7 @@
 #include <npf/core/packet.hpp>
 #include <npf/proto/mac.hpp>
 #include <optional>
+#include <utility>
 #include <vector>
 
 namespace npf::table {
@@ -126,6 +127,10 @@ class ArpCache {
   // What the cache holds for ip, untouched: unlike lookup(), this refreshes nothing and never
   // probes.
   [[nodiscard]] std::optional<ArpNeighbour> peek(std::uint32_t ip) const noexcept;
+
+  // Every entry, with its neighbour's address, in no particular order: for npf show arp, never the
+  // datapath, as it allocates.
+  [[nodiscard]] std::vector<std::pair<std::uint32_t, ArpNeighbour>> list() const;
 
   [[nodiscard]] std::size_t size() const noexcept { return size_; }
 

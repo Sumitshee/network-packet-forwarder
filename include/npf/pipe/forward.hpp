@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <cassert>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <npf/core/byte_span.hpp>
@@ -32,14 +33,39 @@ namespace npf::pipe {
 // The router's own presence on one port, as configured.
 struct PortState {
   proto::MacAddr mac;
-  std::uint32_t ip{0};  // host order
+  std::uint32_t ip{0};  // host order; 0 if the port has no address, as a bridged port need not
   std::uint8_t prefix_len{0};
   PortMode mode{PortMode::Routed};
+  std::uint16_t bridge_domain{0};  // a bridged port's; 0 for a routed one
 };
 
 // The port table, indexed by port id. Throws std::invalid_argument unless the ids run from 0 to
 // N-1 and every port's MAC is known: "mac auto" must be read from the interface first.
 [[nodiscard]] std::vector<PortState> make_port_table(const core::Config& cfg);
+
+// For each port, the ports a frame it floods goes out of: the other bridged ports of its bridge
+// domain whose link is up, in port order; none for a routed port. up[i] is whether port i's link
+// was up at start-up. Throws std::invalid_argument unless up has one flag per port.
+[[nodiscard]] std::vector<std::vector<std::uint16_t>> make_flood_sets(
+    std::span<const PortState> ports, const std::vector<bool>& up);
+
+// Whether a broadcast frame on a bridged port asks for the port's own address -- an ARP request
+// for it, or an IPv4 packet to it -- and so is the router's, not the bridge's (ARCHITECTURE.md §2).
+// A port with no address has none to ask for.
+[[nodiscard]] inline bool asks_for_port(const proto::EthView& eth, const PortState& port) noexcept {
+  if (port.ip == 0) {
+    return false;
+  }
+  if (eth.ethertype() == proto::kEtherTypeArp) {
+    const std::optional<proto::ArpView> arp = proto::ArpView::parse(eth.payload());
+    return arp && arp->oper() == proto::ArpView::kOpRequest && arp->tpa() == port.ip;
+  }
+  if (eth.ethertype() == proto::kEtherTypeIpv4) {
+    const std::optional<proto::Ipv4View> ip = proto::Ipv4View::parse(eth.payload());
+    return ip && ip->dst() == port.ip;
+  }
+  return false;
+}
 
 inline constexpr std::uint32_t kLimitedBroadcast = 0xFFFFFFFFU;
 
@@ -174,10 +200,10 @@ class Forwarder {
         stats_{&stats} {}
 
   // The whole datapath for one packet: the fourteen steps of ARCHITECTURE.md §11, in order. No
-  // allocation, no locks, no system calls. It counts its own drops and ToHost packets; a Forward
-  // is counted by the caller, once the backend has accepted the packet, and a Queued packet when
-  // the ARP cache lets go of it. ICMP is not sent from here: the Decision carries the reason, and
-  // the caller asks error_for() for the message.
+  // allocation, no locks, no system calls. It counts its own drops, ToHost packets and floods; a
+  // Forward is counted by the caller, once the backend has accepted the packet, and a Queued packet
+  // when the ARP cache lets go of it. ICMP is not sent from here: the Decision carries the reason,
+  // and the caller asks error_for() for the message.
   [[nodiscard]] Decision process(core::Packet& p) noexcept {
     const Decision d = steps(p);
     assert((d.verdict == Verdict::Drop) == (d.reason != DropReason::None) &&
@@ -191,6 +217,10 @@ class Forwarder {
       out[i] = process(*pkts[i]);
     }
   }
+
+  // The time MAC learning stamps entries with: process() is given no clock. The worker sets it
+  // once per burst, as it ticks the ARP cache.
+  void set_time(std::chrono::steady_clock::time_point now) noexcept { now_ = now; }
 
   // See ControlPlane.
   [[nodiscard]] std::optional<Reply> deliver_to_host(core::Packet& p, core::PacketPool& pool,
@@ -211,7 +241,16 @@ class Forwarder {
   [[nodiscard]] std::span<const PortState> ports() const noexcept { return control_.ports(); }
 
  private:
+  // Steps 1 to 4: what kind of frame this is, and whose.
   [[nodiscard]] Decision steps(core::Packet& p) noexcept;
+  // Steps 1a and 1b, on a bridged port: learn the port the sender is on, then switch the frame --
+  // unless it is the router's, when nullopt sends it on to step 2. nullopt at once on a routed
+  // port.
+  [[nodiscard]] std::optional<Decision> bridge(core::Packet& p, const proto::EthView& eth,
+                                               const PortState& in) noexcept;
+  // Steps 5 to 14: routing an IPv4 packet addressed to the router, which step 4 may have parsed.
+  [[nodiscard]] Decision route(core::Packet& p, const proto::EthView& eth,
+                               std::optional<proto::Ipv4View> ip) noexcept;
 
   // Step 10. A header parse_l4 rejects leaves a packet no ports, which would carry a TCP or UDP
   // packet past every rule about ports; while there are such rules, it is denied instead (§8).
@@ -238,13 +277,18 @@ class Forwarder {
     ++stats_->to_host;
     return {Verdict::ToHost, DropReason::None, 0};
   }
+  [[nodiscard]] Decision flood() noexcept {
+    ++stats_->flooded;  // once per frame, however many ports its copies go out of
+    return {Verdict::Flood, DropReason::None, 0};
+  }
 
   ControlPlane control_;
   FibT* fib_;  // all borrowed
   table::ArpCache* arp_;
-  [[maybe_unused]] table::MacTable* macs_;  // TODO(phase-12): the L2 path learns and switches
+  table::MacTable* macs_;
   const Filter* filter_;
   stat::Counters* stats_;
+  std::chrono::steady_clock::time_point now_;  // set_time()'s
 };
 
 template <class FibT>
@@ -260,13 +304,20 @@ Decision Forwarder<FibT>::steps(core::Packet& p) noexcept {
     return drop(DropReason::NoOutPort);
   }
 
+  // 1a and 1b: a bridged port learns, and switches what is not the router's -- whatever its
+  // EtherType, so before step 2 could refuse it (ARCHITECTURE.md §11).
+  if (const std::optional<Decision> switched = bridge(p, *eth, *in)) {
+    return *switched;
+  }
+
   // 2. EtherType dispatch.
   const std::uint16_t type = eth->ethertype();
   if (type != proto::kEtherTypeIpv4 && type != proto::kEtherTypeArp) {
     return drop(DropReason::BadEtherType);
   }
 
-  // 3. ARP addressed to the router, or broadcast, goes to the ARP handler: deliver_to_host().
+  // 3. ARP addressed to the router, or broadcast, goes to the ARP handler: deliver_to_host(). From
+  // a bridged port, the only broadcast to get this far asks for the port's own address.
   const proto::MacAddr dst_mac = eth->dst();
   const bool to_our_mac = dst_mac == in->mac;
   if (type == proto::kEtherTypeArp && (to_our_mac || dst_mac.is_broadcast())) {
@@ -282,14 +333,51 @@ Decision Forwarder<FibT>::steps(core::Packet& p) noexcept {
     route_it = ip.has_value() && is_local_destination(control_.ports(), ip->dst());
   }
   if (!route_it) {
-    // A transit frame. Only a bridged port would switch it, and until phase 12 fills the MAC
-    // table even that has nowhere to send it.
-    return drop(DropReason::UnknownDestPort);
+    return drop(DropReason::UnknownDestPort);  // a transit frame on a routed port
+  }
+  return route(p, *eth, ip);
+}
+
+template <class FibT>
+std::optional<Decision> Forwarder<FibT>::bridge(core::Packet& p, const proto::EthView& eth,
+                                                const PortState& in) noexcept {
+  if (in.mode != PortMode::Bridged) {
+    return std::nullopt;
+  }
+  // 1a. A group address is no one station's, so is never learned.
+  const proto::MacAddr src = eth.src();
+  if (!src.is_multicast()) {
+    macs_->learn(src, p.in_port(), now_);
   }
 
+  // 1b. The router's own: addressed to the port, or a broadcast asking for its address.
+  const proto::MacAddr dst = eth.dst();
+  if (dst == in.mac || (dst.is_broadcast() && asks_for_port(eth, in))) {
+    return std::nullopt;
+  }
+  if (dst.is_multicast()) {  // broadcast too
+    return flood();
+  }
+  const std::optional<std::uint16_t> learned = macs_->lookup(dst);
+  if (!learned) {
+    return flood();
+  }
+  if (*learned == p.in_port()) {
+    return drop(DropReason::SamePort);  // a station should not reach itself through the bridge
+  }
+  const PortState* out = port(*learned);
+  if (out == nullptr || out->mode != PortMode::Bridged || out->bridge_domain != in.bridge_domain) {
+    return flood();  // learned in another domain: as good as never, here
+  }
+  return Decision{Verdict::Forward, DropReason::None, *learned};  // the frame unchanged
+}
+
+template <class FibT>
+Decision Forwarder<FibT>::route(core::Packet& p, const proto::EthView& eth,
+                                std::optional<proto::Ipv4View> ip) noexcept {
   // 5. IPv4 header. Steps 3 and 4 leave only IPv4 frames here.
   if (!ip) {
-    ip = proto::Ipv4View::parse(eth->payload());
+    ip = proto::Ipv4View::parse(eth.payload());
     if (!ip) {
       return drop(DropReason::BadIpv4Header);
     }
@@ -344,7 +432,7 @@ Decision Forwarder<FibT>::steps(core::Packet& p) noexcept {
   }
 
   // 13. Rewrite, and 14. forward.
-  rewrite_for_forwarding(p, *eth, *ip, *neighbour_mac, *out);
+  rewrite_for_forwarding(p, eth, *ip, *neighbour_mac, *out);
   return {Verdict::Forward, DropReason::None, next->port};
 }
 

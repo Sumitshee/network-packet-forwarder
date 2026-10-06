@@ -128,6 +128,17 @@ AfPacketBackend::AfPacketBackend(std::span<const core::InterfaceConfig> interfac
     if (::bind(fd.get(), reinterpret_cast<const sockaddr*>(&sll), sizeof(sll)) < 0) {
       throw_errno("bind to " + iface.name);
     }
+    // A bridged port must see frames for every station, not only for its own MAC: a NIC filters
+    // the rest unless promiscuous. The kernel undoes this when the socket closes.
+    if (iface.mode == PortMode::Bridged) {
+      packet_mreq promisc{};
+      promisc.mr_ifindex = static_cast<int>(ifindex);
+      promisc.mr_type = PACKET_MR_PROMISC;
+      if (::setsockopt(fd.get(), SOL_PACKET, PACKET_ADD_MEMBERSHIP, &promisc, sizeof(promisc)) <
+          0) {
+        throw_errno("promiscuous mode on " + iface.name);
+      }
+    }
 
     const LinkFacts link = read_link(fd.get(), iface.name);
     proto::MacAddr mac = link.mac;
@@ -151,7 +162,7 @@ AfPacketBackend::AfPacketBackend(std::span<const core::InterfaceConfig> interfac
                                   .ip = iface.ip,
                                   .prefix_len = iface.prefix_len,
                                   .mode = iface.mode,
-                                  .bridge_domain = 0,
+                                  .bridge_domain = iface.bridge_domain,
                                   .up = link.up};
     sockets_[iface.port] = Socket{std::move(fd), static_cast<int>(ifindex)};
   }

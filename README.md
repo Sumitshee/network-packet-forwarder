@@ -4,7 +4,7 @@ A userspace Layer-2/Layer-3 packet forwarding engine — a software router — w
 Linux. It receives raw Ethernet frames from network interfaces, parses them, makes forwarding
 decisions, rewrites headers and transmits them out of the correct interface.
 
-**Status: phase 11 of 19.** `npf` routes IPv4 between Linux interfaces. It has one AF_PACKET socket
+**Status: phase 12 of 19.** `npf` routes IPv4 between Linux interfaces. It has one AF_PACKET socket
 per port and runs every packet through a fixed fourteen-step pipeline: parse, validate, route,
 resolve the next hop, rewrite the MAC addresses, decrement the TTL and patch the checksum. Every
 packet it drops is counted under a reason. It resolves its neighbours with ARP itself: a packet
@@ -23,6 +23,14 @@ It filters what it forwards, when its configuration names a filter file. Rules m
 destination prefixes, the protocol, TCP and UDP ports, and the port a packet arrived on; they are
 tried in order until one matches, and a policy decides the rest. What a rule about ports cannot do
 with a fragment is under [Known limitations](#known-limitations).
+
+It switches, too. A port configured as bridged learns the MAC address of every station it hears,
+forwards a frame to a station it has learned out of that station's port, unchanged, and floods
+broadcasts, multicasts and frames to stations it has not learned yet out of every other port of
+the same bridge domain. Stations are forgotten after `mac_age` seconds of silence, 300 by default.
+An integration test runs it as a three-port switch between three hosts in one subnet: the hosts
+ping one another through it, the third host sees the first ARP request flooded but none of the
+unicast traffic that follows, and the table empties once the hosts fall silent.
 
 `npf replay` runs the same router over a pcap file instead of live interfaces, and writes what it
 sends to another: deterministically, and with no root. The golden-file tests use it in CI. Each
@@ -61,8 +69,20 @@ enum class PortMode : std::uint8_t { Routed, Bridged };
 // before either path.
 ```
 
-Until switching exists (phase 12), the L2 path has nowhere to send a frame either, so a transit
-frame is dropped on a bridged port too.
+On a bridged port, a broadcast is the router's only when it asks for that port's own address: an
+ARP request for its IP, or an IPv4 packet to it. Every other frame not addressed to the port's MAC
+-- any broadcast, any multicast, any EtherType -- takes the L2 path, so the hosts on a bridge can
+ARP for one another, and an IPv6 frame crosses it although the router does not route IPv6. On
+that path the frame's source is learned, and then:
+
+- a broadcast, a multicast, or a destination not learned yet is flooded out of every other port
+  of the bridge domain that was up at start-up;
+- a destination learned on another port of the bridge domain is forwarded out of that port, the
+  frame unchanged;
+- a destination learned on the port the frame came in on is dropped, as `SamePort`.
+
+A routed port works exactly as before: a frame not addressed to the router is dropped as
+`UnknownDestPort`.
 
 ## Running it
 
@@ -94,9 +114,31 @@ To filter, uncomment `filter filter.conf` in `configs/router.conf`:
 `include/npf/core/config.hpp` give the format. A packet the filter denies is counted as
 `FilterDeny`.
 
+To run it as a switch instead, `scripts/setup_bridge_netns.sh` builds three hosts, ns-h1, ns-h2 and
+ns-h3, all in 10.0.9.0/24 and each a veth away from ns-router, and
+[`configs/bridge.conf`](configs/bridge.conf) bridges the router's three ports:
+
+```bash
+sudo ./scripts/setup_bridge_netns.sh
+sudo ip netns exec ns-router ./build/dev/npf run --config configs/bridge.conf
+```
+
+```bash
+sudo ip netns exec ns-h1 ping 10.0.9.2
+```
+
+```bash
+sudo ./build/dev/npf show mac
+```
+
+```bash
+sudo ./scripts/cleanup_bridge_netns.sh
+```
+
 `npf run` prints a stats line every 5 seconds. `npf show stats` signals it (`SIGUSR1`) to write out
-every counter, and Ctrl-C stops it and prints them one last time. `SIGUSR2` empties its ARP cache
-of everything but the static entries, which is how a test starts it from cold.
+every counter, and Ctrl-C stops it and prints them one last time. `npf show mac` and
+`npf show arp` do the same for its MAC table and its ARP cache. `SIGUSR2` empties the ARP cache of
+everything but the static entries, which is how a test starts it from cold.
 `npf dump --iface <name>` prints the parsed headers of every frame an interface receives.
 
 The integration tests set all of this up, make their checks and tear it down again:
@@ -111,6 +153,10 @@ sudo tests/integration/test_traceroute.sh build/dev/npf
 
 ```bash
 sudo tests/integration/test_arp_resolution.sh build/dev/npf
+```
+
+```bash
+sudo tests/integration/test_switching.sh build/dev/npf
 ```
 
 ### Replaying a pcap
@@ -157,15 +203,25 @@ ctest --preset dev -R golden --output-on-failure
   packet whose TTL runs out, which is answered with Time Exceeded before the filter would see it.
   A denied packet is dropped silently, with no ICMP Communication Administratively Prohibited, and
   counted in total, not per rule; nothing is logged.
-- **Switching.** Bridged ports drop transit frames (phase 12).
+- **Some of switching.** No spanning tree: bridged ports joined in a loop flood a broadcast round it
+  for ever. No VLAN-aware bridging: a tag is carried, never looked at, so a bridge domain is one
+  flat segment whatever its frames' tags. One MAC table serves every bridge domain, so a MAC heard
+  in two is learned in whichever it spoke in last, and a frame for it in the other is flooded. The
+  group addresses IEEE 802.1D reserves, 01:80:c2:00:00:00 to 0f (spanning tree, LLDP, pause
+  frames), which a bridge must not forward, are flooded like any multicast. A flood copy that finds
+  no free buffer is not sent; the frame is still counted once, as flooded. An address on a bridged
+  port is answered on that port alone: the router has no address for a bridge domain as a whole.
 - **Threads.** One worker forwards everything (phase 13).
-- **IPv6.** Not routed: an IPv6 frame is dropped as an unsupported EtherType. The longest-prefix
-  match tables are IPv4's alone too; none is written to take a wider address.
+- **IPv6.** Not routed: an IPv6 frame for the router is dropped as an unsupported EtherType, while
+  one crossing a bridge is switched like any other frame. The longest-prefix match tables are
+  IPv4's alone too; none is written to take a wider address.
 - **Link state.** A port's link is checked once, at start-up. If it goes down later, frames sent to
-  it are counted as `TxFull`.
+  it are counted as `TxFull`, and a bridge goes on flooding to it; one down at start-up is never
+  flooded to.
 - **VLANs.** One 802.1Q (`0x8100`) or 802.1ad (`0x88a8`) tag is parsed and carried, not
-  interpreted: the frame is routed as if it were untagged and leaves with the same tag. A second tag
-  (QinQ) is not unwrapped, and the frame is dropped as an unsupported EtherType.
+  interpreted: the frame is routed as if it were untagged and leaves with the same tag, or is
+  switched with the tag untouched. A second tag (QinQ) is not unwrapped, and a frame for the router
+  with one is dropped as an unsupported EtherType.
 - **IPv4 options.** A header's options are skipped using its length field; none is interpreted.
 - **Fragment reassembly.** Fragments are never reassembled. Only a first (or only) fragment carries
   the transport header, so every other fragment is handled with no ports at all.

@@ -9,6 +9,10 @@
         Print "listening", then "ttl N src > dst" for each ICMP echo request received on <iface>,
         until <count> have arrived or <seconds> have passed. Does what `tcpdump -v` is used for,
         where tcpdump cannot run: inside an unprivileged user namespace it fails to drop privileges.
+    netns_frames.py frames <iface> <seconds>
+        Print "listening", then a line for each frame received on <iface> for <seconds>, in the
+        shape `tcpdump -t -e -n -Q in` gives it, so a test reads either the same way:
+        "src > dst, ethertype ARP (0x0806), length N: Request who-has A tell B", and so on.
 """
 
 import socket
@@ -90,11 +94,53 @@ def echo_ttls(iface, count, seconds):
             seen += 1
 
 
+def mac_text(b):
+    return ":".join(f"{octet:02x}" for octet in b)
+
+
+def describe(frame):
+    """One received frame, as tcpdump -t -e -n prints the parts the switching test reads."""
+    head = f"{mac_text(frame[6:12])} > {mac_text(frame[0:6])}"
+    kind = struct.unpack("!H", frame[12:14])[0]
+    if kind == 0x0806 and len(frame) >= 42:
+        op = struct.unpack("!H", frame[20:22])[0]
+        spa, tpa = socket.inet_ntoa(frame[28:32]), socket.inet_ntoa(frame[38:42])
+        what = (f"Request who-has {tpa} tell {spa}" if op == 1
+                else f"Reply {spa} is-at {mac_text(frame[22:28])}")
+        return f"{head}, ethertype ARP (0x0806), length {len(frame)}: {what}"
+    if kind == 0x0800 and len(frame) >= 34:
+        ihl = (frame[14] & 0x0F) * 4
+        src, dst = socket.inet_ntoa(frame[26:30]), socket.inet_ntoa(frame[30:34])
+        what = f"{src} > {dst}: ip-proto-{frame[23]}"
+        if frame[23] == 1 and len(frame) > 14 + ihl:
+            icmp_type = frame[14 + ihl]
+            what = f"{src} > {dst}: ICMP " + {8: "echo request", 0: "echo reply"}.get(
+                icmp_type, f"type {icmp_type}")
+        return f"{head}, ethertype IPv4 (0x0800), length {len(frame)}: {what}"
+    return f"{head}, ethertype 0x{kind:04x}, length {len(frame)}"
+
+
+def frames(iface, seconds):
+    with socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(ETH_P_ALL)) as s:
+        s.bind((iface, 0))
+        s.settimeout(0.2)
+        print("listening", flush=True)
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            try:
+                frame, address = s.recvfrom(65535)
+            except socket.timeout:
+                continue
+            if address[2] != PACKET_OUTGOING and len(frame) >= 14:
+                print(describe(frame), flush=True)
+
+
 def main(argv):
     commands = {
         "lldp": (lldp, 1),
         "bad-checksum": (bad_checksum, 4),
         "echo-ttls": (lambda i, c, s: echo_ttls(i, int(c), float(s)), 3),
+        "frames": (lambda i, s: frames(i, float(s)), 2),
     }
     if len(argv) < 2 or argv[1] not in commands or len(argv) - 2 != commands[argv[1]][1]:
         print(__doc__, file=sys.stderr)

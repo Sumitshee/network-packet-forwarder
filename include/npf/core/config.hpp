@@ -1,5 +1,6 @@
 #pragma once
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -26,20 +27,25 @@ namespace npf::core {
 // time; '#' starts a comment, and blank lines are skipped. Every other line is one of these, its
 // words in exactly this order:
 //
-//   interface <name> port <id> ip <address>/<len> mode routed|bridged [mac <mac>|auto]
+//   interface <name> port <id> [ip <address>/<len>] mode routed|bridged
+//             [bridge-domain <1 to 65535>] [mac <mac>|auto]
 //   route <prefix>/<len> [via <next hop>] dev <port id>
 //   arp <address> <mac> dev <port id>
 //   filter <path>
 //   pool_size <packets>              burst <1 to 64>
 //   mode rtc|pipeline                workers <threads>
 //   io af_packet|mmap|xdp|pcap       fib linear|trie|patricia|dir24_8
+//   mac_age <seconds>
 //
-// A missing mac, or mac auto, means the MAC is read from the interface at start-up. Interface names
-// and port ids are unique, and every dev names the port of an interface somewhere in the file. A
-// route's prefix has no bits set past its length and appears once; a directly connected route has
-// no via, so "via 0.0.0.0" is refused. filter names a filter file (below), by a path without
-// whitespace that filter_path() resolves. It and each of the last six settings may appear once,
-// anywhere; one that is left out keeps the default given in Config.
+// An interface is one line. A routed interface has an address, and a bridged one a bridge domain,
+// which a routed one has not; a bridged interface's address is optional, and with none the router
+// takes no part in the bridge's IP subnet. A missing mac, or mac auto, means the MAC is read from
+// the interface at start-up. Interface names and port ids are unique, and every dev names the port
+// of an interface with an address, somewhere in the file. A route's prefix has no bits set past its
+// length and appears once; a directly connected route has no via, so "via 0.0.0.0" is refused.
+// filter names a filter file (below), by a path without whitespace that filter_path() resolves.
+// It and each of the last seven settings may appear once, anywhere; one that is left out keeps the
+// default given in Config.
 
 enum class RunMode : std::uint8_t { Rtc, Pipeline };                    // threading: phase 13
 enum class IoKind : std::uint8_t { AfPacket, Mmap, Xdp, Pcap };         // phases 6, 16, 17, 9
@@ -50,10 +56,11 @@ inline constexpr std::size_t kMaxBurst = 64;  // the largest batch the datapath 
 struct InterfaceConfig {
   std::string name;            // the kernel's name for it, e.g. "veth-cr"
   std::uint16_t port{0};       // the id that routes and ARP entries name with dev
-  std::uint32_t ip{0};         // the router's own address on this port, host order
+  std::uint32_t ip{0};         // the router's own address on this port, host order; 0: none
   std::uint8_t prefix_len{0};  // of the subnet that address is in
   PortMode mode{PortMode::Routed};
   std::optional<proto::MacAddr> mac;  // nullopt: read it from the interface at start-up
+  std::uint16_t bridge_domain{0};     // a bridged interface's, from 1; 0 for a routed one
   friend bool operator==(const InterfaceConfig&, const InterfaceConfig&) = default;
 };
 
@@ -76,6 +83,7 @@ struct Config {
   std::size_t workers{1};
   IoKind io{IoKind::AfPacket};
   FibKind fib{FibKind::Linear};
+  std::chrono::seconds mac_age{300};  // how long a station is remembered after it last sent
   friend bool operator==(const Config&, const Config&) = default;
 };
 

@@ -100,6 +100,7 @@ std::vector<PortInfo> port_table(std::span<const core::InterfaceConfig> interfac
     p.ip = iface.ip;
     p.prefix_len = iface.prefix_len;
     p.mode = iface.mode;
+    p.bridge_domain = iface.bridge_domain;
     p.up = true;
   }
   return ports;

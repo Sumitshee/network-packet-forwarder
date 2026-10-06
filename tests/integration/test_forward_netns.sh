@@ -175,7 +175,7 @@ fi
 
 drops=0
 for reason in ShortFrame BadEtherType BadIpv4Header BadChecksum MartianSource TtlExpired \
-  NoRoute ArpUnresolved FilterDeny NoOutPort UnknownDestPort TxFull PoolExhausted; do
+  NoRoute ArpUnresolved FilterDeny NoOutPort UnknownDestPort SamePort TxFull PoolExhausted; do
   n=$(value "$reason")
   if [[ -z $n ]]; then
     fail "8: $reason is missing from the final counters"

@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <array>
+#include <chrono>
 #include <filesystem>
 #include <npf/core/config.hpp>
 #include <npf/core/packet.hpp>
@@ -100,8 +101,9 @@ TEST(Config, RouterConfRoundTrips) {
 TEST(Config, EveryChoiceSurvivesTheRoundTrip) {
   // No value here is a default, so none can round-trip merely by being left out.
   constexpr std::string_view kText =
-      R"(interface br0 port 7 ip 192.0.2.1/25 mode bridged mac 02:00:00:00:00:FF
+      R"(interface br0 port 7 ip 192.0.2.1/25 mode bridged bridge-domain 65535 mac 02:00:00:00:00:FF
 interface uplink port 65535 ip 198.51.100.2/31 mode routed mac auto
+interface lan port 3 mode bridged bridge-domain 7
 route 0.0.0.0/0 via 198.51.100.3 dev 65535
 route 192.0.2.0/25 dev 7
 route 203.0.113.7/32 via 192.0.2.2 dev 7
@@ -114,10 +116,17 @@ mode pipeline
 workers 4
 io xdp
 fib dir24_8
+mac_age 45
 )";
   const Config cfg = parsed(kText);
-  ASSERT_EQ(cfg.interfaces.size(), 2U);
+  ASSERT_EQ(cfg.interfaces.size(), 3U);
   EXPECT_EQ(cfg.interfaces[0].mode, PortMode::Bridged);
+  EXPECT_EQ(cfg.interfaces[0].bridge_domain, 65535);
+  EXPECT_EQ(cfg.interfaces[1].bridge_domain, 0);  // routed
+  EXPECT_EQ(cfg.interfaces[2].ip, 0U);            // a bridged port with no address
+  EXPECT_EQ(cfg.interfaces[2].prefix_len, 0);
+  EXPECT_EQ(cfg.interfaces[2].bridge_domain, 7);
+  EXPECT_EQ(cfg.mac_age, std::chrono::seconds{45});
   EXPECT_EQ(cfg.interfaces[0].mac, (MacAddr{{0x02, 0, 0, 0, 0, 0xFF}}));  // either case is read
   EXPECT_FALSE(cfg.interfaces[1].mac.has_value());                        // mac auto
   ASSERT_EQ(cfg.routes.size(), 3U);
@@ -149,6 +158,7 @@ TEST(Config, AFileWithNoSettingsGetsTheDefaults) {
   EXPECT_EQ(cfg.workers, 1U);
   EXPECT_EQ(cfg.io, IoKind::AfPacket);
   EXPECT_EQ(cfg.fib, FibKind::Linear);
+  EXPECT_EQ(cfg.mac_age, std::chrono::seconds{300});
 }
 
 TEST(Config, AcceptsEveryWordTheFormatDefines) {
@@ -162,12 +172,31 @@ TEST(Config, AcceptsEveryWordTheFormatDefines) {
   EXPECT_EQ(parsed("fib trie").fib, FibKind::Trie);
   EXPECT_EQ(parsed("fib patricia").fib, FibKind::Patricia);
   EXPECT_EQ(parsed("fib dir24_8").fib, FibKind::Dir24_8);
-  for (const auto& [word, mode] :
-       {std::pair{"routed", PortMode::Routed}, std::pair{"bridged", PortMode::Bridged}}) {
-    const Config cfg = parsed(std::string{"interface eth0 port 0 ip 10.0.0.1/8 mode "} + word);
+  for (const auto& [words, mode] : {std::pair{"routed", PortMode::Routed},
+                                    std::pair{"bridged bridge-domain 1", PortMode::Bridged}}) {
+    const Config cfg = parsed(std::string{"interface eth0 port 0 ip 10.0.0.1/8 mode "} + words);
     ASSERT_EQ(cfg.interfaces.size(), 1U);
-    EXPECT_EQ(cfg.interfaces[0].mode, mode) << word;
+    EXPECT_EQ(cfg.interfaces[0].mode, mode) << words;
   }
+  EXPECT_EQ(parsed("mac_age 1").mac_age, std::chrono::seconds{1});
+}
+
+TEST(Config, BridgeConfIsThePlansThreePortBridge) {
+  const ParseResult loaded = load_config(std::filesystem::path{NPF_CONFIG_DIR} / "bridge.conf");
+  ASSERT_TRUE(loaded.value.has_value()) << loaded.error;
+  const Config& cfg = *loaded.value;
+  ASSERT_EQ(cfg.interfaces.size(), 3U);
+  for (std::uint16_t i = 0; i < 3; ++i) {
+    const npf::core::InterfaceConfig& ifc = cfg.interfaces[i];
+    EXPECT_EQ(ifc.name, "veth-h" + std::to_string(i + 1));
+    EXPECT_EQ(ifc.port, i);
+    EXPECT_EQ(ifc.mode, PortMode::Bridged);
+    EXPECT_EQ(ifc.bridge_domain, 1);
+    EXPECT_EQ(ifc.ip, 0U);  // the router takes no part in the hosts' subnet
+  }
+  EXPECT_TRUE(cfg.routes.empty());
+  EXPECT_EQ(cfg.mac_age, std::chrono::seconds{300});
+  EXPECT_EQ(parse_config(to_string(cfg)).value, cfg);
 }
 
 TEST(Config, MacAutoMeansTheSameAsNoMac) {
@@ -330,7 +359,7 @@ void PrintTo(const BadConfig& c, std::ostream* os) {
   *os << c.name;
 }
 
-const std::array<BadConfig, 23> kBadConfigs{{
+const std::array<BadConfig, 31> kBadConfigs{{
     {"UnknownKeyword", R"(# two interfaces, then a typo
 interface veth-cr port 0 ip 10.0.1.1/24 mode routed
 
@@ -338,7 +367,7 @@ rout 10.0.1.0/24 dev 0
 )",
      4,
      "unknown keyword 'rout'; expected interface, route, arp, filter, pool_size, burst, mode, "
-     "workers, io or fib"},
+     "workers, io, fib or mac_age"},
     {"PrefixLongerThan32", R"(interface veth-cr port 0 ip 10.0.1.1/24 mode routed
 route 10.0.1.0/33 dev 0
 )",
@@ -432,6 +461,36 @@ filter b.filter
     {"FilterWithoutAPath", R"(filter
 )",
      1, "expected a filter file's path, got end of line"},
+    {"RoutedWithoutAnAddress", R"(interface veth-cr port 0 mode routed
+)",
+     1,
+     "interface 'veth-cr' is routed, so it needs an address: ip <address>/<len>, after its port"},
+    {"BridgedWithoutABridgeDomain", R"(interface veth-h1 port 0 mode bridged
+)",
+     1,
+     "interface 'veth-h1' is bridged, so it needs a bridge domain: bridge-domain <1 to 65535>, "
+     "after its mode"},
+    {"BridgeDomainOnARoutedPort",
+     R"(interface veth-cr port 0 ip 10.0.1.1/24 mode routed bridge-domain 1
+)",
+     1, "only a bridged interface is in a bridge domain"},
+    {"BridgeDomainZero", R"(interface veth-h1 port 0 mode bridged bridge-domain 0
+)",
+     1, "expected a bridge domain from 1 to 65535, got '0'"},
+    {"AddressZero", R"(interface veth-cr port 0 ip 0.0.0.0/24 mode routed
+)",
+     1, "0.0.0.0 is not an address an interface can have"},
+    {"RouteThroughAPortWithNoAddress", R"(interface veth-h1 port 0 mode bridged bridge-domain 1
+route 10.0.9.0/24 dev 0
+)",
+     2, "route 10.0.9.0/24 uses dev 0, but interface 'veth-h1' has no address"},
+    {"ArpThroughAPortWithNoAddress", R"(interface veth-h1 port 0 mode bridged bridge-domain 1
+arp 10.0.9.2 aa:bb:cc:dd:ee:02 dev 0
+)",
+     2, "the ARP entry for 10.0.9.2 uses dev 0, but interface 'veth-h1' has no address"},
+    {"MacAgeZero", R"(mac_age 0
+)",
+     1, "expected a number of seconds from 1 to 4294967295, got '0'"},
 }};
 
 class MalformedConfig : public ::testing::TestWithParam<BadConfig> {};

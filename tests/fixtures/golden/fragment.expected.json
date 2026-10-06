@@ -22,6 +22,7 @@
   "FilterDeny": 0,
   "NoOutPort": 0,
   "UnknownDestPort": 0,
+  "SamePort": 0,
   "TxFull": 0,
   "PoolExhausted": 0,
   "ip_proto_17": 3,

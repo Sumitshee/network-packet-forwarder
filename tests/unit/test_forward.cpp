@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstddef>
@@ -214,7 +215,7 @@ Config topology() {
   c.interfaces = {
       {"veth-cr", 0, kPort0Ip, 24, PortMode::Routed, kPort0Mac},
       {"veth-sr", 1, kPort1Ip, 24, PortMode::Routed, kPort1Mac},
-      {"br0", 2, kPort2Ip, 24, PortMode::Bridged, kPort2Mac},
+      {"br0", 2, kPort2Ip, 24, PortMode::Bridged, kPort2Mac, 1},
   };
   return c;
 }
@@ -312,8 +313,11 @@ class ForwarderTest : public ::testing::Test {
     }
   }
 
-  // Packets the pipeline has counted itself: each Drop or ToHost adds exactly one, a Forward none.
-  [[nodiscard]] std::uint64_t counted() const { return stats_.total_drops() + stats_.to_host; }
+  // Packets the pipeline has counted itself: each Drop, ToHost or Flood adds exactly one, a Forward
+  // none.
+  [[nodiscard]] std::uint64_t counted() const {
+    return stats_.total_drops() + stats_.to_host + stats_.flooded;
+  }
 
   PacketPool pool_{64};
   Config cfg_ = topology();
@@ -364,12 +368,14 @@ TEST_F(ForwarderTest, Step4BroadcastIsRoutedOnlyWhenItIsForTheRouter) {
   expect_drop(process(ping({.eth_dst = kBroadcastMac})), DropReason::UnknownDestPort);
 }
 
-TEST_F(ForwarderTest, Step4BridgedPortCannotSwitchUntilPhase12) {
-  expect_drop(process(ping({.src = ip4(10, 0, 3, 9), .eth_dst = kStrangerMac}), 2),
-              DropReason::UnknownDestPort);
-  // Addressed to the router itself, a frame on a bridged port is routed like any other.
+TEST_F(ForwarderTest, Step4ABridgedPortSwitchesTransitFramesAndRoutesItsOwn) {
+  // Never seen, the stranger is flooded to the rest of the bridge domain (step 1b)...
+  EXPECT_EQ(process(ping({.src = ip4(10, 0, 3, 9), .eth_dst = kStrangerMac}), 2).verdict,
+            Verdict::Flood);
+  // ...but addressed to the router itself, a frame on a bridged port is routed like any other.
   EXPECT_EQ(process(ping({.src = ip4(10, 0, 3, 9), .eth_dst = kPort2Mac}), 2).verdict,
             Verdict::Forward);
+  EXPECT_EQ(stats_.drop(DropReason::UnknownDestPort), 0U);
 }
 
 TEST_F(ForwarderTest, Step5MalformedIpv4Header) {
@@ -1174,6 +1180,189 @@ TEST(DropReason, EveryReasonHasANameOfItsOwn) {
     names.insert(name);
   }
   EXPECT_EQ(names.size(), npf::kDropReasons);
+}
+
+// --- the L2 path (phase 12): steps 1a and 1b on a bridged port -----------------------------------
+
+constexpr MacAddr kPort3Mac{{0x02, 0x00, 0x00, 0x00, 0x00, 0x13}};
+constexpr MacAddr kPort4Mac{{0x02, 0x00, 0x00, 0x00, 0x00, 0x14}};
+constexpr MacAddr kHostA{{0x02, 0xAA, 0x00, 0x00, 0x00, 0x0A}};
+constexpr MacAddr kHostB{{0x02, 0xAA, 0x00, 0x00, 0x00, 0x0B}};
+constexpr MacAddr kHostC{{0x02, 0xAA, 0x00, 0x00, 0x00, 0x0C}};
+constexpr MacAddr kIpv6AllNodes{{0x33, 0x33, 0x00, 0x00, 0x00, 0x01}};
+constexpr std::uint32_t kHostAIp = ip4(10, 0, 9, 1);
+constexpr std::uint32_t kHostBIp = ip4(10, 0, 9, 2);
+constexpr std::uint32_t kSwitchIp = ip4(10, 0, 9, 254);  // port 2's own address
+constexpr std::uint32_t kUplinkIp = ip4(10, 0, 8, 1);
+
+// Bridged ports 0 to 2 in bridge domain 1, of which only port 2 has an address; bridged port 3
+// alone in domain 2; and a routed port 4.
+Config switch_topology() {
+  Config c;
+  c.interfaces = {
+      {"sw0", 0, 0, 0, PortMode::Bridged, kPort0Mac, 1},
+      {"sw1", 1, 0, 0, PortMode::Bridged, kPort1Mac, 1},
+      {"sw2", 2, kSwitchIp, 24, PortMode::Bridged, kPort2Mac, 1},
+      {"sw3", 3, 0, 0, PortMode::Bridged, kPort3Mac, 2},
+      {"up0", 4, kUplinkIp, 24, PortMode::Routed, kPort4Mac},
+  };
+  return c;
+}
+
+// A ping from one host on the bridge to another, in a frame from src_mac to dst_mac.
+Frame between(MacAddr dst_mac, MacAddr src_mac, std::uint32_t dst = kHostBIp,
+              std::uint32_t src = kHostAIp) {
+  return ethernet(dst_mac, src_mac, kEtherTypeIpv4, ipv4(src, dst, 64, echo_request()));
+}
+
+class SwitchTest : public ::testing::Test {
+ protected:
+  ~SwitchTest() override {
+    arp_.flush();  // what it might hold is in held_ too
+    for (Packet* p : held_) {
+      pool_.release(p);
+    }
+    EXPECT_EQ(pool_.available(), pool_.capacity());
+  }
+  SwitchTest() { fwd_.set_time(kNow); }
+  SwitchTest(const SwitchTest&) = delete;
+  SwitchTest& operator=(const SwitchTest&) = delete;
+  SwitchTest(SwitchTest&&) = delete;
+  SwitchTest& operator=(SwitchTest&&) = delete;
+
+  Packet* packet(CBytes frame, std::uint16_t in_port) {
+    Packet* p = pool_.acquire();
+    if (p == nullptr) {
+      throw std::runtime_error("the test pool is too small");
+    }
+    held_.push_back(p);
+    p->resize(frame.size());
+    std::ranges::copy(frame, p->data().begin());
+    p->set_in_port(in_port);
+    return p;
+  }
+  Decision process(CBytes frame, std::uint16_t in_port) {
+    return fwd_.process(*packet(frame, in_port));
+  }
+
+  PacketPool pool_{64};
+  Config cfg_ = switch_topology();
+  LinearLpm fib_;
+  RecordingEvents events_;
+  npf::table::ArpCache arp_{events_, 64};
+  npf::table::MacTable macs_{64};
+  npf::pipe::Filter filter_{{}, npf::pipe::Action::Allow};
+  Counters stats_;
+  Forwarder<LinearLpm> fwd_{cfg_, fib_, arp_, macs_, filter_, stats_};
+  std::vector<Packet*> held_;
+};
+
+TEST_F(SwitchTest, TheSenderOfEveryFrameOnABridgedPortIsLearned) {
+  (void)process(between(kHostB, kHostA), 0);
+  EXPECT_EQ(macs_.lookup(kHostA), 0);
+  (void)process(arp({.sha = kHostB, .spa = kHostBIp, .tpa = kHostAIp}), 1);  // a broadcast too
+  EXPECT_EQ(macs_.lookup(kHostB), 1);
+  (void)process(between(kPort2Mac, kHostC, kSwitchIp, ip4(10, 0, 9, 3)), 2);  // and one for us
+  EXPECT_EQ(macs_.lookup(kHostC), 2);
+  EXPECT_EQ(macs_.size(), 3U);
+}
+
+TEST_F(SwitchTest, NothingIsLearnedOnARoutedPortNorFromAGroupSource) {
+  (void)process(between(kPort4Mac, kHostA, kUplinkIp), 4);
+  (void)process(between(kHostB, kIpv6AllNodes), 0);  // a group address as source
+  EXPECT_EQ(macs_.size(), 0U);
+}
+
+TEST_F(SwitchTest, ALearnedDestinationIsForwardedOutOfItsPortUnchanged) {
+  (void)process(between(kHostA, kHostB, kHostAIp, kHostBIp), 1);  // B is on port 1
+  const Frame f = between(kHostB, kHostA);
+  Packet* p = packet(f, 0);
+  const Decision d = fwd_.process(*p);
+  EXPECT_EQ(d.verdict, Verdict::Forward);
+  EXPECT_EQ(d.out_port, 1);
+  EXPECT_TRUE(std::ranges::equal(p->data(), f)) << "switching must not touch the frame";
+  EXPECT_EQ(stats_.flooded, 1U);  // B's own frame: A was not known yet
+}
+
+TEST_F(SwitchTest, UnknownBroadcastAndMulticastDestinationsAreFlooded) {
+  EXPECT_EQ(process(between(kHostB, kHostA), 0).verdict, Verdict::Flood);         // never seen
+  EXPECT_EQ(process(between(kBroadcastMac, kHostA), 0).verdict, Verdict::Flood);  // broadcast
+  EXPECT_EQ(process(between(kIpv6AllNodes, kHostA), 0).verdict, Verdict::Flood);  // multicast
+  EXPECT_EQ(stats_.flooded, 3U);
+  EXPECT_EQ(stats_.total_drops(), 0U);
+}
+
+TEST_F(SwitchTest, ADestinationLearnedOnTheIngressPortIsDroppedAsSamePort) {
+  (void)process(between(kHostA, kHostB, kHostAIp, kHostBIp), 0);  // B is on port 0, as A is
+  expect_drop(process(between(kHostB, kHostA), 0), DropReason::SamePort);
+  EXPECT_EQ(stats_.drop(DropReason::SamePort), 1U);
+}
+
+TEST_F(SwitchTest, ADestinationLearnedInAnotherBridgeDomainIsFlooded) {
+  (void)process(between(kHostA, kHostC), 3);  // C is on port 3, in domain 2
+  EXPECT_EQ(macs_.lookup(kHostC), 3);
+  EXPECT_EQ(process(between(kHostC, kHostA), 0).verdict, Verdict::Flood);  // within domain 1
+}
+
+TEST_F(SwitchTest, AnyEtherTypeIsSwitched) {
+  (void)process(between(kHostA, kHostB, kHostAIp, kHostBIp), 1);
+  const Decision v6 = process(ethernet(kHostB, kHostA, kEtherTypeIpv6, Frame(40)), 0);
+  EXPECT_EQ(v6.verdict, Verdict::Forward);
+  EXPECT_EQ(v6.out_port, 1);
+  EXPECT_EQ(process(ethernet(kIpv6AllNodes, kHostA, kEtherTypeIpv6, Frame(40)), 0).verdict,
+            Verdict::Flood);
+  EXPECT_EQ(stats_.drop(DropReason::BadEtherType), 0U);
+}
+
+TEST_F(SwitchTest, ABroadcastAskingForAnotherHostIsFlooded) {
+  const Frame who_has_b = arp({.sha = kHostA, .spa = kHostAIp, .tpa = kHostBIp});
+  EXPECT_EQ(process(who_has_b, 0).verdict, Verdict::Flood);
+  EXPECT_EQ(process(who_has_b, 2).verdict, Verdict::Flood);  // a port with an address too
+  EXPECT_EQ(stats_.to_host, 0U);
+}
+
+TEST_F(SwitchTest, ABroadcastAskingForThePortsOwnAddressIsTheRouters) {
+  const Frame who_has_us = arp({.sha = kHostA, .spa = kHostAIp, .tpa = kSwitchIp});
+  EXPECT_EQ(process(who_has_us, 2).verdict, Verdict::ToHost);
+  // From port 0, which has no address, the same question is the bridge's business.
+  EXPECT_EQ(process(who_has_us, 0).verdict, Verdict::Flood);
+  // An IPv4 broadcast frame to the port's address is the router's; one to the limited broadcast,
+  // which a routed port keeps (step 8), is flooded on a bridged port.
+  EXPECT_EQ(process(between(kBroadcastMac, kHostA, kSwitchIp), 2).verdict, Verdict::ToHost);
+  EXPECT_EQ(process(between(kBroadcastMac, kHostA, npf::pipe::kLimitedBroadcast), 2).verdict,
+            Verdict::Flood);
+  EXPECT_EQ(
+      process(between(kBroadcastMac, kHostA, npf::pipe::kLimitedBroadcast, ip4(10, 0, 8, 7)), 4)
+          .verdict,
+      Verdict::ToHost);
+}
+
+TEST_F(SwitchTest, AFrameAddressedToThePortTakesTheL3Path) {
+  EXPECT_EQ(process(between(kPort2Mac, kHostA, kSwitchIp), 2).verdict, Verdict::ToHost);
+  expect_drop(process(ethernet(kPort2Mac, kHostA, kEtherTypeIpv6, Frame(40)), 2),
+              DropReason::BadEtherType);  // the L3 path's step 2, not the switch
+}
+
+TEST_F(SwitchTest, LearningStampsEntriesWithTheTimeSetForTheBurst) {
+  fwd_.set_time(kNow + std::chrono::seconds{10});
+  (void)process(between(kHostB, kHostA), 0);
+  macs_.age(kNow + std::chrono::seconds{310});
+  EXPECT_EQ(macs_.lookup(kHostA), 0);  // exactly 300 s: kept
+  macs_.age(kNow + std::chrono::seconds{311});
+  EXPECT_EQ(macs_.lookup(kHostA), std::nullopt);
+}
+
+TEST(FloodSets, AreTheOtherUpPortsOfTheSameBridgeDomain) {
+  Config cfg = switch_topology();
+  const std::vector<npf::pipe::PortState> ports = npf::pipe::make_port_table(cfg);
+  using Set = std::vector<std::uint16_t>;
+  const std::vector<Set> all_up = npf::pipe::make_flood_sets(ports, {true, true, true, true, true});
+  EXPECT_EQ(all_up, (std::vector<Set>{{1, 2}, {0, 2}, {0, 1}, {}, {}}));
+  const std::vector<Set> one_down =
+      npf::pipe::make_flood_sets(ports, {true, false, true, true, true});
+  EXPECT_EQ(one_down[0], (Set{2}));
+  EXPECT_EQ(one_down[2], (Set{0}));
+  EXPECT_THROW((void)npf::pipe::make_flood_sets(ports, {true, true}), std::invalid_argument);
 }
 
 }  // namespace

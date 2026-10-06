@@ -2,6 +2,7 @@
 #include <array>
 #include <cassert>
 #include <charconv>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -66,8 +67,8 @@ constexpr std::array<Word<FibKind>, 4> kFibKinds{{
     {"dir24_8", FibKind::Dir24_8},
 }};
 
-constexpr std::array<std::string_view, 6> kSettings{"pool_size", "burst", "mode",
-                                                    "workers",   "io",    "fib"};
+constexpr std::array<std::string_view, 7> kSettings{"pool_size", "burst", "mode",   "workers",
+                                                    "io",        "fib",   "mac_age"};
 
 constexpr std::array<Word<pipe::Action>, 2> kActions{{
     {"allow", pipe::Action::Allow},
@@ -405,32 +406,34 @@ class Parser {
     } else {
       w.fail(
           std::format("unknown keyword '{}'; expected interface, route, arp, filter, pool_size, "
-                      "burst, mode, workers, io or fib",
+                      "burst, mode, workers, io, fib or mac_age",
                       keyword));
     }
   }
 
   // The checks that need the whole file, so a route may come before the interface it uses.
   Config result() {
-    const auto has_port = [this](std::uint16_t port) {
-      return std::ranges::any_of(cfg_.interfaces,
-                                 [port](const InterfaceConfig& i) { return i.port == port; });
+    // What is wrong with a dev naming port, if anything: through a port with no address, the router
+    // could neither ask for a neighbour's MAC nor answer as itself.
+    const auto dev_fault = [this](std::uint16_t port) -> std::string {
+      const auto it = std::ranges::find(cfg_.interfaces, port, &InterfaceConfig::port);
+      if (it == cfg_.interfaces.end()) {
+        return std::format("no interface has port {}", port);
+      }
+      return it->ip == 0 ? std::format("interface '{}' has no address", it->name) : std::string{};
     };
     for (std::size_t i = 0; i < cfg_.routes.size(); ++i) {
       const table::Route& r = cfg_.routes[i];
-      if (!has_port(r.out_port)) {
-        throw ConfigError(route_lines_[i],
-                          std::format("route {} uses dev {}, but no interface has port {}",
-                                      format_prefix(r.prefix), r.out_port, r.out_port));
+      if (const std::string why = dev_fault(r.out_port); !why.empty()) {
+        throw ConfigError(route_lines_[i], std::format("route {} uses dev {}, but {}",
+                                                       format_prefix(r.prefix), r.out_port, why));
       }
     }
     for (std::size_t i = 0; i < cfg_.arp.size(); ++i) {
       const StaticArp& a = cfg_.arp[i];
-      if (!has_port(a.port)) {
-        throw ConfigError(
-            arp_lines_[i],
-            std::format("the ARP entry for {} uses dev {}, but no interface has port {}",
-                        format_ipv4(a.ip), a.port, a.port));
+      if (const std::string why = dev_fault(a.port); !why.empty()) {
+        throw ConfigError(arp_lines_[i], std::format("the ARP entry for {} uses dev {}, but {}",
+                                                     format_ipv4(a.ip), a.port, why));
       }
     }
     return std::move(cfg_);
@@ -442,16 +445,40 @@ class Parser {
     ifc.name = w.take("an interface name");
     w.expect("port");
     ifc.port = take_port(w);
-    w.expect("ip");
-    const auto [ip, prefix_len] = take_interface_address(w);
-    ifc.ip = ip;
-    ifc.prefix_len = prefix_len;
+    const bool has_ip = w.accept("ip");
+    if (has_ip) {
+      const auto [ip, prefix_len] = take_interface_address(w);
+      if (ip == 0) {  // 0 is how an InterfaceConfig says "no address"
+        w.fail("0.0.0.0 is not an address an interface can have");
+      }
+      ifc.ip = ip;
+      ifc.prefix_len = prefix_len;
+    }
     w.expect("mode");
     ifc.mode = take_word(w, kPortModes, "a port mode");
+    if (w.accept("bridge-domain")) {
+      if (ifc.mode != PortMode::Bridged) {
+        w.fail("only a bridged interface is in a bridge domain");
+      }
+      ifc.bridge_domain = static_cast<std::uint16_t>(
+          take_number(w, "a bridge domain", {1, std::numeric_limits<std::uint16_t>::max()}));
+    }
     if (w.accept("mac")) {
       ifc.mac = take_mac_or_auto(w);
     }
     w.expect_end();
+    if (ifc.mode == PortMode::Routed && !has_ip) {
+      w.fail(
+          std::format("interface '{}' is routed, so it needs an address: ip <address>/<len>, "
+                      "after its port",
+                      ifc.name));
+    }
+    if (ifc.mode == PortMode::Bridged && ifc.bridge_domain == 0) {
+      w.fail(
+          std::format("interface '{}' is bridged, so it needs a bridge domain: bridge-domain "
+                      "<1 to 65535>, after its mode",
+                      ifc.name));
+    }
     for (std::size_t i = 0; i < cfg_.interfaces.size(); ++i) {
       const InterfaceConfig& other = cfg_.interfaces[i];
       if (other.name == ifc.name) {
@@ -534,9 +561,12 @@ class Parser {
       cfg_.workers = take_number(w, "a worker count", {1, kMaxCount});
     } else if (key == "io") {
       cfg_.io = take_word(w, kIoKinds, "an I/O backend");
-    } else {
-      assert(key == "fib" && "kSettings names a setting this function does not handle");
+    } else if (key == "fib") {
       cfg_.fib = take_word(w, kFibKinds, "a FIB");
+    } else {
+      assert(key == "mac_age" && "kSettings names a setting this function does not handle");
+      cfg_.mac_age = std::chrono::seconds{static_cast<std::chrono::seconds::rep>(
+          take_number(w, "a number of seconds", {1, kMaxCount}))};
     }
     w.expect_end();
   }
@@ -701,8 +731,14 @@ FilterParseResult load_filter(const std::filesystem::path& path, const Config& r
 std::string to_string(const Config& cfg) {
   std::string out;
   for (const InterfaceConfig& i : cfg.interfaces) {
-    out += std::format("interface {} port {} ip {}/{} mode {}", i.name, i.port, format_ipv4(i.ip),
-                       i.prefix_len, word_for(kPortModes, i.mode));
+    out += std::format("interface {} port {}", i.name, i.port);
+    if (i.ip != 0) {
+      out += std::format(" ip {}/{}", format_ipv4(i.ip), i.prefix_len);
+    }
+    out += std::format(" mode {}", word_for(kPortModes, i.mode));
+    if (i.mode == PortMode::Bridged) {
+      out += std::format(" bridge-domain {}", i.bridge_domain);
+    }
     if (i.mac) {
       out += std::format(" mac {}", format_mac(*i.mac));
     }
@@ -726,9 +762,9 @@ std::string to_string(const Config& cfg) {
     }
     out += std::format("filter {}\n", cfg.filter);
   }
-  out += std::format("pool_size {}\nburst {}\nmode {}\nworkers {}\nio {}\nfib {}\n", cfg.pool_size,
-                     cfg.burst, word_for(kRunModes, cfg.mode), cfg.workers,
-                     word_for(kIoKinds, cfg.io), word_for(kFibKinds, cfg.fib));
+  out += std::format("pool_size {}\nburst {}\nmode {}\nworkers {}\nio {}\nfib {}\nmac_age {}\n",
+                     cfg.pool_size, cfg.burst, word_for(kRunModes, cfg.mode), cfg.workers,
+                     word_for(kIoKinds, cfg.io), word_for(kFibKinds, cfg.fib), cfg.mac_age.count());
   return out;
 }
 

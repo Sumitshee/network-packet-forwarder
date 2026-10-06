@@ -29,6 +29,7 @@ import socket
 import struct
 
 from scapy.layers.inet import ICMP, IP, TCP, UDP, IPOption_RR, fragment
+from scapy.layers.inet6 import ICMPv6ND_RS, IPv6
 from scapy.layers.l2 import ARP, Dot1AD, Dot1Q, Ether
 from scapy.packet import Raw
 
@@ -98,7 +99,7 @@ T0_US = 1_700_000_000_000_000
 
 DROP_REASONS = ("ShortFrame", "BadEtherType", "BadIpv4Header", "BadChecksum", "MartianSource",
                 "TtlExpired", "NoRoute", "ArpUnresolved", "FilterDeny", "NoOutPort",
-                "UnknownDestPort", "TxFull", "PoolExhausted")
+                "UnknownDestPort", "SamePort", "TxFull", "PoolExhausted")
 
 
 def to_router(l3) -> bytes:
@@ -166,10 +167,12 @@ def counters(inputs: list[bytes], outputs: list[bytes], protocols: dict[int, int
 
 
 def write_golden(name: str, what: str, inputs: list[bytes], outputs: list[tuple[int, bytes]],
-                 expected: dict[str, int], filter_text: str | None = None) -> None:
+                 expected: dict[str, int], filter_text: str | None = None,
+                 conf_template: str = "") -> None:
     """One case. outputs pairs each frame the router must write with the input it answers, whose
-    timestamp it must carry. filter_text, if given, is the case's filter file."""
-    conf = GOLDEN_CONF.format(name=name, what=what, pool_size=POOL_SIZE)
+    timestamp it must carry. filter_text, if given, is the case's filter file; conf_template, if
+    given, the router it replays through instead of the usual two routed ports."""
+    conf = (conf_template or GOLDEN_CONF).format(name=name, what=what, pool_size=POOL_SIZE)
     if filter_text is not None:
         (GOLDEN / f"{name}.filter").write_text(filter_text)
         conf += f"filter {name}.filter\n"
@@ -365,6 +368,76 @@ def filter_case() -> None:
                  filter_text=text)
 
 
+# --- switching (phase 12) ------------------------------------------------------------------------
+
+# The router as a three-port switch: every port bridged, in bridge domain 1, with no address. Burst
+# 1, so that each input is handled, and its copies sent, before the next is read: the output then
+# holds each input's copies together, in port order.
+BRIDGE_CONF = """\
+# Golden case {name}: {what}.
+# Written by scripts/make_fixtures.py; tests/integration/test_golden.cpp replays it.
+interface veth-h1 port 0 mode bridged bridge-domain 1 mac 02:00:00:00:09:01
+interface veth-h2 port 1 mode bridged bridge-domain 1 mac 02:00:00:00:09:02
+interface veth-h3 port 2 mode bridged bridge-domain 1 mac 02:00:00:00:09:03
+pool_size {pool_size}
+burst 1
+io pcap
+"""
+BRIDGE_PORTS = (0, 1, 2)
+H1_MAC = "02:00:00:00:a0:01"
+H2_MAC = "02:00:00:00:a0:02"
+H4_MAC = "02:00:00:00:a0:04"
+
+
+def switch_model(frames: list[bytes], in_port: int = 0) -> tuple[list[tuple[int, bytes]], dict]:
+    """What a learning switch must do with frames that all arrive on in_port, as docs/BUILD_PLAN.md
+    phase 12 says: learn every unicast source's port; flood a frame to a group address, or to one
+    not learned, out of every other port of the bridge domain, in port order; send one to a learned
+    destination out of that port; and drop it if that is the port it came in on. Returns the frames
+    sent, each with the input it came from, and the counters that moves."""
+    table: dict[bytes, int] = {}
+    sent: list[tuple[int, bytes]] = []
+    counted = {"flooded": 0, "forwarded": 0, "SamePort": 0}
+    for i, frame in enumerate(frames):
+        dst, src = frame[0:6], frame[6:12]
+        if not src[0] & 1:
+            table[src] = in_port
+        if dst[0] & 1 or dst not in table:
+            counted["flooded"] += 1
+            sent += [(i, frame) for port in BRIDGE_PORTS if port != in_port]
+        elif table[dst] == in_port:
+            counted["SamePort"] += 1
+        else:
+            counted["forwarded"] += 1
+            sent.append((i, frame))
+    return sent, counted
+
+
+def switch_case() -> None:
+    """docs/BUILD_PLAN.md phase 12's golden case. A replay delivers every frame on port 0, so this
+    shows flooding -- a broadcast ARP request, a frame to a station not yet heard from, an IPv6
+    multicast -- and a frame to a station learned on the port it came in on, dropped."""
+    payload = Raw(b"npf-golden")
+    who_has = bytes(Ether(dst=BROADCAST, src=H1_MAC)
+                    / ARP(op=1, hwsrc=H1_MAC, psrc="10.0.9.1", hwdst=ZERO_MAC, pdst="10.0.9.2"))
+    who_has += bytes(60 - len(who_has))  # padded to the Ethernet minimum, as on a wire
+    unknown = bytes(Ether(dst=H2_MAC, src=H1_MAC)
+                    / IP(src="10.0.9.1", dst="10.0.9.2", ttl=64, id=0x6001)
+                    / ICMP(type=8, id=9, seq=1) / payload)
+    solicit = bytes(Ether(dst="33:33:00:00:00:02", src=H1_MAC)
+                    / IPv6(src="fe80::a0:1", dst="ff02::2", hlim=255) / ICMPv6ND_RS())
+    # A station behind port 0 too, writing to h1, which the first frame showed is on port 0.
+    same_port = bytes(Ether(dst=H1_MAC, src=H4_MAC)
+                      / IP(src="10.0.9.4", dst="10.0.9.1", ttl=64, id=0x6004)
+                      / ICMP(type=8, id=9, seq=2) / payload)
+    inputs = [who_has, unknown, solicit, same_port]
+    sent, counted = switch_model(inputs)
+    assert counted == {"flooded": 3, "forwarded": 0, "SamePort": 1}, counted
+    write_golden("l2_flood", "a three-port switch floods, and drops a frame to its own port",
+                 inputs, sent, counters(inputs, [frame for _, frame in sent], **counted),
+                 conf_template=BRIDGE_CONF)
+
+
 def main() -> None:
     FIXTURES.mkdir(parents=True, exist_ok=True)
     print(f"writing {FIXTURES}")
@@ -430,6 +503,7 @@ def main() -> None:
 
     golden_cases()
     filter_case()
+    switch_case()
 
 
 if __name__ == "__main__":

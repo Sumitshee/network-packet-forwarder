@@ -10,6 +10,7 @@
 #include <npf/table/arp_cache.hpp>
 #include <optional>
 #include <span>
+#include <utility>
 #include <vector>
 
 namespace npf::table {
@@ -176,6 +177,19 @@ std::optional<ArpNeighbour> ArpCache::peek(std::uint32_t ip) const noexcept {
                       .state = e->state,
                       .is_static = e->is_static,
                       .queued = e->queued};
+}
+
+std::vector<std::pair<std::uint32_t, ArpNeighbour>> ArpCache::list() const {
+  std::vector<std::pair<std::uint32_t, ArpNeighbour>> out;
+  out.reserve(size_);
+  for (const Entry& e : std::span(entries_).first(size_)) {
+    out.emplace_back(e.ip, ArpNeighbour{.mac = e.mac,
+                                        .port = e.port,
+                                        .state = e.state,
+                                        .is_static = e.is_static,
+                                        .queued = e.queued});
+  }
+  return out;
 }
 
 void ArpCache::probe(Entry& e) noexcept {

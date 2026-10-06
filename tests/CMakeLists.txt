@@ -52,6 +52,9 @@ npf_count_allocations(test_arp_cache)
 target_link_libraries(test_arp_cache PRIVATE npf_table)
 npf_add_unit_test(test_lpm_property unit/test_lpm_property.cpp)
 target_link_libraries(test_lpm_property PRIVATE npf_table)
+npf_add_unit_test(test_mac_table unit/test_mac_table.cpp)
+npf_count_allocations(test_mac_table)
+target_link_libraries(test_mac_table PRIVATE npf_table)
 npf_add_unit_test(test_config unit/test_config.cpp)
 target_compile_definitions(test_config PRIVATE NPF_CONFIG_DIR="${PROJECT_SOURCE_DIR}/configs")
 npf_add_unit_test(test_forward unit/test_forward.cpp)
@@ -75,7 +78,7 @@ add_dependencies(test_golden npf)
 
 # Integration tests that need root. Run by anyone else, each exits 77, which CTest reports as
 # skipped rather than failed -- so in CI they are skipped.
-foreach(name forward_netns traceroute arp_resolution)
+foreach(name forward_netns traceroute arp_resolution switching)
   add_test(NAME integration.${name}
            COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/integration/test_${name}.sh $<TARGET_FILE:npf>)
   set_tests_properties(integration.${name} PROPERTIES
