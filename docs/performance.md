@@ -509,6 +509,54 @@ and -3.0), against a noise band of 5.1.
 **Caveat:** a cache with many neighbours spends more in the search, which this benchmark does not
 exercise.
 
+### Entry 4: the header checksum in 32-bit words (NOISE: reverted)
+
+**Change:**
+
+- `ones_complement_sum()` reads 32-bit big-endian words into a 64-bit accumulator, then a 16-bit
+  word and an odd byte for what is left, and folds 64 bits down to 16.
+- Since 2^16 = 1 modulo 2^16 - 1, adding a 32-bit word adds its two 16-bit halves at once, so the
+  result is unchanged.
+- The tests that hold it to `checksum_reference()` passed: a million random IPv4 headers, and
+  100,000 buffers of every length up to 1500.
+
+**Before:** commit `4080dd7`. **After:** that, plus the change. Two comparisons.
+
+The datapath:
+
+| Benchmark, metric | Before: median (min – p95) | After: median (min – p95) | Delta | Noise band | Rounds | Verdict |
+|---|---:|---:|---:|---:|---:|---|
+| `full_datapath/dir24_8/topology`, cycles | 292.2 (283.5 – 338.2) | 287.3 (279.7 – 299.1) | -4.9 (-1.7%) | 46.0 | -16.5, +2.8 | NOISE |
+| `full_datapath/linear/topology`, cycles | 308.8 (294.9 – 333.5) | 299.9 (289.8 – 311.0) | -8.9 (-2.9%) | 24.7 | -16.2, -3.8 | NOISE |
+
+The sum on its own, by buffer size:
+
+| `bench_checksum` (no cycle counter), ns per call | Before: median (min – p95) | After: median (min – p95) | Delta | Noise band | Rounds | Verdict |
+|---|---:|---:|---:|---:|---:|---|
+| `BM_OnesComplementSum/20`, ns | 9.4 (8.6 – 11.8) | 8.6 (8.1 – 12.3) | -0.8 (-8.5%) | 3.7 | -0.8, -0.5 | NOISE |
+| `BM_OnesComplementSum/60`, ns | 30.5 (24.8 – 46.9) | 20.9 (18.5 – 28.1) | -9.6 (-31.4%) | 16.4 | -10.2, -9.8 | NOISE |
+| `BM_OnesComplementSum/1500`, ns | 639.8 (573.1 – 712.8) | 470.6 (444.7 – 624.2) | -169.2 (-26.4%) | 153.6 | -169.6, -141.5 | FASTER |
+
+**Delta:**
+
+- The datapath's changes are noise, and their rounds disagree.
+- On its own, the sum is only significant at 1500 bytes: -169.2 ns
+  (-26.4%). At 20 and 60 bytes, the sizes of IPv4 headers, it is noise.
+
+**Verdict: noise, for the datapath this was for. The change is reverted** in the next commit.
+Besides, GCC 13 warned (`-Warray-bounds`) about the new loop in one test's inlined constant-size
+buffer, which CI's `-Werror` would have refused.
+
+**What it says:**
+
+- Entry 1 put the checksum check at 34.6 cycles. Halving the additions for ten 16-bit words
+  did not move that measurably.
+- Wider words pay at an MTU's length, not a header's. Should the router ever sum transport
+  checksums over a whole packet, this is the change to measure again. It is in the Candidates.
+
+**Caveat:** the 1500-byte result is `bench_checksum`'s, a loop over one buffer that stays in the
+L1 cache.
+
 ## Phase 3: checksum microbenchmark (tier A)
 
 **What.** `bench/micro/bench_checksum.cpp` times the three checksum paths in
