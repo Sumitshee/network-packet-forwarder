@@ -4,7 +4,7 @@ A userspace Layer-2/Layer-3 packet forwarding engine — a software router — w
 Linux. It receives raw Ethernet frames from network interfaces, parses them, makes forwarding
 decisions, rewrites headers and transmits them out of the correct interface.
 
-**Status: phase 15 of 19.** `npf` routes IPv4 between Linux interfaces. It runs every packet
+**Status: phase 16 of 19.** `npf` routes IPv4 between Linux interfaces. It runs every packet
 through a fixed fourteen-step pipeline: parse, validate, route,
 resolve the next hop, rewrite the MAC addresses, decrement the TTL and patch the checksum. Every
 packet it drops is counted under a reason. It resolves its neighbours with ARP itself: a packet
@@ -43,6 +43,19 @@ own ARP caches and pass each other the ARP replies they hear. An integration tes
 datagrams of one flow through 1, 2, 4 and 8 workers in each model and checks that they arrive in
 the order sent; another runs the router built with ThreadSanitizer under a minute of sustained
 traffic in each model.
+
+It reads and writes the wire through either of two socket backends, chosen with `io` in the
+configuration or `--io` on the command line. `af_packet` makes a system call per frame. `mmap`
+(PACKET_MMAP) shares rings with the kernel. On receive, the kernel fills 4 MiB blocks of a
+TPACKET_V3 ring and hands each one over when it is full, or after 10 ms. On transmit, frames go
+into the slots of a TPACKET_V2 ring that bypasses the queueing discipline, with one system call
+per burst. Both backends copy each frame into a pool buffer and out again; neither is zero-copy.
+An integration test runs every golden case live through both and requires byte-identical frames
+out of every port. In pipeline mode the RX threads receive only what the workers' rings can
+take, and leave the rest waiting in the kernel. The kernel's own receive drops are reported
+beside npf's counters as `kernel_rx_drops`. The 10 ms is a latency cost at low rates: a block
+that never fills waits for its timer. [`docs/performance.md`](docs/performance.md) compares the
+two backends.
 
 It is measured at two tiers, kept apart. Tier A times the forwarding code in process, with no I/O:
 parsing, FIB lookups in each of the four tables, the whole fourteen-step pipeline, the packet pool
@@ -133,10 +146,14 @@ sudo ./build/dev/npf show stats
 sudo ./scripts/cleanup_netns.sh
 ```
 
-`--workers` and `--mode` override the configuration's `workers` and `mode`:
+`--workers`, `--mode` and `--io` override the configuration's `workers`, `mode` and `io`:
 
 ```bash
 sudo ip netns exec ns-router ./build/dev/npf run --config configs/router.conf --workers 4 --mode pipeline
+```
+
+```bash
+sudo ip netns exec ns-router ./build/dev/npf run --config configs/router.conf --io mmap
 ```
 
 `bench/system/gen` sends numbered UDP flows from the client, and `scripts/check_ordering.py` checks a
@@ -283,8 +300,9 @@ ctest --preset dev -R golden --output-on-failure
   directions of a connection may be handled by different workers; each direction stays in order.
   Each worker resolves its neighbours for itself, so several may ask for the same one, and has its
   own ICMP rate limiter, so the router as a whole sends up to N times one limiter's allowance.
-  Pipeline mode needs a power-of-two number of workers and a `pool_size` of at most 16384, and drops
-  a packet whose worker's ring is full, as `RingFull`. Bridged ports need `workers 1`: each worker
+  Pipeline mode needs a power-of-two number of workers and a `pool_size` of at most 16384. While
+  any worker's ring is full its RX threads receive nothing: they spin in `poll()` on a readable
+  socket until there is room, and the kernel drops what overflows. Bridged ports need `workers 1`: each worker
   would keep a MAC table of its own. The routing table cannot change while the router runs.
 - **IPv6.** Not routed: an IPv6 frame for the router is dropped as an unsupported EtherType, while
   one crossing a bridge is switched like any other frame. The longest-prefix match tables are
@@ -300,14 +318,18 @@ ctest --preset dev -R golden --output-on-failure
   packet socket reads it, passing it alongside instead (`PACKET_AUXDATA`, or the TPACKET_V3
   header), and npf does not read it back, so a tagged frame is forwarded untagged.
   `tests/integration/test_io_equivalence.sh` checks exactly this.
+- **Zero-copy.** Both socket backends copy every frame between the kernel's memory and a pool
+  buffer, once on the way in and once on the way out. PACKET_MMAP saves the system call per
+  frame, not the copies. With `mmap`, the 10 ms block timeout is fixed, as are the ring sizes:
+  8 blocks of 4 MiB per port, shared between the sockets of a fanout group, and 512 TX slots.
 - **IPv4 options.** A header's options are skipped using its length field; none is interpreted.
 - **Fragment reassembly.** Fragments are never reassembled. Only a first (or only) fragment carries
   the transport header, so every other fragment is handled with no ports at all.
 - **TCP.** Only the header's fields are read: ports, sequence and acknowledgement numbers, flags.
   There is no connection state.
 - **Most configuration choices.** The configuration parser accepts every value the file format
-  defines, but `npf run` runs only `io af_packet`, and `npf replay` only `io pcap`, on one thread
-  (`mode rtc`, `workers 1`); both only with `fib linear`. They refuse the rest: `fib trie`, `patricia` and
+  defines, but `npf run` runs only `io af_packet` and `io mmap` (not `io xdp`), and `npf replay`
+  only `io pcap`, on one thread (`mode rtc`, `workers 1`); both only with `fib linear`. They refuse the rest: `fib trie`, `patricia` and
   `dir24_8` name tables that exist and are tested, but the router is not built on them yet.
 
 ## Known limitations

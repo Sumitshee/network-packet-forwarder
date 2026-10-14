@@ -111,8 +111,9 @@ def context(args, tier_a):
     cache = cmake_cache(args.build)
     compiler = cache.get("CMAKE_CXX_COMPILER")
     _, version = run([compiler, "--version"]) if compiler else (1, "")
-    _, sha = run(["git", "-c", f"safe.directory={ROOT}", "-C", ROOT, "rev-parse", "HEAD"])
-    _, dirty = run(["git", "-c", f"safe.directory={ROOT}", "-C", ROOT, "status", "--porcelain", "--", ".", ":!bench/results",
+    src = args.source
+    _, sha = run(["git", "-c", f"safe.directory={src}", "-C", src, "rev-parse", "HEAD"])
+    _, dirty = run(["git", "-c", f"safe.directory={src}", "-C", src, "status", "--porcelain", "--", ".", ":!bench/results",
                     ":!docs/performance.md", ":!docs/img"])
     code, perf = run(["sh", "-c", "perf stat -e cycles true"])
     datapath = tier_a.get("bench_datapath", {}).get("context", {})
@@ -248,6 +249,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("raw")
     parser.add_argument("--build", required=True)
+    parser.add_argument("--source", default=ROOT,
+                        help="the source tree npf was built from (default: this checkout)")
     parser.add_argument("--out", required=True)
     parser.add_argument("--quick", action="store_true")
     args = parser.parse_args()

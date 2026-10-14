@@ -38,6 +38,9 @@ NPF="$BUILD/npf"
 # [phase 15] NPF_BENCH_TOOLS: where gen and sink come from, when npf comes from a variant build --
 # so that a change to npf's build flags does not change the traffic it is measured with.
 TOOLS=${NPF_BENCH_TOOLS:-$BUILD}
+# [phase 16] NPF_BENCH_SOURCE: the source tree npf was built from, when that is another commit's
+# worktree -- so that the result names the commit measured, not the one checked out here.
+SOURCE=${NPF_BENCH_SOURCE:-$ROOT}
 GEN="$TOOLS/bench/system/gen"
 SINK="$TOOLS/bench/system/sink"
 CONFIG="$ROOT/configs/router.conf"
@@ -119,7 +122,7 @@ if [[ -n $ONLY_CONFIGS ]]; then
 fi
 
 # Under sudo, git refuses a repository root does not own unless told it is safe.
-SHA=$(git -c safe.directory="$ROOT" -C "$ROOT" rev-parse --short HEAD)
+SHA=$(git -c safe.directory="$SOURCE" -C "$SOURCE" rev-parse --short HEAD)
 DATE=$(date -u +%F)
 RAW="$ROOT/bench/results/raw/$DATE-$SHA${LABEL:+-$LABEL}"
 OUT="$ROOT/bench/results/$DATE-$SHA${LABEL:+-$LABEL}.json"
@@ -357,14 +360,14 @@ fi
 ((TIER_B)) && tier_b
 
 if ((QUICK)); then
-  python3 "$ROOT/scripts/bench_combine.py" "$RAW" --build "$BUILD" --quick \
+  python3 "$ROOT/scripts/bench_combine.py" "$RAW" --build "$BUILD" --source "$SOURCE" --quick \
     --out "$RAW/combined.json" || die "the results did not pass their checks"
   log "a rehearsal: $RAW/combined.json, not for bench/results"
   if ((COMPARE_IO)); then
     python3 "$ROOT/scripts/bench_compare_io.py" "$RAW/combined.json"
   fi
 else
-  python3 "$ROOT/scripts/bench_combine.py" "$RAW" --build "$BUILD" --out "$OUT" ||
+  python3 "$ROOT/scripts/bench_combine.py" "$RAW" --build "$BUILD" --source "$SOURCE" --out "$OUT" ||
     die "the results did not pass their checks"
   log "wrote $OUT"
   if ((COMPARE_IO)); then
