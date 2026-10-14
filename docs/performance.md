@@ -658,6 +658,40 @@ in the next commit.
 **Caveat:** a header with options is longer, so a recompute would cost more; this benchmark's
 headers have none.
 
+### Entry 9: the FIB through its virtual interface (NOISE: the template stays)
+
+`docs/BUILD_PLAN.md`'s candidate 7 is to devirtualise the FIB. `Forwarder` has been templated on
+the FIB's type since phase 6, so this entry measures what it saves, the other way round: the cost
+of the abstraction.
+
+**Change (an experiment):** step 11 calls `lookup_v()`, the `Fib` interface's virtual function,
+instead of the concrete table's inline `lookup()`. The pointer passes through an empty `asm`
+statement, so the compiler cannot see the dynamic type and turn the call back into a direct one;
+both tables are `final`, and otherwise it could.
+
+**Before:** commit `8fbab42`, the direct call. **After:** the virtual call.
+
+| Benchmark, metric | Before: median (min – p95) | After: median (min – p95) | Delta | Noise band | Rounds | Verdict |
+|---|---:|---:|---:|---:|---:|---|
+| `full_datapath/dir24_8/topology`, cycles | 288.7 (283.0 – 300.6) | 289.5 (286.0 – 298.7) | +0.8 (+0.3%) | 11.9 | -1.5, +4.0 | NOISE |
+| `full_datapath/linear/topology`, cycles | 296.0 (291.4 – 309.1) | 300.1 (290.2 – 305.5) | +4.1 (+1.4%) | 13.1 | +6.5, +1.9 | NOISE |
+
+**Delta:** +0.8 cycles per packet on DIR-24-8 and +4.1 on the linear
+table, inside bands of 11.9 and 13.1, with rounds that disagree
+on DIR-24-8.
+
+**Verdict: noise.** The virtual call costs nothing this benchmark can resolve. The experiment is
+reverted in the next commit, so the template stays: it costs nothing either, and it lets the
+lookup inline.
+
+**What it says:** every packet here calls the same function through the same pointer, which the
+CPU's indirect-branch predictor gets right every time. The abstraction's cost in this benchmark is
+an indirect call that is never mispredicted, and that is below the noise.
+
+**Caveat:** a FIB lookup in a larger loop body, or one that alternated between tables, might give
+the predictor more trouble. This entry does not claim the template was unnecessary, only that its
+saving is not measurable here.
+
 ## Phase 3: checksum microbenchmark (tier A)
 
 **What.** `bench/micro/bench_checksum.cpp` times the three checksum paths in

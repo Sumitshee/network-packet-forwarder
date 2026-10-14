@@ -444,7 +444,11 @@ Decision Forwarder<FibT>::route(core::Packet& p, const proto::EthView& eth,
   }
 
   // 11. Route. error_for() turns the drop into an ICMP Net Unreachable.
-  const std::optional<table::NextHop> next = fib_->lookup(ip->dst());
+  // Entry 9's experiment: the lookup through the Fib interface's virtual call. The empty asm hides
+  // the dynamic type, so the compiler cannot turn the call back into a direct one.
+  const table::Fib* through_interface = fib_;
+  asm("" : "+r"(through_interface));
+  const std::optional<table::NextHop> next = through_interface->lookup_v(ip->dst());
   if (!next) {
     return drop(DropReason::NoRoute);
   }
