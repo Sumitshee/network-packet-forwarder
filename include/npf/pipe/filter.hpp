@@ -45,6 +45,11 @@ class Filter {
   // tiny-fragment attack on exactly such rules.
   [[nodiscard]] bool has_port_rules() const noexcept { return port_rules_; }
 
+  // [phase 15] With no rules, evaluate() returns the default action for every packet, whatever is
+  // in it -- which lets the pipeline skip reading the packet for it (docs/performance.md, entry 2).
+  [[nodiscard]] bool empty() const noexcept { return rules_.empty(); }
+  [[nodiscard]] Action default_action() const noexcept { return default_; }
+
  private:
   std::vector<Rule> rules_;
   Action default_;

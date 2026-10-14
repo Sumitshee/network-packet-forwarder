@@ -435,6 +435,49 @@ changes is kept: each removes behaviour the router must have.
   254.
 - One FIB, one table size and one traffic mix: frames to one neighbour, all forwarded.
 
+### Entry 2: skip the filter when it has no rules (NOISE: reverted)
+
+**Change:**
+
+- `Filter` gains `empty()` and `default_action()`.
+- `filter_denies()` returns the policy straight away for a filter with no rules, instead of parsing
+  the transport header and calling `evaluate()` to loop over nothing.
+- A filter with no rules is its policy for every packet, so nothing it decides changes. A new
+  test holds that, malformed transport headers included.
+
+**Before:** commit `1734df5`. **After:** that, plus the change.
+
+| Benchmark, metric | Before: median (min – p95) | After: median (min – p95) | Delta | Noise band | Rounds | Verdict |
+|---|---:|---:|---:|---:|---:|---|
+| `full_datapath/dir24_8/topology`, cycles | 280.5 (276.0 – 293.0) | 252.0 (250.2 – 285.1) | -28.5 (-10.2%) | 33.1 | -32.3, -26.8 | NOISE |
+| `full_datapath/linear/topology`, cycles | 287.1 (284.8 – 305.2) | 258.1 (256.0 – 297.4) | -29.0 (-10.1%) | 39.3 | -17.0, -28.6 | NOISE |
+| `full_datapath/dir24_8/topology`, ns | 90.8 (78.3 – 131.6) | 75.9 (70.7 – 146.8) | -14.9 (-16.4%) | 70.9 | -28.3, -7.1 | NOISE |
+| `full_datapath/linear/topology`, ns | 74.8 (72.3 – 84.2) | 80.9 (66.5 – 164.4) | +6.1 (+8.2%) | 83.4 | +32.6, -2.8 | NOISE |
+
+**Delta:**
+
+- -28.5 cycles per packet on DIR-24-8, and -29.0 on the
+  linear table.
+- Both rounds agree, at -32.3 and -26.8.
+- The noise bands are 33.1 and 39.3: each run had
+  repetitions that slow.
+
+**Verdict: noise, by the phase's rule. The change is reverted** in the commit after the one that
+records it. The test stays: it holds either way.
+
+**What it says:**
+
+- The two rounds agree in sign and in size, so the improvement is probably real. It is smaller
+  than this run's spread, though, and the rule is the rule.
+- It is also well short of the 78.6 cycles that removing the whole filter step saved
+  (entry 1). Where the rest of that saving came from was not measured. One possibility: with the
+  step gone entirely, the compiler can arrange the steps around it differently.
+- A filter with rules gains nothing from this change, whatever its size.
+
+**Caveat:** a better-resolved instrument -- more repetitions, a quieter machine -- might find this
+change significant. The rule was fixed before any change was measured, and is not changed after
+one.
+
 ## Phase 3: checksum microbenchmark (tier A)
 
 **What.** `bench/micro/bench_checksum.cpp` times the three checksum paths in

@@ -481,6 +481,20 @@ TEST_F(ForwarderTest, Step10ComesAfterPacketsForTheRouterAndExpiringOnes) {
   expect_drop(process(ping({.ttl = 2})), DropReason::FilterDeny);        // step 10
 }
 
+// A filter with no rules is its policy, for every packet: even one whose transport header does not
+// parse, which the pipeline no longer reads when there are no rules to read it for.
+TEST_F(ForwarderTest, Step10AFilterWithNoRulesIsItsPolicyWhateverThePacket) {
+  Frame tcp(8);  // too short for a TCP header
+  const Frame truncated = ethernet(kPort0Mac, kClientMac, kEtherTypeIpv4,
+                                   ipv4(kClient, kServer, 64, tcp, npf::proto::kIpProtoTcp));
+  filter_ = Filter({}, Action::Allow);
+  EXPECT_EQ(process(truncated).verdict, Verdict::Forward);
+  EXPECT_EQ(process(ping()).verdict, Verdict::Forward);
+  filter_ = Filter({}, Action::Deny);
+  expect_drop(process(truncated), DropReason::FilterDeny);
+  expect_drop(process(ping()), DropReason::FilterDeny);
+}
+
 TEST_F(ForwarderTest, Step11NoRoute) {
   expect_drop(process(ping({.dst = kNowhere})), DropReason::NoRoute);
 }

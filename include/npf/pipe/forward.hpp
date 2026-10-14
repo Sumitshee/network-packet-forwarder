@@ -290,6 +290,10 @@ class Forwarder {
   // packet past every rule about ports; while there are such rules, it is denied instead (§8).
   [[nodiscard]] bool filter_denies(const proto::Ipv4View& ip,
                                    std::uint16_t in_port) const noexcept {
+    // No rules: the policy decides, and the transport header need not be parsed again for it.
+    if (filter_->empty()) {
+      return filter_->default_action() == Action::Deny;
+    }
     const std::optional<proto::L4Info> l4 = proto::parse_l4(ip);
     if (!l4 && filter_->has_port_rules() &&
         (ip.protocol() == proto::kIpProtoTcp || ip.protocol() == proto::kIpProtoUdp)) {
