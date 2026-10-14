@@ -33,8 +33,11 @@ set -uo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 BUILD=${NPF_BENCH_BUILD:-$ROOT/build/bench}
 NPF="$BUILD/npf"
-GEN="$BUILD/bench/system/gen"
-SINK="$BUILD/bench/system/sink"
+# [phase 15] NPF_BENCH_TOOLS: where gen and sink come from, when npf comes from a variant build --
+# so that a change to npf's build flags does not change the traffic it is measured with.
+TOOLS=${NPF_BENCH_TOOLS:-$BUILD}
+GEN="$TOOLS/bench/system/gen"
+SINK="$TOOLS/bench/system/sink"
 CONFIG="$ROOT/configs/router.conf"
 
 TIER_A=0

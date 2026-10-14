@@ -115,7 +115,7 @@ run before 2
 
 OUT="$ROOT/bench/results/$(date -u +%F)-${BEFORE_SHA:0:7}-ab-$NAME.json"
 python3 "$ROOT/scripts/bench_compare.py" --name "$NAME" --before-ref "$BEFORE_SHA" \
-  --after-ref "$AFTER_DESC" --cmake-before "$CMAKE_BEFORE" --cmake-after "$CMAKE_AFTER" \
+  --after-ref "$AFTER_DESC" --cmake-before="$CMAKE_BEFORE" --cmake-after="$CMAKE_AFTER" \
   --diff "$WORK/after.diff" --out "$OUT" \
   "$WORK/before-1.json" "$WORK/after-1.json" "$WORK/after-2.json" "$WORK/before-2.json"
 if [[ -n ${SUDO_UID:-} ]]; then

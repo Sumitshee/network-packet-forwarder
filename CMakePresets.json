@@ -52,12 +52,12 @@
     {
       "name": "release",
       "inherits": "base",
-      "displayName": "Release (-O2 -g)",
+      "displayName": "Release (-O2 -g, LTO)",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
         "CMAKE_CXX_FLAGS_RELEASE": "-O2 -g -DNDEBUG",
         "NPF_BUILD_TESTS": "OFF",
-        "NPF_LTO": "OFF"
+        "NPF_LTO": "ON"
       }
     },
     {

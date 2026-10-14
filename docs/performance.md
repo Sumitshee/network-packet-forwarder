@@ -743,6 +743,77 @@ ns, which entry 0 showed to be the weaker metric.
 **Caveat:** on bare metal, the same change may well pay. No TLB-miss counter was read, here or
 there.
 
+### Entry 11: `-march=native` and LTO, all four combinations (FASTER: LTO, kept in the release preset)
+
+**Change:** none in the code; the build flags. `NPF_NATIVE` adds `-march=native` and `NPF_LTO`
+link-time optimisation, both CMake options since phase 0. The bench preset has native on and LTO
+off.
+
+**Method:** three comparisons at one commit, `2106520`. `scripts/ab_bench.sh` builds each side
+with its own `--cmake-*` arguments; nothing else differs.
+
+| Comparison and benchmark, cycles per packet | Before: median (min – p95) | After: median (min – p95) | Delta | Noise band | Rounds | Verdict |
+|---|---:|---:|---:|---:|---:|---|
+| `-march=native`, off to on, no LTO: `full_datapath/dir24_8/topology` | 268.6 (264.6 – 278.7) | 275.7 (275.0 – 283.8) | +7.1 (+2.7%) | 10.2 | +8.4, +4.1 | NOISE |
+| `-march=native`, off to on, no LTO: `full_datapath/linear/topology` | 280.4 (278.3 – 289.5) | 286.0 (282.9 – 292.8) | +5.5 (+2.0%) | 9.0 | +4.9, +6.1 | NOISE |
+| `-march=native`, off to on, no LTO: `parse_only` | 21.9 (21.5 – 22.3) | 23.3 (23.0 – 23.9) | +1.4 (+6.4%) | 0.6 | +1.5, +1.3 | SLOWER |
+| LTO, off to on, with `-march=native`: `full_datapath/dir24_8/topology` | 285.1 (278.4 – 311.9) | 258.5 (218.2 – 299.9) | -26.6 (-9.3%) | 41.3 | +14.9, -65.2 | NOISE |
+| LTO, off to on, with `-march=native`: `full_datapath/linear/topology` | 289.0 (282.3 – 301.2) | 272.3 (228.3 – 306.0) | -16.7 (-5.8%) | 33.6 | +17.4, -66.5 | NOISE |
+| LTO, off to on, with `-march=native`: `parse_only` | 23.4 (22.8 – 26.0) | 25.1 (24.8 – 26.3) | +1.8 (+7.5%) | 2.6 | +1.8, +0.6 | NOISE |
+| LTO, off to on, without `-march=native`: `full_datapath/dir24_8/topology` | 268.8 (265.7 – 275.1) | 219.9 (217.6 – 230.3) | -48.9 (-18.2%) | 10.4 | -49.9, -48.3 | FASTER |
+| LTO, off to on, without `-march=native`: `full_datapath/linear/topology` | 286.6 (279.5 – 293.4) | 235.8 (230.4 – 248.9) | -50.8 (-17.7%) | 13.2 | -47.8, -51.5 | FASTER |
+| LTO, off to on, without `-march=native`: `parse_only` | 22.1 (21.6 – 23.4) | 23.2 (22.5 – 26.0) | +1.1 (+4.9%) | 2.8 | +1.3, +0.8 | NOISE |
+
+**Delta:**
+
+- **LTO without `-march=native` is faster:** -48.9 cycles per packet on DIR-24-8
+  (-18.2%) and -50.8 on the linear table, against bands of
+  10.4 and 13.2. The rounds agree, at
+  -49.9 and -48.3.
+- **LTO with `-march=native` is noise:** -26.6, against a band of
+  41.3, with rounds that disagree (+14.9 and
+  -65.2). The run did not settle.
+- **`-march=native` alone** is noise on the datapath, and slower on `parse_only`:
+  +1.4 cycles, outside a band of 0.65.
+
+The four combinations, by the medians of the comparisons above (DIR-24-8, cycles per packet):
+
+| Flags | Median |
+|---|---:|
+| neither | 268.8 |
+| LTO only | 219.9 |
+| `-march=native` only | 285.1 |
+| both | 258.5 |
+
+Each pair of rows comes from a different comparison, run at a different time, so this table is a
+summary, not a fifth comparison.
+
+**Verdict:**
+
+- **LTO is kept, in the release preset**, which builds exactly the flags that measured faster:
+  `-O2 -g`, without `-march=native`.
+- **The bench preset is not changed.** CLAUDE.md defines it as `-O2 -g -march=native`, and with
+  native on, LTO did not measure significant. Phase 14's baseline was taken with it as it is.
+- With LTO, a dev build passes all 451 tests with `-Werror` under GCC 13 and Clang 18 alike.
+
+**What it says:**
+
+- Entries 2 and 3 tried to shorten the two steps that entry 1 found costliest, the filter and
+  the ARP lookup, by hand. Neither measured. Both are calls into other translation units,
+  `Filter::evaluate()` and `ArpCache::lookup()`, and LTO is what lets the compiler inline across
+  translation units.
+- That is consistent with LTO's gain, though no annotated assembly was compared, so it is not
+  shown to be the reason.
+- Why `-march=native` makes `parse_only` slower and LTO's effect unstable was not measured. This
+  CPU has AVX-512, which `-march=native` lets the compiler use.
+
+**Caveat:**
+
+- GCC 13 only: the bench preset's compiler. Clang 18's `-flto=thin` was checked for correctness,
+  not measured.
+- The tier B half of this entry, the same builds through the namespaces, follows from the phase 15
+  tier B session.
+
 ## Phase 3: checksum microbenchmark (tier A)
 
 **What.** `bench/micro/bench_checksum.cpp` times the three checksum paths in
