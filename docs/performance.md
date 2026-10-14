@@ -588,6 +588,38 @@ the linear table. Both are slower, if anything, and both are inside their bands.
 **Caveat:** a real backend's frames arrive from wherever the kernel copied them, with neither that
 order nor that stride. Phase 16's PACKET_MMAP ring is where to measure this again.
 
+### Entry 7: `[[unlikely]]` on the drop branches (NOISE: reverted)
+
+**Change:** each of the eleven branches in `steps()` and `route()` that returns a drop is marked
+`[[unlikely]]`, so that the compiler lays out the forwarding path as the one that falls through.
+
+**Before:** commit `d6c9004`. **After:** that, plus the change.
+
+| Benchmark, metric | Before: median (min – p95) | After: median (min – p95) | Delta | Noise band | Rounds | Verdict |
+|---|---:|---:|---:|---:|---:|---|
+| `full_datapath/dir24_8/topology`, cycles | 285.7 (278.6 – 299.6) | 279.9 (274.0 – 285.5) | -5.8 (-2.0%) | 13.9 | -6.6, -4.1 | NOISE |
+| `full_datapath/linear/topology`, cycles | 297.9 (293.6 – 309.0) | 292.8 (284.8 – 308.7) | -5.0 (-1.7%) | 15.8 | -6.9, -5.1 | NOISE |
+| `full_datapath/dir24_8/topology`, ns | 124.0 (100.5 – 130.1) | 112.8 (100.9 – 118.0) | -11.2 (-9.1%) | 6.1 | -13.7, -5.5 | FASTER |
+| `full_datapath/linear/topology`, ns | 116.9 (100.7 – 174.3) | 113.8 (102.5 – 157.4) | -3.1 (-2.7%) | 57.4 | -9.4, +4.2 | NOISE |
+
+**Delta:**
+
+- On cycles, the metric this phase decides by: -5.8 per packet on DIR-24-8 and
+  -5.0 on the linear table. Both are noise, inside bands of
+  13.9 and 15.8.
+- Wall time calls the DIR-24-8 case faster: -11.2 ns, outside a band of
+  6.1. Entry 0 showed wall time unable to decide anything here, so the cycles
+  decide.
+
+**Verdict: noise. The change is reverted** in the next commit.
+
+**What it says:** the benchmark forwards every frame, so every branch goes the same way every time,
+and the CPU's branch predictor learns that within a lap whatever the layout. Where the hints could
+matter is a mix of drops and forwards. No branch-miss counter was read.
+
+**Caveat:** only GCC 13 was measured; another compiler may lay the code out differently with or
+without the hints.
+
 ## Phase 3: checksum microbenchmark (tier A)
 
 **What.** `bench/micro/bench_checksum.cpp` times the three checksum paths in

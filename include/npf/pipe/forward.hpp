@@ -329,12 +329,12 @@ template <class FibT>
 Decision Forwarder<FibT>::steps(core::Packet& p) noexcept {
   // 1. Ethernet.
   const std::optional<proto::EthView> eth = proto::EthView::parse(p.data());
-  if (!eth) {
+  if (!eth) [[unlikely]] {
     return drop(DropReason::ShortFrame);
   }
   const PortState* in = port(p.in_port());
   assert(in != nullptr && "a packet from a port the configuration does not have");
-  if (in == nullptr) {
+  if (in == nullptr) [[unlikely]] {
     return drop(DropReason::NoOutPort);
   }
 
@@ -346,7 +346,7 @@ Decision Forwarder<FibT>::steps(core::Packet& p) noexcept {
 
   // 2. EtherType dispatch.
   const std::uint16_t type = eth->ethertype();
-  if (type != proto::kEtherTypeIpv4 && type != proto::kEtherTypeArp) {
+  if (type != proto::kEtherTypeIpv4 && type != proto::kEtherTypeArp) [[unlikely]] {
     return drop(DropReason::BadEtherType);
   }
 
@@ -366,7 +366,7 @@ Decision Forwarder<FibT>::steps(core::Packet& p) noexcept {
     ip = proto::Ipv4View::parse(eth->payload());
     route_it = ip.has_value() && is_local_destination(control_.ports(), ip->dst());
   }
-  if (!route_it) {
+  if (!route_it) [[unlikely]] {
     return drop(DropReason::UnknownDestPort);  // a transit frame on a routed port
   }
   return route(p, *eth, ip);
@@ -412,19 +412,19 @@ Decision Forwarder<FibT>::route(core::Packet& p, const proto::EthView& eth,
   // 5. IPv4 header. Steps 3 and 4 leave only IPv4 frames here.
   if (!ip) {
     ip = proto::Ipv4View::parse(eth.payload());
-    if (!ip) {
+    if (!ip) [[unlikely]] {
       return drop(DropReason::BadIpv4Header);
     }
   }
 
   // 6. Header checksum.
-  if (!proto::ipv4_checksum_valid(ip->header())) {
+  if (!proto::ipv4_checksum_valid(ip->header())) [[unlikely]] {
     return drop(DropReason::BadChecksum);
   }
   stats_->count_protocol(ip->protocol());
 
   // 7. Martian source (RFC 1812 §5.3.7).
-  if (proto::is_martian_source(ip->src())) {
+  if (proto::is_martian_source(ip->src())) [[unlikely]] {
     return drop(DropReason::MartianSource);
   }
 
@@ -434,22 +434,22 @@ Decision Forwarder<FibT>::route(core::Packet& p, const proto::EthView& eth,
   }
 
   // 9. TTL. error_for() turns the drop into an ICMP Time Exceeded.
-  if (ip->ttl() <= 1) {
+  if (ip->ttl() <= 1) [[unlikely]] {
     return drop(DropReason::TtlExpired);
   }
 
   // 10. Filter.
-  if (filter_denies(*ip, p.in_port())) {
+  if (filter_denies(*ip, p.in_port())) [[unlikely]] {
     return drop(DropReason::FilterDeny);
   }
 
   // 11. Route. error_for() turns the drop into an ICMP Net Unreachable.
   const std::optional<table::NextHop> next = fib_->lookup(ip->dst());
-  if (!next) {
+  if (!next) [[unlikely]] {
     return drop(DropReason::NoRoute);
   }
   const PortState* out = port(next->port);
-  if (out == nullptr) {
+  if (out == nullptr) [[unlikely]] {
     return drop(DropReason::NoOutPort);
   }
 
