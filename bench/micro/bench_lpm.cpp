@@ -41,78 +41,22 @@
 #include <utility>
 #include <vector>
 
+#include "bgp_routes.hpp"
+#include "spread.hpp"
+
 namespace {
 
+using npf::bench::with_spread;
 using npf::table::Route;
 
 constexpr std::size_t kKeys = std::size_t{1} << 20U;  // a power of two: the loop masks its index
 constexpr double kZipfAlpha = 0.99;
 constexpr std::uint32_t kSeed = 20261005;
 
-// --- statistics, as bench_checksum reports them --------------------------------------------------
-
-// CLAUDE.md §9 wants the median and p95, and the spread. Google Benchmark's aggregates give mean,
-// median, stddev and cv across repetitions; these add p95 (nearest rank), min and max.
-double p95(const std::vector<double>& v) {
-  std::vector<double> sorted = v;
-  std::ranges::sort(sorted);
-  const auto rank = static_cast<std::size_t>(std::ceil(0.95 * static_cast<double>(sorted.size())));
-  return sorted[std::max<std::size_t>(rank, 1) - 1];
-}
-double min_of(const std::vector<double>& v) {
-  return *std::ranges::min_element(v);
-}
-double max_of(const std::vector<double>& v) {
-  return *std::ranges::max_element(v);
-}
-
-void with_spread(benchmark::internal::Benchmark* b) {
-  b->ComputeStatistics("p95", p95)
-      ->ComputeStatistics("min", min_of)
-      ->ComputeStatistics("max", max_of);
-}
-
 // --- the data ------------------------------------------------------------------------------------
 
 std::uint32_t next32(std::mt19937& rng) {
   return static_cast<std::uint32_t>(rng());
-}
-
-// "a.b.c.d/len id" lines. The id stands for a next hop; any distinct value per id will do.
-std::vector<Route> load_routes(const std::filesystem::path& path) {
-  std::ifstream in(path);
-  if (!in) {
-    throw std::runtime_error(
-        std::format("cannot read {}: run scripts/fetch_bgp_table.sh first", path.string()));
-  }
-  std::vector<Route> routes;
-  std::string line;
-  while (std::getline(in, line)) {
-    unsigned a = 0;
-    unsigned b = 0;
-    unsigned c = 0;
-    unsigned d = 0;
-    unsigned len = 0;
-    unsigned id = 0;
-    char dot1 = 0;
-    char dot2 = 0;
-    char dot3 = 0;
-    char slash = 0;
-    std::istringstream fields(line);
-    if (!(fields >> a >> dot1 >> b >> dot2 >> c >> dot3 >> d >> slash >> len >> id) ||
-        dot1 != '.' || dot2 != '.' || dot3 != '.' || slash != '/' || a > 255 || b > 255 ||
-        c > 255 || d > 255 || len > 32) {
-      throw std::runtime_error(std::format("{}: cannot read '{}'", path.string(), line));
-    }
-    const npf::table::Prefix prefix{a << 24U | b << 16U | c << 8U | d,
-                                    static_cast<std::uint8_t>(len)};
-    if (!npf::table::is_valid(prefix)) {
-      throw std::runtime_error(
-          std::format("{}: '{}' has bits set past its length", path.string(), line));
-    }
-    routes.push_back({prefix, 0x0AFF0000U + id, static_cast<std::uint16_t>(id % 4)});
-  }
-  return routes;
 }
 
 std::vector<std::uint32_t> uniform_keys() {
@@ -279,15 +223,14 @@ int main(int argc, char** argv) {
     return 1;
   }
   try {
-    const char* dir = std::getenv("NPF_BGP_DATA");
-    const std::filesystem::path data_dir = dir != nullptr ? dir : "data";
+    const std::filesystem::path data_dir = npf::bench::bgp_data_dir();
     static Data data;
     for (const auto& [name, file] :
          {std::pair{"10", "bgp_prefixes_10.txt"}, std::pair{"1k", "bgp_prefixes_1k.txt"},
           std::pair{"100k", "bgp_prefixes_100k.txt"}, std::pair{"full", "bgp_prefixes.txt"}}) {
       Size& size = data.sizes.emplace_back();
       size.name = name;
-      size.routes = load_routes(data_dir / file);
+      size.routes = npf::bench::load_routes(data_dir / file);
       size.uniform = uniform_keys();
       size.zipf = zipf_keys(size.routes);
       size.sequential = sequential_keys(size.routes);

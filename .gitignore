@@ -23,3 +23,6 @@ oom-*
 .idea/
 *.swp
 .DS_Store
+
+# Python bytecode, from running the scripts
+__pycache__/

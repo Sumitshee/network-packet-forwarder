@@ -52,7 +52,7 @@ find_package(Threads REQUIRED)
 add_executable(skeleton tools/skeleton/skeleton.cpp)
 
 add_subdirectory(src)
-# The tier B tools, gen among them, are built by every preset: the netns tests drive traffic with
+# The tier B tools, gen and sink, are built by every preset: the netns tests drive traffic with
 # them.
 add_subdirectory(bench/system)
 

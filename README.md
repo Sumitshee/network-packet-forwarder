@@ -4,7 +4,7 @@ A userspace Layer-2/Layer-3 packet forwarding engine — a software router — w
 Linux. It receives raw Ethernet frames from network interfaces, parses them, makes forwarding
 decisions, rewrites headers and transmits them out of the correct interface.
 
-**Status: phase 13 of 19.** `npf` routes IPv4 between Linux interfaces. It runs every packet
+**Status: phase 14 of 19.** `npf` routes IPv4 between Linux interfaces. It runs every packet
 through a fixed fourteen-step pipeline: parse, validate, route,
 resolve the next hop, rewrite the MAC addresses, decrement the TTL and patch the checksum. Every
 packet it drops is counted under a reason. It resolves its neighbours with ARP itself: a packet
@@ -43,6 +43,15 @@ own ARP caches and pass each other the ARP replies they hear. An integration tes
 datagrams of one flow through 1, 2, 4 and 8 workers in each model and checks that they arrive in
 the order sent; another runs the router built with ThreadSanitizer under a minute of sustained
 traffic in each model.
+
+It is measured at two tiers, kept apart. Tier A times the forwarding code in process, with no I/O:
+parsing, FIB lookups in each of the four tables, the whole fourteen-step pipeline, the packet pool
+and the ring. Tier B sends numbered, timestamped UDP flows through the namespaces and measures what
+arrives -- datagrams per second, loss, one-way latency, CPU time -- for each threading model and
+worker count, and for the same topology forwarded by the Linux kernel instead, the control every npf
+number is read against. `scripts/run_bench.sh --all` runs both and writes one JSON with the context
+of the run; [`docs/performance.md`](docs/performance.md) gives the method, the baseline, and what
+the numbers do not measure.
 
 `npf replay` runs the same router over a pcap file instead of live interfaces, and writes what it
 sends to another: deterministically, and with no root. The golden-file tests use it in CI. Each
@@ -193,6 +202,26 @@ sudo tests/integration/test_ordering.sh build/dev/npf
 ```bash
 sudo tests/integration/test_soak.sh build/tsan/npf
 ```
+
+### Benchmarking
+
+The bench preset builds the microbenchmarks and the bench/system tools; tier B needs root, for the
+namespaces. `git clean` keeps `data/`, the routing table `bench_lpm` reads, and `.deps-cache/`.
+
+```bash
+git clean -xdf -e data -e .deps-cache && cmake --preset bench && cmake --build --preset bench -j
+```
+
+```bash
+sudo ./scripts/run_bench.sh --all
+```
+
+```bash
+python3 bench/plot.py
+```
+
+`--tier-a`, `--tier-b` and `--kernel-baseline` run one part; `--quick` is a short rehearsal whose
+result stays in `bench/results/raw/`.
 
 ### Replaying a pcap
 

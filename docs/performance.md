@@ -2,8 +2,144 @@
 
 Every number in this file is the output of a run on the machine described below; the JSON each
 table came from is in `bench/results/`. Nothing here is estimated or rounded up. What a set of
-numbers does *not* measure is stated next to it. The full methodology (the two tiers, the kernel
-control, the repetition rules) arrives with the benchmark harness in phase 14.
+numbers does *not* measure is stated next to it. The methodology below holds for every entry from
+phase 14 on; phases 3 and 10, which came before the harness, say how each was run.
+
+## Methodology
+
+Since phase 14, `scripts/run_bench.sh` takes every measurement, the same way each time, and
+`scripts/bench_combine.py` turns one run into one file, `bench/results/<date>-<sha>.json`: the
+evidence each table below comes from. That file also records what CLAUDE.md §9 asks of every
+result: git SHA, ISO date, `uname -r`, the CPU model from `lscpu`, the compiler and its version, the
+CMake preset and the exact compile command, the burst size and pool size, the worker counts, and
+whether `perf stat -e cycles` succeeded. `bench_combine.py` refuses to write a run with a NaN, a
+benchmark error, or a zero where a measurement belongs.
+
+```bash
+git clean -xdf -e data -e .deps-cache
+cmake --preset bench && cmake --build --preset bench -j
+sudo ./scripts/run_bench.sh --all
+python3 bench/plot.py
+```
+
+`git clean` keeps `data/`, the RouteViews table `scripts/fetch_bgp_table.sh` downloads, and
+`.deps-cache/`, GoogleTest and Google Benchmark: neither changes what is measured, and both are
+slow to fetch again.
+
+### Two tiers, never mixed
+
+**Tier A** measures code: the forwarding logic in process, with no I/O at all, in Google Benchmark.
+
+- `bench_datapath`:
+  - 1024 UDP frames of 70 bytes, built once in a packet pool and walked in bursts of 32 over 16
+    flows, so every iteration is one burst.
+  - `parse_only` runs the Ethernet, IPv4 and L4 parsers.
+  - `parse_and_lookup/<fib>/<size>` adds a FIB lookup of each destination.
+  - `full_datapath/<fib>/<size>` calls the real `Forwarder::process_burst`, all fourteen steps of
+    ARCHITECTURE.md §11, rewrite and incremental checksum included. Every frame of a lap must be
+    forwarded, before timing and after, or the benchmark fails.
+  - `<fib>` is each of the four LPM tables; `<size>` is the three routes of
+    `configs/router.conf`, or those plus the 100k sample of the RouteViews table.
+  - Forwarding rewrites a frame -- the next hop's MAC as destination, which the router would drop
+    if it came round again -- so `full_datapath` restores all 1024 frames from pristine copies after
+    each lap, with the timer and the cycle counter stopped. A pause leaves a little behind in the
+    timings: `parse_only/refilled` is `parse_only` with the same pauses, and the difference between
+    the two is that residue.
+- `bench_pool`: one acquire and release, and a burst of 32 of each.
+- `bench_ring`: one push and pop on one thread; a round trip between two threads through two
+  rings; and bursts of 32 streamed from one thread to another.
+- `bench_checksum` (phase 3) and `bench_lpm` (phase 10), as before.
+
+Each benchmark is pinned with `taskset`: CPU 2, or CPUs 2 and 4 for the ring's two threads, which
+`lscpu -e` puts on different cores. It runs 0.5 s of warm-up, then 7 repetitions, reported as
+aggregates: mean, median, standard deviation, coefficient of variation, and p95 (nearest rank, so
+the slowest of 7), min and max. Every benchmark starts once the one-minute load average is below
+0.5. `bench_datapath` also counts the CPU's cycles in user mode through `perf_event_open`, and
+reports cycles per packet. The `perf` tool itself is not installed (see Environment), but the
+counters it would read are.
+
+**Tier B** measures the whole router -- npf, the kernel under it, veth, two network namespaces --
+by sending traffic through it. It is the topology of `scripts/setup_netns.sh`, with npf running
+`configs/router.conf` (burst 32, pool 4096 per pool):
+
+- `bench/system/gen`:
+  - runs in ns-client, pinned to CPU 6;
+  - sends 16 flows of 70-byte frames, the smallest that carry its payload, to 10.0.2.2 through a
+    raw IP socket;
+  - each datagram carries its flow, its sequence number and the time-stamp counter read just
+    before `sendto()`.
+- `bench/system/sink`:
+  - runs in ns-server, pinned to CPU 7, on a UDP socket, reading with `recvmmsg()`;
+  - counts what arrives, finds the gaps in each flow's sequence numbers, and takes each
+    datagram's one-way latency as the TSC when it was received minus the TSC gen stamped;
+  - both read the same counter on the same machine (`constant_tsc nonstop_tsc tsc_reliable`), and
+    sink converts ticks to nanoseconds at the rate it measures against `CLOCK_MONOTONIC_RAW` over
+    its whole run. A negative latency would mean the counter differs between CPUs; any one fails
+    the run.
+- npf runs confined to CPUs 0-5. That is the process's CPU mask, not a pin per thread, which
+  phase 13 did not build.
+
+Every configuration runs two scenarios:
+
+- **throughput**: gen as fast as it can send.
+- **latency**: gen at 20,000 datagrams a second, paced on the steady clock, a rate low enough that
+  queues should stay empty.
+
+Each scenario is a 2 s warm-up, then 5 repetitions of 10 s, each with a fresh sink. Per repetition
+the run records:
+
+- **offered**: what gen sent, per second;
+- **delivered**: what sink received, per second of gen's run;
+- **loss**: the share of what was sent that never arrived;
+- **latency**: p50, p95, p99, p99.9 and max of every datagram's;
+- **npf's CPU**: user plus system time from `/proc/<pid>/stat` over the repetition, as a share of
+  one CPU, so 4 workers can reach 400%;
+- **the machine's busy time**: from `/proc/stat`, as a share of all 8 CPUs.
+
+Per configuration the run also records npf's peak RSS (`VmHWM`) and its final counters, which must
+balance: `rx_packets == forwarded + flooded + to_host + every drop`.
+
+The configurations:
+
+- **the kernel control**: npf replaced by Linux's own forwarding on the same topology, with
+  addresses on ns-router's veths, `net.ipv4.ip_forward=1`, and `arp_ignore` back to 0 so that the
+  router's kernel answers ARP. It runs in a topology built for it and torn down afterwards, so
+  nothing it changed survives into npf's runs. **It is the denominator**: a tier B number for npf
+  means something only next to the kernel's on the same machine, the same day.
+- **npf**: `--mode rtc` and `--mode pipeline`, each with 1, 2 and 4 workers.
+
+### Reporting
+
+Every number quoted is a median over the repetitions, with p95 and the spread from min to max
+beside it, never a mean alone. A later change whose difference from the baseline lies inside the
+baseline's spread is noise: the change is reverted, and the negative result is written down here.
+
+### What these numbers do not measure
+
+- **A NIC.**
+  - veth hands a frame from one namespace to another in memory, with no wire, no interrupt
+    moderation and no DMA.
+  - On veth the kernel's own forwarding runs in the softirq of the sending CPU: most of the
+    kernel control's work lands on gen's CPU 6. That shows in the machine's busy time, and in no
+    process's CPU time.
+- **npf's peak rate, when gen is slower.**
+  - One gen thread on one raw socket is the only source, so the throughput scenario offers what
+    gen can send through the configuration under test, not what the router could take.
+  - On veth, gen's own `sendto()` pays for part of the receiving side's work, so the offered rate
+    itself depends on the configuration.
+  - Delivered rates are comparable as delivered rates. Where offered and delivered are equal and
+    loss is zero, the router was not the bottleneck, and its capacity was not reached.
+- **The router's latency alone.** Latency is one way from gen's `sendto()` to sink's return from
+  `recvmmsg()`: both kernels' network stacks, npf or the kernel's forwarding between them, and
+  sink's own scheduling. sink reads the TSC once per batch of up to 64 datagrams, so a datagram's
+  latency includes the wait for the rest of its batch. That is none at 20,000 a second, and more
+  under the throughput scenario's load.
+- **Bare metal.** This is WSL2: a Hyper-V virtual machine on a Windows laptop whose clock follows
+  turbo and the power plan, with other Windows processes beside it. The repetitions and their
+  spread show how much that moved the numbers; they cannot remove it.
+- **Tier A numbers as tier B.** A tier A time is the forwarding code's, with every frame and table
+  in cache, or as much of them as fits. It says nothing about packets per second through
+  interfaces, and a tier B number says nothing about the code.
 
 ## Environment
 
@@ -29,6 +165,10 @@ kernel also lists `branch-instructions`, `branch-misses`, `bus-cycles`, `cache-m
 `cache-references`, `cpu-cycles`, `instructions` and `ref-cycles` under
 `/sys/bus/event_source/devices/cpu/events`. Counting kernel-mode events, and the `perf` tool itself,
 were not tried.
+
+## Phase 14: baseline (both tiers)
+
+TBD: the baseline run of `scripts/run_bench.sh --all` has not been made yet.
 
 ## Phase 3: checksum microbenchmark (tier A)
 
