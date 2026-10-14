@@ -2,6 +2,7 @@
 
 #include <cassert>
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <new>
 #include <npf/core/packet.hpp>
@@ -14,7 +15,8 @@ namespace npf::core {
 //
 // Not thread-safe, by design: every worker owns its own pool (ARCHITECTURE.md §12) and a packet
 // never crosses threads in run-to-completion mode, so the hot path needs no atomics and no locks.
-// Sharing one pool between threads is a bug, not a use case.
+// Sharing one pool between threads is a bug, not a use case. In pipeline mode a packet does travel,
+// but only its owner thread ever acquires or releases it: it goes home on a ring (§3).
 class PacketPool {
  public:
   // Throws std::invalid_argument for a count of zero, std::bad_alloc if the storage cannot be
@@ -54,6 +56,15 @@ class PacketPool {
   [[nodiscard]] std::size_t capacity() const noexcept { return capacity_; }
   [[nodiscard]] std::size_t available() const noexcept { return available_; }  // for leak tests
 
+  // Whether p is one of this pool's packets, in or out of it: how a pipeline worker tells which
+  // thread a packet it has finished with goes home to. Reads only the pool's fixed bounds, so any
+  // thread may ask.
+  [[nodiscard]] bool owns(const Packet* p) const noexcept {
+    const auto addr = reinterpret_cast<std::uintptr_t>(p);
+    const auto base = reinterpret_cast<std::uintptr_t>(storage_.get());
+    return addr >= base && addr - base < capacity_ * kSlotSize && (addr - base) % kSlotSize == 0;
+  }
+
  private:
   static constexpr std::align_val_t kAlign{64};
   // Each slot is one cache line of Packet metadata followed by that packet's buffer.
@@ -62,8 +73,6 @@ class PacketPool {
   struct FreeStorage {
     void operator()(std::byte* p) const noexcept { ::operator delete(p, kAlign); }
   };
-
-  [[nodiscard]] bool owns(const Packet* p) const noexcept;
 
   Packet* head_{nullptr};
   std::size_t available_{0};

@@ -81,12 +81,14 @@ ControlPlane::ControlPlane(const core::Config& cfg, table::ArpCache& arp, stat::
 std::optional<Reply> ControlPlane::deliver_to_host(core::Packet& p, core::PacketPool& pool,
                                                    core::Clock::time_point now) noexcept {
   n_released_ = 0;
+  n_discarded_ = 0;
+  news_.reset();
   const std::optional<proto::EthView> eth = proto::EthView::parse(p.data());
   if (!eth || p.in_port() >= ports_.size()) {
     return std::nullopt;
   }
   if (eth->ethertype() == proto::kEtherTypeArp) {
-    return answer_arp(p, *eth, pool);
+    return answer_arp(p, *eth);
   }
   const std::optional<proto::Ipv4View> ip = proto::Ipv4View::parse(eth->payload());
   if (!ip || !is_router_address(ports_, ip->dst())) {
@@ -179,8 +181,7 @@ core::Packet* ControlPlane::make_error(const core::Packet& p, const proto::EthVi
   return out;
 }
 
-std::optional<Reply> ControlPlane::answer_arp(core::Packet& p, const proto::EthView& eth,
-                                              core::PacketPool& pool) noexcept {
+std::optional<Reply> ControlPlane::answer_arp(core::Packet& p, const proto::EthView& eth) noexcept {
   const std::optional<proto::ArpView> msg = proto::ArpView::parse(eth.payload());
   if (!msg) {
     return std::nullopt;  // malformed: nothing to answer, nothing to learn
@@ -195,7 +196,9 @@ std::optional<Reply> ControlPlane::answer_arp(core::Packet& p, const proto::EthV
 
   if (msg->oper() == proto::ArpView::kOpReply) {
     ++stats_->arp_replies_rx;
-    learn(p.in_port(), *msg, pool);
+    // A gratuitous reply announces; any other reply answers a question.
+    news_ = ArpNews{.ip = spa, .mac = sha, .port = p.in_port(), .answer = !gratuitous};
+    learn(*news_);
     return std::nullopt;
   }
   if (msg->oper() != proto::ArpView::kOpRequest) {
@@ -203,7 +206,8 @@ std::optional<Reply> ControlPlane::answer_arp(core::Packet& p, const proto::EthV
   }
   ++stats_->arp_requests_rx;
   if (gratuitous) {
-    learn(p.in_port(), *msg, pool);
+    news_ = ArpNews{.ip = spa, .mac = sha, .port = p.in_port(), .answer = false};
+    learn(*news_);
     return std::nullopt;
   }
   // Each port answers for its own address only, like Linux with arp_ignore=1.
@@ -225,42 +229,48 @@ std::optional<Reply> ControlPlane::answer_arp(core::Packet& p, const proto::EthV
   return Reply{&p, p.in_port()};
 }
 
+void ControlPlane::apply(const ArpNews& news) noexcept {
+  n_released_ = 0;
+  n_discarded_ = 0;
+  if (news.port < ports_.size()) {
+    learn(news);
+  }
+}
+
 // What a reply, or an announcement, arriving on port tells the cache about its sender. Only news
 // from the port the cache asks for that neighbour on counts: the cache is keyed by address alone,
 // and a station on another segment must not steer the neighbour's traffic. A reply answers the
 // cache's question, and so does an announcement while the cache is still waiting for an answer;
 // either completes the entry and frees the packets queued on it. Otherwise an announcement only
 // refreshes.
-void ControlPlane::learn(std::uint16_t port, const proto::ArpView& msg,
-                         core::PacketPool& pool) noexcept {
-  const std::uint32_t neighbour = msg.spa();
-  const proto::MacAddr mac = msg.sha();
-  const std::optional<table::ArpNeighbour> known = arp_->peek(neighbour);
-  if (!known || known->port != port) {
+void ControlPlane::learn(const ArpNews& news) noexcept {
+  const std::optional<table::ArpNeighbour> known = arp_->peek(news.ip);
+  if (!known || known->port != news.port) {
     return;
   }
-  const bool answer = msg.oper() == proto::ArpView::kOpReply && msg.tpa() != neighbour;
-  if (!answer && known->state != table::ArpState::Incomplete) {
-    arp_->on_unsolicited(neighbour, mac);
+  if (!news.answer && known->state != table::ArpState::Incomplete) {
+    arp_->on_unsolicited(news.ip, news.mac);
     return;
   }
-  arp_->on_reply(neighbour, mac, ready_);
-  const PortState& out = ports_[port];
+  arp_->on_reply(news.ip, news.mac, ready_);
+  const PortState& out = ports_[news.port];
   for (core::Packet* q : ready_) {
     // Steps 1 to 12 passed before it was queued, and nothing has touched it since.
     const std::optional<proto::EthView> eth = proto::EthView::parse(q->data());
     const std::optional<proto::Ipv4View> ip =
         eth ? proto::Ipv4View::parse(eth->payload()) : std::nullopt;
+    // The assertions are the bounds checks: on_reply() hands back at most one queue.
     if (!eth || !ip) {
-      pool.release(q);
       ++stats_->drop(DropReason::ArpUnresolved);
+      assert(n_discarded_ < discarded_.size() && "one entry's queue at most");
+      // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-constant-array-index)
+      discarded_[n_discarded_++] = q;
       continue;
     }
-    rewrite_for_forwarding(*q, *eth, *ip, mac, out);
+    rewrite_for_forwarding(*q, *eth, *ip, news.mac, out);
     assert(n_released_ < released_.size() && "one entry's queue at most");
-    // The assertion is the bounds check: on_reply() hands back at most one queue.
     // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-constant-array-index)
-    released_[n_released_++] = Reply{q, port};
+    released_[n_released_++] = Reply{q, news.port};
   }
   ready_.clear();
 }

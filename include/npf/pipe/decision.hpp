@@ -31,6 +31,8 @@ enum class DropReason : std::uint8_t {
   NoOutPort,        // route named a port that does not exist or is down
   UnknownDestPort,  // L2 lookup miss on a port with no bridge domain
   SamePort,         // L2: the destination was learned on the port the frame came in on
+  RingFull,         // pipeline mode: the ring to the chosen worker was full, so the RX thread
+                    // dropped the packet before any worker saw it
   TxFull,           // transmit ring or socket buffer full
   PoolExhausted,    // no free packet buffer
   // ARCHITECTURE.md §1 fixes this name. An underscore and a capital reserve an identifier for the
@@ -82,6 +84,8 @@ static_assert(sizeof(Decision) == 4);
       return "UnknownDestPort";
     case DropReason::SamePort:
       return "SamePort";
+    case DropReason::RingFull:
+      return "RingFull";
     case DropReason::TxFull:
       return "TxFull";
     case DropReason::PoolExhausted:

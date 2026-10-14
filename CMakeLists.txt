@@ -46,11 +46,15 @@ endif()
 npf_apply_sanitizer("${NPF_SANITIZER}")
 
 include(Dependencies)
+find_package(Threads REQUIRED)
 
 # Phase 0.5 throwaway prototype. Never link it into anything.
 add_executable(skeleton tools/skeleton/skeleton.cpp)
 
 add_subdirectory(src)
+# The tier B tools, gen among them, are built by every preset: the netns tests drive traffic with
+# them.
+add_subdirectory(bench/system)
 
 if(NPF_BUILD_TESTS)
   enable_testing()

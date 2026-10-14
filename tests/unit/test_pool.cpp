@@ -181,6 +181,23 @@ TEST(Pool, PacketMetadataStartsOnACacheLine) {
   }
 }
 
+// How a pipeline worker tells whose packet it holds: in the pool or out of it, a pool owns its
+// own packets and no other's.
+TEST(Pool, OwnsItsOwnPacketsAndNoOthers) {
+  PacketPool a(4);
+  PacketPool b(4);
+  Packet* from_a = a.acquire();
+  Packet* from_b = b.acquire();
+  EXPECT_TRUE(a.owns(from_a));
+  EXPECT_FALSE(a.owns(from_b));
+  EXPECT_TRUE(b.owns(from_b));
+  EXPECT_FALSE(b.owns(from_a));
+  a.release(from_a);
+  EXPECT_TRUE(a.owns(from_a));  // released, still its
+  EXPECT_FALSE(a.owns(nullptr));
+  b.release(from_b);
+}
+
 TEST(Pool, RejectsZeroCapacity) {
   EXPECT_THROW(PacketPool pool(0), std::invalid_argument);
 }

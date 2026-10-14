@@ -99,7 +99,7 @@ T0_US = 1_700_000_000_000_000
 
 DROP_REASONS = ("ShortFrame", "BadEtherType", "BadIpv4Header", "BadChecksum", "MartianSource",
                 "TtlExpired", "NoRoute", "ArpUnresolved", "FilterDeny", "NoOutPort",
-                "UnknownDestPort", "SamePort", "TxFull", "PoolExhausted")
+                "UnknownDestPort", "SamePort", "RingFull", "TxFull", "PoolExhausted")
 
 
 def to_router(l3) -> bytes:

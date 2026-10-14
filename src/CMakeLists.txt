@@ -22,8 +22,9 @@ target_link_libraries(npf_io PUBLIC npf_core PRIVATE npf_warnings)
 add_library(npf_pipe
   pipe/filter.cpp
   pipe/forward.cpp
-  pipe/icmp_gen.cpp)
-target_link_libraries(npf_pipe PUBLIC npf_table npf_core PRIVATE npf_warnings)
+  pipe/icmp_gen.cpp
+  pipe/worker.cpp)
+target_link_libraries(npf_pipe PUBLIC npf_table npf_core Threads::Threads PRIVATE npf_warnings)
 
 add_executable(npf main.cpp)
 target_link_libraries(npf PRIVATE npf_pipe npf_io npf_table npf_core npf_warnings)

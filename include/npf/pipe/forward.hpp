@@ -102,6 +102,16 @@ struct Reply {
   std::uint16_t port;
 };
 
+// [phase 13] What an ARP reply or announcement one worker received tells the other workers' caches
+// (ARCHITECTURE.md §12): the neighbour at `ip` has `mac`, heard on `port`. `answer`: a reply to a
+// question, rather than a sender announcing its own address.
+struct ArpNews {
+  std::uint32_t ip{0};
+  proto::MacAddr mac;
+  std::uint16_t port{0};
+  bool answer{false};
+};
+
 // The part of the pipeline that answers packets instead of forwarding them -- ARP for the
 // router's addresses, echo replies, ICMP errors -- run by the caller after process() has decided,
 // and the way out of the ARP cache for the packets that waited in it. Compiled once, in
@@ -124,12 +134,28 @@ class ControlPlane {
   [[nodiscard]] std::optional<Reply> deliver_to_host(core::Packet& p, core::PacketPool& pool,
                                                      core::Clock::time_point now) noexcept;
 
-  // The packets the last deliver_to_host() took back from the ARP cache, oldest first, each
-  // rewritten for its next hop (step 13) and to be sent from `port`. They are the caller's now:
-  // it takes them before calling deliver_to_host() again, and counts each as it would a Forward.
+  // The packets the last deliver_to_host() or apply() took back from the ARP cache, oldest first,
+  // each rewritten for its next hop (step 13) and to be sent from `port`. They are the caller's
+  // now: it takes them before calling either again, and counts each as it would a Forward.
   [[nodiscard]] std::span<const Reply> released() const noexcept {
     return {released_.data(), n_released_};
   }
+
+  // Packets the last deliver_to_host() or apply() took back from the ARP cache but could not
+  // rewrite, already counted as ArpUnresolved, for the caller to release. Never expected -- they
+  // parsed when they were queued -- but releasing a packet is not this class's business: in
+  // pipeline mode it belongs to another thread's pool.
+  [[nodiscard]] std::span<core::Packet* const> discarded() const noexcept {
+    return {discarded_.data(), n_discarded_};
+  }
+
+  // [phase 13] The ARP reply or announcement the last deliver_to_host() received, whatever this
+  // worker's own cache made of it, for the worker to pass on to the others; nullopt if none.
+  [[nodiscard]] std::optional<ArpNews> news() const noexcept { return news_; }
+
+  // [phase 13] News another worker received, applied to this worker's cache as if the frame had
+  // arrived here. The packets it frees are in released().
+  void apply(const ArpNews& news) noexcept;
 
   // For a packet process() dropped: Time Exceeded for TtlExpired, Net Unreachable for NoRoute --
   // if RFC 1812 §4.3.2.7 allows an error and the rate limiter has a token -- as a new packet to
@@ -149,9 +175,9 @@ class ControlPlane {
   [[nodiscard]] std::span<const PortState> ports() const noexcept { return ports_; }
 
  private:
-  [[nodiscard]] std::optional<Reply> answer_arp(core::Packet& p, const proto::EthView& eth,
-                                                core::PacketPool& pool) noexcept;
-  void learn(std::uint16_t port, const proto::ArpView& msg, core::PacketPool& pool) noexcept;
+  [[nodiscard]] std::optional<Reply> answer_arp(core::Packet& p,
+                                                const proto::EthView& eth) noexcept;
+  void learn(const ArpNews& news) noexcept;
   [[nodiscard]] core::Packet* make_error(const core::Packet& p, const proto::EthView& eth,
                                          const proto::Ipv4View& ip, IcmpError err,
                                          core::PacketPool& pool,
@@ -163,6 +189,9 @@ class ControlPlane {
   std::vector<core::Packet*> ready_;  // ArpCache::on_reply's out-parameter, reserved once
   std::array<Reply, table::kArpQueueDepth> released_{};
   std::size_t n_released_{0};
+  std::array<core::Packet*, table::kArpQueueDepth> discarded_{};
+  std::size_t n_discarded_{0};
+  std::optional<ArpNews> news_;
   IcmpRateLimiter limiter_;  // RFC 1812 §4.3.2.8: errors only, not echo replies
 };
 
@@ -228,6 +257,11 @@ class Forwarder {
     return control_.deliver_to_host(p, pool, now);
   }
   [[nodiscard]] std::span<const Reply> released() const noexcept { return control_.released(); }
+  [[nodiscard]] std::span<core::Packet* const> discarded() const noexcept {
+    return control_.discarded();
+  }
+  [[nodiscard]] std::optional<ArpNews> news() const noexcept { return control_.news(); }
+  void apply(const ArpNews& news) noexcept { control_.apply(news); }
   [[nodiscard]] core::Packet* error_for(const core::Packet& p, DropReason reason,
                                         core::PacketPool& pool,
                                         core::Clock::time_point now) noexcept {

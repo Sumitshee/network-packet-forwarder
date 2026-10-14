@@ -4,8 +4,8 @@ A userspace Layer-2/Layer-3 packet forwarding engine — a software router — w
 Linux. It receives raw Ethernet frames from network interfaces, parses them, makes forwarding
 decisions, rewrites headers and transmits them out of the correct interface.
 
-**Status: phase 12 of 19.** `npf` routes IPv4 between Linux interfaces. It has one AF_PACKET socket
-per port and runs every packet through a fixed fourteen-step pipeline: parse, validate, route,
+**Status: phase 13 of 19.** `npf` routes IPv4 between Linux interfaces. It runs every packet
+through a fixed fourteen-step pipeline: parse, validate, route,
 resolve the next hop, rewrite the MAC addresses, decrement the TTL and patch the checksum. Every
 packet it drops is counted under a reason. It resolves its neighbours with ARP itself: a packet
 for a neighbour it has not resolved yet waits, up to three per neighbour, while it asks, and goes
@@ -31,6 +31,18 @@ the same bridge domain. Stations are forgotten after `mac_age` seconds of silenc
 An integration test runs it as a three-port switch between three hosts in one subnet: the hosts
 ping one another through it, the third host sees the first ARP request flooded but none of the
 unicast traffic that follows, and the table empties once the hosts fall silent.
+
+It runs on as many worker threads as it is told, in one of two models. In run-to-completion
+(`mode rtc`, the default) each worker has its own AF_PACKET socket on every port, all of a port's
+sockets joined in one `PACKET_FANOUT_HASH` group, so the kernel hands each flow to one worker, which
+receives, decides and transmits it without ever touching another thread's memory. In the pipeline
+model (`mode pipeline`) one thread per port receives, and steers each packet by a symmetric hash of
+its flow -- the same for both directions -- through a lock-free single-producer, single-consumer
+ring to a worker, which transmits it and sends the buffer home on a second ring. Workers keep their
+own ARP caches and pass each other the ARP replies they hear. An integration test sends 100,000
+datagrams of one flow through 1, 2, 4 and 8 workers in each model and checks that they arrive in
+the order sent; another runs the router built with ThreadSanitizer under a minute of sustained
+traffic in each model.
 
 `npf replay` runs the same router over a pcap file instead of live interfaces, and writes what it
 sends to another: deterministically, and with no root. The golden-file tests use it in CI. Each
@@ -109,6 +121,19 @@ sudo ./build/dev/npf show stats
 sudo ./scripts/cleanup_netns.sh
 ```
 
+`--workers` and `--mode` override the configuration's `workers` and `mode`:
+
+```bash
+sudo ip netns exec ns-router ./build/dev/npf run --config configs/router.conf --workers 4 --mode pipeline
+```
+
+`bench/system/gen` sends numbered UDP flows from the client, and `scripts/check_ordering.py` checks a
+capture of them for reordering:
+
+```bash
+sudo ip netns exec ns-client ./build/dev/bench/system/gen --dst 10.0.2.2 --flows 4 --count 100000 --ip-id-sequence
+```
+
 To filter, uncomment `filter filter.conf` in `configs/router.conf`:
 [`configs/filter.conf`](configs/filter.conf) has the rules, and the comments in
 `include/npf/core/config.hpp` give the format. A packet the filter denies is counted as
@@ -136,9 +161,11 @@ sudo ./scripts/cleanup_bridge_netns.sh
 ```
 
 `npf run` prints a stats line every 5 seconds. `npf show stats` signals it (`SIGUSR1`) to write out
-every counter, and Ctrl-C stops it and prints them one last time. `npf show mac` and
-`npf show arp` do the same for its MAC table and its ARP cache. `SIGUSR2` empties the ARP cache of
-everything but the static entries, which is how a test starts it from cold.
+every counter, summed over every thread, and Ctrl-C stops it and prints them one last time.
+`npf show mac` and `npf show arp` do the same for its MAC tables and its ARP caches, a section per
+worker when there are several. `SIGUSR2` empties the ARP caches of everything but the static
+entries, which is how a test starts it from cold. Each of these is answered with every thread
+parked between two bursts, so nothing is read while it is being written.
 `npf dump --iface <name>` prints the parsed headers of every frame an interface receives.
 
 The integration tests set all of this up, make their checks and tear it down again:
@@ -157,6 +184,14 @@ sudo tests/integration/test_arp_resolution.sh build/dev/npf
 
 ```bash
 sudo tests/integration/test_switching.sh build/dev/npf
+```
+
+```bash
+sudo tests/integration/test_ordering.sh build/dev/npf
+```
+
+```bash
+sudo tests/integration/test_soak.sh build/tsan/npf
 ```
 
 ### Replaying a pcap
@@ -190,7 +225,7 @@ ctest --preset dev -R golden --output-on-failure
   a neighbour, the next one is dropped, not the oldest. The router learns a neighbour's address
   from its replies and announcements, never from its requests, and creates an entry only for a
   neighbour it has asked about itself. Requests are always broadcast, even when checking an entry
-  it already has. One cache serves every port, searched entry by entry. No proxy ARP.
+  it already has. One cache per worker serves every port, searched entry by entry. No proxy ARP.
 - **Some of replay.** Only classic pcap is read: not pcapng, and not the nanosecond-resolution
   variant, which is refused rather than misread. Every input frame arrives on port 0, and the output
   does not record which port a frame left by. No time passes during a replay, so an ARP request is
@@ -211,7 +246,14 @@ ctest --preset dev -R golden --output-on-failure
   frames), which a bridge must not forward, are flooded like any multicast. A flood copy that finds
   no free buffer is not sent; the frame is still counted once, as flooded. An address on a bridged
   port is answered on that port alone: the router has no address for a bridge domain as a whole.
-- **Threads.** One worker forwards everything (phase 13).
+- **Some of threading.** No NUMA awareness, CPU pinning, work stealing or change in the number of
+  workers while running. The kernel's fanout hash is not symmetric, so in run-to-completion the two
+  directions of a connection may be handled by different workers; each direction stays in order.
+  Each worker resolves its neighbours for itself, so several may ask for the same one, and has its
+  own ICMP rate limiter, so the router as a whole sends up to N times one limiter's allowance.
+  Pipeline mode needs a power-of-two number of workers and a `pool_size` of at most 16384, and drops
+  a packet whose worker's ring is full, as `RingFull`. Bridged ports need `workers 1`: each worker
+  would keep a MAC table of its own. The routing table cannot change while the router runs.
 - **IPv6.** Not routed: an IPv6 frame for the router is dropped as an unsupported EtherType, while
   one crossing a bridge is switched like any other frame. The longest-prefix match tables are
   IPv4's alone too; none is written to take a wider address.
@@ -228,8 +270,8 @@ ctest --preset dev -R golden --output-on-failure
 - **TCP.** Only the header's fields are read: ports, sequence and acknowledgement numbers, flags.
   There is no connection state.
 - **Most configuration choices.** The configuration parser accepts every value the file format
-  defines, but `npf run` runs only `io af_packet`, and `npf replay` only `io pcap`; both only with
-  `fib linear`, `mode rtc` and `workers 1`. They refuse the rest: `fib trie`, `patricia` and
+  defines, but `npf run` runs only `io af_packet`, and `npf replay` only `io pcap`, on one thread
+  (`mode rtc`, `workers 1`); both only with `fib linear`. They refuse the rest: `fib trie`, `patricia` and
   `dir24_8` name tables that exist and are tested, but the router is not built on them yet.
 
 ## Known limitations

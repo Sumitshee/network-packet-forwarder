@@ -67,6 +67,13 @@ npf_count_allocations(test_filter)
 target_link_libraries(test_filter PRIVATE npf_pipe)
 target_compile_definitions(test_filter PRIVATE NPF_CONFIG_DIR="${PROJECT_SOURCE_DIR}/configs")
 
+npf_add_unit_test(test_ring unit/test_ring.cpp)
+target_link_libraries(test_ring PRIVATE Threads::Threads)
+npf_add_unit_test(test_hash unit/test_hash.cpp)
+npf_add_unit_test(test_worker unit/test_worker.cpp)
+target_link_libraries(test_worker PRIVATE npf_pipe)
+target_link_libraries(test_hash PRIVATE npf_pipe)
+
 npf_add_unit_test(test_pcap_file unit/test_pcap_file.cpp)
 target_link_libraries(test_pcap_file PRIVATE npf_io)
 
@@ -78,7 +85,7 @@ add_dependencies(test_golden npf)
 
 # Integration tests that need root. Run by anyone else, each exits 77, which CTest reports as
 # skipped rather than failed -- so in CI they are skipped.
-foreach(name forward_netns traceroute arp_resolution switching)
+foreach(name forward_netns traceroute arp_resolution switching ordering)
   add_test(NAME integration.${name}
            COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/integration/test_${name}.sh $<TARGET_FILE:npf>)
   set_tests_properties(integration.${name} PROPERTIES
@@ -86,6 +93,14 @@ foreach(name forward_netns traceroute arp_resolution switching)
     RUN_SERIAL TRUE
     TIMEOUT 180)
 endforeach()
+
+# Ten runs of 100,000 datagrams each.
+set_tests_properties(integration.ordering PROPERTIES TIMEOUT 400)
+
+# 60 s of traffic in each mode: the phase 13 race hunt, meant for the tsan preset's binary.
+add_test(NAME integration.soak
+         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/integration/test_soak.sh $<TARGET_FILE:npf>)
+set_tests_properties(integration.soak PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 400)
 
 # libFuzzer ships only with Clang, and ThreadSanitizer cannot be combined with the fuzzers' ASan.
 if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang" AND NOT NPF_SANITIZER STREQUAL "tsan")

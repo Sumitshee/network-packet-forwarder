@@ -13,8 +13,13 @@
         Print "listening", then a line for each frame received on <iface> for <seconds>, in the
         shape `tcpdump -t -e -n -Q in` gives it, so a test reads either the same way:
         "src > dst, ethertype ARP (0x0806), length N: Request who-has A tell B", and so on.
+    netns_frames.py pcap <iface> <seconds> <file>
+        Print "listening", then write every frame received on <iface> for <seconds>, or until
+        SIGTERM, to <file> as a pcap: what `tcpdump -w` is used for, where tcpdump cannot run.
+        A Python loop drops frames a fast sender outruns; scripts/check_ordering.py allows gaps.
 """
 
+import signal
 import socket
 import struct
 import sys
@@ -135,12 +140,36 @@ def frames(iface, seconds):
                 print(describe(frame), flush=True)
 
 
+def pcap(iface, seconds, path):
+    stop = []
+    signal.signal(signal.SIGTERM, lambda *_: stop.append(True))
+    with socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(ETH_P_ALL)) as s,             open(path, "wb") as out:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 8 * 1024 * 1024)
+        s.bind((iface, 0))
+        s.settimeout(0.2)
+        # The classic header: magic, version 2.4, no time zone, snap length, Ethernet.
+        out.write(struct.pack("<IHHiIII", 0xA1B2C3D4, 2, 4, 0, 0, 65535, 1))
+        print("listening", flush=True)
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline and not stop:
+            try:
+                frame, address = s.recvfrom(65535)
+            except (socket.timeout, InterruptedError):
+                continue
+            if address[2] == PACKET_OUTGOING:
+                continue
+            now = time.time()
+            out.write(struct.pack("<IIII", int(now), int((now % 1) * 1e6), len(frame), len(frame)))
+            out.write(frame)
+
+
 def main(argv):
     commands = {
         "lldp": (lldp, 1),
         "bad-checksum": (bad_checksum, 4),
         "echo-ttls": (lambda i, c, s: echo_ttls(i, int(c), float(s)), 3),
         "frames": (lambda i, s: frames(i, float(s)), 2),
+        "pcap": (lambda i, s, f: pcap(i, float(s), f), 3),
     }
     if len(argv) < 2 or argv[1] not in commands or len(argv) - 2 != commands[argv[1]][1]:
         print(__doc__, file=sys.stderr)

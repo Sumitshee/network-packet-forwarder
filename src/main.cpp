@@ -1,11 +1,15 @@
 // npf, the router.
 //
-//   npf run --config <file> [--pidfile <path>] [--stats-file <path>] [--busy-poll]
-//       Forwards until SIGINT or SIGTERM, with a stats line every 5 s. SIGUSR1 prints the whole
+//   npf run --config <file> [--mode rtc|pipeline] [--workers <n>] [--pidfile <path>]
+//           [--stats-file <path>] [--busy-poll]
+//       Forwards until SIGINT or SIGTERM, with a stats line every 5 s. --mode and --workers stand
+//       in for the configuration's own: n workers, each running to completion on sockets of its
+//       own (rtc), or fed by an RX thread per port (pipeline). SIGUSR1 prints the whole
 //       counter table and writes it to the stats file, which is how `npf show stats` reads it.
 //       SIGRTMIN and SIGRTMIN+1 write the MAC table and the ARP cache next to it, with the
-//       extensions .mac and .arp, for `npf show mac` and `npf show arp`. SIGUSR2 empties the ARP
-//       cache of all but its static entries, for tests.
+//       extensions .mac and .arp, for `npf show mac` and `npf show arp`, a section per worker when
+//       there are several. SIGUSR2 empties the ARP caches of all but their static entries, for
+//       tests.
 //   npf dump --iface <name>
 //       Prints the parsed headers of every frame received on one interface.
 //   npf show stats|mac|arp [--pidfile <path>] [--stats-file <path>]
@@ -27,7 +31,9 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cerrno>
+#include <charconv>
 #include <chrono>
 #include <csignal>
 #include <cstddef>
@@ -40,6 +46,7 @@
 #include <initializer_list>
 #include <iterator>
 #include <limits>
+#include <memory>
 #include <npf/core/config.hpp>
 #include <npf/core/log.hpp>
 #include <npf/core/packet.hpp>
@@ -52,6 +59,7 @@
 #include <npf/pipe/decision.hpp>
 #include <npf/pipe/filter.hpp>
 #include <npf/pipe/forward.hpp>
+#include <npf/pipe/worker.hpp>
 #include <npf/proto/arp.hpp>
 #include <npf/proto/checksum.hpp>
 #include <npf/proto/ethernet.hpp>
@@ -85,16 +93,14 @@ using npf::proto::format_ipv4;
 using npf::proto::format_mac;
 
 constexpr std::string_view kUsage =
-    "usage: npf run --config <file> [--pidfile <path>] [--stats-file <path>] [--busy-poll]\n"
+    "usage: npf run --config <file> [--mode rtc|pipeline] [--workers <n>] [--pidfile <path>]\n"
+    "               [--stats-file <path>] [--busy-poll]\n"
     "       npf dump --iface <name>\n"
     "       npf show stats|mac|arp [--pidfile <path>] [--stats-file <path>]\n"
     "       npf replay <in.pcap> <out.pcap> --config <file> [--stats-json <path>]\n";
 
 constexpr auto kStatsPeriod = std::chrono::seconds{5};
 constexpr int kPollTimeoutMs = 100;  // long enough that an idle router does not spin a core
-constexpr std::size_t kArpCapacity = 1024;
-constexpr std::size_t kMacCapacity = 4096;
-constexpr auto kMacAgeInterval = std::chrono::seconds{1};  // how often the MAC table is aged
 constexpr std::size_t kDumpPoolSize = 256;
 constexpr auto kShowTimeout = std::chrono::seconds{2};
 
@@ -121,6 +127,8 @@ struct Options {
   std::filesystem::path stats_file{"/run/npf.stats"};
   std::string iface;
   bool busy_poll{false};
+  std::optional<npf::core::RunMode> mode;  // run's: nullopt keeps the configuration's
+  std::optional<std::size_t> workers;
   std::vector<std::filesystem::path> files;  // replay's: the pcap to read, then the one to write
   std::filesystem::path stats_json;
 };
@@ -129,6 +137,15 @@ struct Flag {
   std::string_view name;
   std::string_view value;
 };
+
+std::size_t parse_count(std::string_view text, std::string_view what) {
+  std::size_t n = 0;
+  const auto [end, ec] = std::from_chars(text.data(), text.data() + text.size(), n);
+  if (ec != std::errc{} || end != text.data() + text.size() || n == 0) {
+    throw UsageError(std::format("{} needs a positive whole number, not '{}'", what, text));
+  }
+  return n;
+}
 
 // Applies one "--name value" pair. False if the command has no such option.
 bool set_option(Options& o, const Flag& flag) {
@@ -144,6 +161,13 @@ bool set_option(Options& o, const Flag& flag) {
     o.stats_file = flag.value;
   } else if (flag.name == "--stats-json" && o.command == "replay") {
     o.stats_json = flag.value;
+  } else if (flag.name == "--workers" && o.command == "run") {
+    o.workers = parse_count(flag.value, "--workers");
+  } else if (flag.name == "--mode" && o.command == "run") {
+    if (flag.value != "rtc" && flag.value != "pipeline") {
+      throw UsageError(std::format("--mode is rtc or pipeline, not '{}'", flag.value));
+    }
+    o.mode = flag.value == "rtc" ? npf::core::RunMode::Rtc : npf::core::RunMode::Pipeline;
   } else {
     return false;
   }
@@ -278,9 +302,15 @@ class Pidfile {
 
 using CounterList = std::vector<std::pair<std::string, std::uint64_t>>;
 
+// Buffers free and buffers in all, over every pool.
+struct PoolUse {
+  std::size_t available{0};
+  std::size_t capacity{0};
+};
+
 // Every counter, by name, in one fixed order: the drop reasons in DropReason's, then only the IP
 // protocols seen, by number.
-CounterList counter_list(const npf::stat::Counters& c, const PacketPool& pool) {
+CounterList counter_list(const npf::stat::Counters& c, PoolUse pool) {
   CounterList out{
       {"rx_packets", c.rx_packets},
       {"rx_bytes", c.rx_bytes},
@@ -306,13 +336,13 @@ CounterList counter_list(const npf::stat::Counters& c, const PacketPool& pool) {
     }
     ++protocol;
   }
-  out.emplace_back("pool_available", pool.available());
-  out.emplace_back("pool_capacity", pool.capacity());
+  out.emplace_back("pool_available", pool.available);
+  out.emplace_back("pool_capacity", pool.capacity);
   return out;
 }
 
 // One "name value" pair per line, so a script can pick out any counter with awk.
-std::string counter_table(const npf::stat::Counters& c, const PacketPool& pool) {
+std::string counter_table(const npf::stat::Counters& c, PoolUse pool) {
   std::string out;
   for (const auto& [name, value] : counter_list(c, pool)) {
     out += std::format("{:<18}{}\n", name, value);
@@ -321,7 +351,7 @@ std::string counter_table(const npf::stat::Counters& c, const PacketPool& pool) 
 }
 
 // The same, as one JSON object: a "name": value pair per line, in the same order.
-std::string counter_json(const npf::stat::Counters& c, const PacketPool& pool) {
+std::string counter_json(const npf::stat::Counters& c, PoolUse pool) {
   std::string out = "{";
   std::string_view separator = "\n";
   for (const auto& [name, value] : counter_list(c, pool)) {
@@ -413,278 +443,9 @@ void write_snapshot(const std::filesystem::path& path, const std::string& table)
   }
 }
 
-// --- the forwarding loop -------------------------------------------------------------------------
+// --- the router ----------------------------------------------------------------------------------
 
-// Packets waiting to go out of one port: at most one burst's worth.
-class TxQueue {
- public:
-  [[nodiscard]] bool push(Packet* p) noexcept {
-    if (size_ == slots_.size()) {
-      return false;
-    }
-    // The check above is the bounds check.
-    // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-constant-array-index)
-    slots_[size_++] = p;
-    return true;
-  }
-  [[nodiscard]] std::span<Packet* const> packets() const noexcept { return {slots_.data(), size_}; }
-  void clear() noexcept { size_ = 0; }
-
- private:
-  std::array<Packet*, npf::core::kMaxBurst> slots_{};
-  std::size_t size_{0};
-};
-
-// What the ARP cache asks of the worker. A request is built in a fresh buffer and queued on its
-// port, to leave with the rest of the burst. A packet the cache gives up on is released and
-// counted as ArpUnresolved -- but the head of a queue first earns its sender a Host Unreachable,
-// which takes the control plane, built after the cache. So a head waits here, and the worker
-// answers it straight after the tick() that gave it up.
-class ArpCacheEvents final : public npf::table::ArpEvents {
- public:
-  // capacity: the ARP cache's. One tick() gives up on each entry at most once.
-  ArpCacheEvents(PacketPool& pool, std::vector<npf::pipe::PortState> ports,
-                 std::vector<TxQueue>& queues, npf::stat::Counters& stats, std::size_t capacity)
-      : pool_{&pool},
-        ports_{std::move(ports)},
-        queues_{&queues},
-        stats_{&stats},
-        unresolved_(capacity) {}
-
-  void send_arp_request(std::uint32_t target_ip, std::uint16_t out_port) noexcept override {
-    if (out_port >= ports_.size()) {
-      return;
-    }
-    Packet* p = pool_->acquire();
-    if (p == nullptr) {
-      return;  // no buffer to spare: the next packet for this neighbour asks again
-    }
-    const npf::pipe::PortState& port = ports_[out_port];
-    if (!npf::proto::build_arp_request(*p, port.mac, port.ip, target_ip) ||
-        !(*queues_)[out_port].push(p)) {
-      pool_->release(p);
-    }
-  }
-
-  void unresolved(Packet* p) noexcept override {
-    if (n_unresolved_ == unresolved_.size()) {
-      discard(p);  // not reached: see the constructor
-      return;
-    }
-    unresolved_[n_unresolved_++] = p;
-  }
-
-  void discard(Packet* p) noexcept override {
-    pool_->release(p);
-    ++stats_->drop(DropReason::ArpUnresolved);
-  }
-
-  // The heads given up on since the last clear_unresolved(), still to be answered and dropped.
-  [[nodiscard]] std::span<Packet* const> unresolved_heads() const noexcept {
-    return {unresolved_.data(), n_unresolved_};
-  }
-  void clear_unresolved() noexcept { n_unresolved_ = 0; }
-
- private:
-  PacketPool* pool_;  // borrowed, like everything the worker uses
-  std::vector<npf::pipe::PortState> ports_;
-  std::vector<TxQueue>* queues_;
-  npf::stat::Counters* stats_;
-  std::vector<Packet*> unresolved_;  // sized once; the first n_unresolved_ are waiting
-  std::size_t n_unresolved_{0};
-};
-
-// The one worker: run the ARP cache's and the MAC table's timers, receive a burst, decide every
-// packet, send the answers, the forwarded and the flooded.
-class Worker {
- public:
-  using Pipeline = npf::pipe::Forwarder<npf::table::LinearLpm>;
-  using FloodSets = std::vector<std::vector<std::uint16_t>>;  // make_flood_sets()'
-
-  Worker(npf::io::IoBackend& backend, PacketPool& pool, Pipeline& pipeline,
-         npf::table::ArpCache& arp, ArpCacheEvents& arp_events, npf::table::MacTable& macs,
-         npf::stat::Counters& stats, std::vector<TxQueue>& requests, FloodSets flood_sets,
-         std::size_t burst)
-      : backend_{&backend},
-        pool_{&pool},
-        pipeline_{&pipeline},
-        arp_{&arp},
-        arp_events_{&arp_events},
-        macs_{&macs},
-        stats_{&stats},
-        requests_{&requests},
-        flood_sets_{std::move(flood_sets)},
-        forward_(requests.size()),
-        flood_(requests.size()),
-        arp_replies_(requests.size()),
-        icmp_(requests.size()),
-        burst_{burst} {}
-
-  void run_one_burst(npf::core::Clock::time_point now) noexcept {
-    pipeline_->set_time(now);
-    arp_->tick(now);
-    if (now >= next_mac_age_) {  // a scan of the whole table: once a second is plenty
-      macs_->age(now);
-      next_mac_age_ = now + kMacAgeInterval;
-    }
-    answer_unresolved(now);
-    const std::size_t n = backend_->rx_burst(rx_.data(), burst_);
-    const std::span<Packet* const> got(rx_.data(), n);
-    for (const Packet* p : got) {
-      ++stats_->rx_packets;
-      stats_->rx_bytes += p->size();
-    }
-    pipeline_->process_burst(rx_.data(), n, decisions_.data());
-    const std::span<const npf::Decision> decided(decisions_.data(), n);
-    for (std::size_t i = 0; i < n; ++i) {
-      dispatch(got[i], decided[i], now);
-    }
-    transmit();
-  }
-
- private:
-  // The heads of the queues tick() gave up on: a Host Unreachable each, out of the port each
-  // arrived on, then dropped, as the packets queued behind them already were.
-  void answer_unresolved(npf::core::Clock::time_point now) noexcept {
-    for (Packet* p : arp_events_->unresolved_heads()) {
-      if (Packet* error = pipeline_->host_unreachable(*p, *pool_, now); error != nullptr) {
-        queue(icmp_[p->in_port()], error);
-      }
-      pool_->release(p);
-      ++stats_->drop(DropReason::ArpUnresolved);
-    }
-    arp_events_->clear_unresolved();
-  }
-
-  // Every packet leaves here queued for transmission, released, or held by the ARP cache: exactly
-  // one of those. So does every answer the control plane hands back.
-  void dispatch(Packet* p, npf::Decision d, npf::core::Clock::time_point now) noexcept {
-    switch (d.verdict) {
-      case Verdict::Forward:
-        forward(p, d.out_port);
-        return;
-      case Verdict::ToHost: {
-        const std::optional<npf::pipe::Reply> reply = pipeline_->deliver_to_host(*p, *pool_, now);
-        for (const npf::pipe::Reply& freed : pipeline_->released()) {  // an ARP answer's doing
-          forward(freed.packet, freed.port);
-        }
-        if (reply && reply->packet == p) {  // an ARP request, turned into its reply in place
-          queue(arp_replies_[reply->port], p);
-          return;
-        }
-        if (reply) {
-          queue(icmp_[reply->port], reply->packet);
-        }
-        pool_->release(p);
-        return;
-      }
-      case Verdict::Drop:
-        if (Packet* error = pipeline_->error_for(*p, d.reason, *pool_, now); error != nullptr) {
-          queue(icmp_[p->in_port()], error);
-        }
-        pool_->release(p);
-        return;
-      case Verdict::Queued:  // the ARP cache's now, until deliver_to_host() or tick() lets it go
-        return;
-      case Verdict::Flood:
-        flood(p);
-        return;
-    }
-  }
-
-  // Out of every port of the frame's flood set: a copy each for all but the last, which takes the
-  // frame itself. The pipeline counted the frame, once, as flooded; a copy that finds no free
-  // buffer is not made, and shows only as one transmission fewer. A flood queue cannot overflow:
-  // a burst gives each port at most one copy of each frame.
-  void flood(Packet* p) noexcept {
-    const std::span<const std::uint16_t> out = flood_sets_[p->in_port()];
-    if (out.empty()) {  // the only port of its bridge domain that is up
-      pool_->release(p);
-      return;
-    }
-    for (const std::uint16_t port : out.first(out.size() - 1)) {
-      Packet* copy = pool_->acquire();
-      if (copy == nullptr) {
-        continue;
-      }
-      copy->resize(p->size());
-      std::ranges::copy(p->data(), copy->data().begin());
-      copy->set_in_port(p->in_port());
-      copy->set_rx_tsc(p->rx_tsc());  // a replay stamps what it writes with the input's time
-      queue(flood_[port], copy);
-    }
-    queue(flood_[out.back()], p);
-  }
-
-  void forward(Packet* p, std::uint16_t port) noexcept {
-    if (!forward_[port].push(p)) {
-      pool_->release(p);
-      ++stats_->drop(DropReason::TxFull);
-    }
-  }
-
-  void queue(TxQueue& q, Packet* p) noexcept {
-    if (!q.push(p)) {
-      pool_->release(p);
-    }
-  }
-
-  // One tx_burst per queue per port: what the router says itself goes first, since traffic waits
-  // on ARP and senders wait on ICMP.
-  void transmit() noexcept {
-    for (std::size_t i = 0; i < forward_.size(); ++i) {
-      const auto port = static_cast<std::uint16_t>(i);
-      stats_->arp_replies_tx += send(port, arp_replies_[i]);
-      stats_->arp_requests_tx += send(port, (*requests_)[i]);
-      send(port, icmp_[i]);  // counted as generated already, and in tx_packets once sent
-      const std::size_t queued = forward_[i].packets().size();
-      const std::size_t sent = send(port, forward_[i]);
-      stats_->forwarded += sent;
-      stats_->drop(DropReason::TxFull) += queued - sent;
-      send(port, flood_[i]);  // counted as flooded already, and in tx_packets once sent
-    }
-    backend_->tx_flush();
-  }
-
-  // Hands a queue to the backend, and releases what it refuses. Returns how many it took.
-  std::size_t send(std::uint16_t port, TxQueue& q) noexcept {
-    const std::span<Packet* const> pkts = q.packets();
-    if (pkts.empty()) {
-      return 0;
-    }
-    std::size_t bytes = 0;  // summed first: the backend releases what it sends
-    for (const Packet* p : pkts) {
-      bytes += p->size();
-    }
-    const std::size_t sent = backend_->tx_burst(pkts.data(), pkts.size(), port);
-    for (Packet* p : pkts.subspan(sent)) {
-      bytes -= p->size();
-      pool_->release(p);
-    }
-    stats_->tx_packets += sent;
-    stats_->tx_bytes += bytes;
-    q.clear();
-    return sent;
-  }
-
-  npf::io::IoBackend* backend_;  // all borrowed: their owner outlives the worker
-  PacketPool* pool_;
-  Pipeline* pipeline_;
-  npf::table::ArpCache* arp_;
-  ArpCacheEvents* arp_events_;
-  npf::table::MacTable* macs_;
-  npf::stat::Counters* stats_;
-  std::vector<TxQueue>* requests_;    // per port, filled by the ARP cache through ArpCacheEvents
-  FloodSets flood_sets_;              // per port: where a frame it floods goes
-  std::vector<TxQueue> forward_;      // per port
-  std::vector<TxQueue> flood_;        // per port: flooded frames and their copies
-  std::vector<TxQueue> arp_replies_;  // per port: the ARP requests deliver_to_host() turned around
-  std::vector<TxQueue> icmp_;         // per port: echo replies and ICMP errors
-  std::array<Packet*, npf::core::kMaxBurst> rx_{};
-  std::array<npf::Decision, npf::core::kMaxBurst> decisions_{};
-  std::size_t burst_;
-  npf::core::Clock::time_point next_mac_age_;
-};
+using npf::pipe::Worker;
 
 // What this phase can run. The parser accepts more, for the phases that will implement it. io is
 // what the command reads and writes through: af_packet for npf run, pcap for npf replay.
@@ -701,21 +462,57 @@ void require_supported(const npf::core::Config& cfg, npf::core::IoKind io) {
   if (cfg.fib != npf::core::FibKind::Linear) {
     throw std::runtime_error("only 'fib linear' is implemented so far");
   }
-  if (cfg.mode != npf::core::RunMode::Rtc || cfg.workers != 1) {
-    throw std::runtime_error("only 'mode rtc' with 'workers 1' is implemented so far");
+  if (cfg.arp.size() > npf::pipe::kArpCapacity) {
+    throw std::runtime_error(std::format("at most {} arp entries", npf::pipe::kArpCapacity));
   }
-  if (cfg.arp.size() > kArpCapacity) {
-    throw std::runtime_error(std::format("at most {} arp entries", kArpCapacity));
+  if (io == npf::core::IoKind::Pcap) {
+    if (cfg.mode != npf::core::RunMode::Rtc || cfg.workers != 1) {
+      throw std::runtime_error(
+          "npf replay runs one worker on one thread, to be deterministic: it needs 'mode rtc' "
+          "and 'workers 1'");
+    }
+    return;
+  }
+  if (cfg.workers > npf::pipe::kMaxWorkers) {
+    throw std::runtime_error(std::format("at most {} workers", npf::pipe::kMaxWorkers));
+  }
+  if (cfg.mode == npf::core::RunMode::Pipeline) {
+    if (!std::has_single_bit(cfg.workers)) {
+      throw std::runtime_error(
+          "pipeline mode picks a worker by hash & (workers - 1), so workers must be a power of "
+          "two");
+    }
+    if (cfg.pool_size > npf::pipe::kReturnRingSize) {
+      throw std::runtime_error(
+          std::format("pipeline mode allows a pool_size of at most {}, the packets a ring home "
+                      "to an RX thread can hold",
+                      npf::pipe::kReturnRingSize));
+    }
+  }
+  const bool bridged = std::ranges::any_of(
+      cfg.interfaces, [](const auto& i) { return i.mode == npf::PortMode::Bridged; });
+  if (bridged && cfg.workers != 1) {
+    throw std::runtime_error(
+        "bridged ports need 'workers 1': each worker has a MAC table of its own, and would learn "
+        "only the stations whose frames the kernel happens to hand it");
   }
 }
 
-npf::core::Config load_config_for(const std::filesystem::path& path, npf::core::IoKind io) {
-  npf::core::ParseResult parsed = npf::core::load_config(path);
+// The configuration file, with the command line's --mode and --workers in place of its own.
+npf::core::Config load_config_for(const Options& o, npf::core::IoKind io) {
+  npf::core::ParseResult parsed = npf::core::load_config(o.config);
   if (!parsed.value) {
-    throw std::runtime_error(std::format("{}: {}", path.string(), parsed.error));
+    throw std::runtime_error(std::format("{}: {}", o.config.string(), parsed.error));
   }
-  require_supported(*parsed.value, io);
-  return std::move(*parsed.value);
+  npf::core::Config cfg = std::move(*parsed.value);
+  if (o.mode) {
+    cfg.mode = *o.mode;
+  }
+  if (o.workers) {
+    cfg.workers = *o.workers;
+  }
+  require_supported(cfg, io);
+  return cfg;
 }
 
 // The packet filter cfg, read from config_file, names; without one, no rules, and every packet is
@@ -750,127 +547,400 @@ std::vector<bool> link_states(const npf::io::IoBackend& backend) {
   return up;
 }
 
-// The router itself -- its tables, the pipeline, and the worker that drives them -- around the
-// backend and the pool that run() or replay() brings. cfg's interfaces must have their MACs.
-// Members are built in the order declared, each from those above it.
-struct Router {
-  Router(const npf::core::Config& cfg, const npf::core::FilterConfig& rules,
-         npf::io::IoBackend& backend, PacketPool& pool)
-      : requests(cfg.interfaces.size()),
-        arp_events(pool, npf::pipe::make_port_table(cfg), requests, stats, kArpCapacity),
-        arp(arp_events, kArpCapacity),
-        macs(kMacCapacity, cfg.mac_age),
-        filter(rules.rules, rules.policy),
-        pipeline(cfg, fib, arp, macs, filter, stats),
-        worker(backend, pool, pipeline, arp, arp_events, macs, stats, requests,
-               npf::pipe::make_flood_sets(pipeline.ports(), link_states(backend)), cfg.burst) {
+// What every worker shares, and only reads once the workers run: the FIB and the packet filter.
+struct SharedTables {
+  SharedTables(const npf::core::Config& cfg, const npf::core::FilterConfig& rules)
+      : filter(rules.rules, rules.policy) {
     for (const npf::table::Route& r : cfg.routes) {
       if (!fib.add(r)) {
         throw std::runtime_error("the FIB refused a route the parser accepted");
       }
     }
-    for (const npf::core::StaticArp& a : cfg.arp) {
-      arp.insert_static(a.ip, a.mac, a.port);
+  }
+  npf::table::LinearLpm fib;
+  npf::pipe::Filter filter;
+};
+
+// Every thread's counters summed, and every pool's buffers.
+struct Totals {
+  npf::stat::Counters counters;
+  PoolUse pools;
+};
+
+// One worker and what it owns besides its tables: its pool, the recycler over it, and its backend
+// -- its own sockets in run-to-completion mode, the rings and its transmit-only sockets in
+// pipeline mode.
+struct Lane {
+  std::unique_ptr<PacketPool> pool;
+  std::unique_ptr<npf::pipe::Recycler> recycler;
+  std::unique_ptr<npf::io::AfPacketBackend> sockets;
+  std::unique_ptr<npf::pipe::Doorbell> bell;                                // pipeline mode
+  std::unique_ptr<npf::pipe::RingBackend<npf::io::AfPacketBackend>> rings;  // pipeline mode
+  std::unique_ptr<Worker> worker;
+};
+
+// One pipeline RX thread's: its pool, its socket on its port, and the stage that steers.
+struct RxLane {
+  std::unique_ptr<PacketPool> pool;
+  std::unique_ptr<npf::io::AfPacketBackend> sockets;
+  std::unique_ptr<npf::pipe::RxStage> stage;
+};
+
+// Lets the threads go again however the caller leaves the scope that parked them.
+class ResumeOnExit {
+ public:
+  explicit ResumeOnExit(npf::pipe::Rendezvous& rv) : rv_{&rv} {}
+  ResumeOnExit(const ResumeOnExit&) = delete;
+  ResumeOnExit(ResumeOnExit&&) = delete;
+  ResumeOnExit& operator=(const ResumeOnExit&) = delete;
+  ResumeOnExit& operator=(ResumeOnExit&&) = delete;
+  ~ResumeOnExit() { rv_->resume_all(); }
+
+ private:
+  npf::pipe::Rendezvous* rv_;
+};
+
+// npf run's threads, in either model (ARCHITECTURE.md §12), and the control thread's hold on them.
+// Built whole by the constructor; start() lets the threads go, and stop() joins them.
+class Engine {
+ public:
+  Engine(npf::core::Config cfg, const npf::core::FilterConfig& rules, bool busy_poll)
+      : cfg_{std::move(cfg)}, busy_poll_{busy_poll} {
+    if (cfg_.mode == npf::core::RunMode::Rtc) {
+      build_rtc(rules);
+    } else {
+      build_pipeline(rules);
+    }
+    if (lanes_.size() > 1) {
+      std::vector<Worker*> workers;
+      workers.reserve(lanes_.size());
+      for (const Lane& lane : lanes_) {
+        workers.push_back(lane.worker.get());
+      }
+      news_ = std::make_unique<npf::pipe::NewsRings>(workers.size());
+      news_->connect(workers);
+    }
+    rendezvous_ = std::make_unique<npf::pipe::Rendezvous>(lanes_.size() + rx_lanes_.size());
+  }
+  Engine(const Engine&) = delete;
+  Engine(Engine&&) = delete;
+  Engine& operator=(const Engine&) = delete;
+  Engine& operator=(Engine&&) = delete;
+  ~Engine() { stop(); }
+
+  // Starts every thread. Signals must already be blocked, so that the threads inherit the mask
+  // and every signal reaches the control thread's signalfd.
+  void start() {
+    for (Lane& lane : lanes_) {
+      threads_.emplace_back([this, &lane] { run_worker(lane); });
+    }
+    for (RxLane& lane : rx_lanes_) {
+      threads_.emplace_back([this, &lane] { run_rx(lane); });
     }
   }
 
-  npf::table::LinearLpm fib;
-  npf::stat::Counters stats;
-  std::vector<TxQueue> requests;
-  ArpCacheEvents arp_events;
-  npf::table::ArpCache arp;
-  npf::table::MacTable macs;
-  npf::pipe::Filter filter;
-  Worker::Pipeline pipeline;
-  Worker worker;
+  // Ends every thread, then lets go of every packet still held: those waiting on ARP, and in
+  // pipeline mode those in rings. Only this thread is left to touch anything.
+  void stop() noexcept {
+    if (threads_.empty()) {
+      return;
+    }
+    rendezvous_->stop_all();
+    threads_.clear();  // joins
+    for (Lane& lane : lanes_) {
+      lane.worker->arp().flush();  // dropped now, and so counted
+    }
+    for (RxLane& lane : rx_lanes_) {
+      lane.stage->reclaim();
+    }
+  }
+
+  // Runs f with every thread parked between bursts, so it may read or change what they own.
+  template <class F>
+  auto parked(F f) {
+    if (threads_.empty()) {
+      return f();
+    }
+    rendezvous_->park_all();
+    const ResumeOnExit resume{*rendezvous_};
+    return f();
+  }
+
+  // Callers hold the threads parked, or have stopped them.
+  [[nodiscard]] Totals totals() const {
+    Totals t;
+    for (const Lane& lane : lanes_) {
+      t.counters.merge(lane.worker->stats());
+      t.pools.available += lane.pool->available();
+      t.pools.capacity += lane.pool->capacity();
+    }
+    for (const RxLane& lane : rx_lanes_) {
+      t.counters.merge(lane.stage->stats());
+      t.pools.available += lane.pool->available();
+      t.pools.capacity += lane.pool->capacity();
+    }
+    return t;
+  }
+
+  [[nodiscard]] std::string mac_tables(npf::core::Clock::time_point now) const {
+    return per_worker([now](const Worker& w) { return mac_table_text(w.macs(), now); });
+  }
+  [[nodiscard]] std::string arp_caches() {
+    return per_worker([](Worker& w) { return arp_cache_text(w.arp()); });
+  }
+  // Returns how many entries each cache kept: its static ones.
+  std::size_t flush_arp() {
+    for (Lane& lane : lanes_) {
+      lane.worker->arp().flush();
+    }
+    return lanes_.front().worker->arp().size();
+  }
+
+  [[nodiscard]] std::uint64_t rx_oversized() const {
+    std::uint64_t n = 0;
+    for (const Lane& lane : lanes_) {
+      n += cfg_.mode == npf::core::RunMode::Rtc ? lane.sockets->rx_oversized() : 0;
+    }
+    for (const RxLane& lane : rx_lanes_) {
+      n += lane.sockets->rx_oversized();
+    }
+    return n;
+  }
+
+  [[nodiscard]] std::size_t ports() const noexcept { return cfg_.interfaces.size(); }
+  [[nodiscard]] std::size_t workers() const noexcept { return lanes_.size(); }
+  [[nodiscard]] std::size_t rx_threads() const noexcept { return rx_lanes_.size(); }
+
+ private:
+  // N workers, each with its own sockets, all in the ports' fanout groups. The first backend
+  // makes the groups and reads the MACs, and the others join.
+  void build_rtc(const npf::core::FilterConfig& rules) {
+    for (std::size_t w = 0; w < cfg_.workers; ++w) {
+      Lane& lane = lanes_.emplace_back();
+      lane.pool = std::make_unique<PacketPool>(cfg_.pool_size);
+      npf::io::AfPacketOptions options;
+      options.fanout = true;
+      options.quiet = w != 0;
+      if (w != 0) {
+        options.fanout_groups = lanes_.front().sockets->fanout_groups();
+      }
+      lane.sockets =
+          std::make_unique<npf::io::AfPacketBackend>(cfg_.interfaces, *lane.pool, options);
+      if (w == 0) {
+        take_macs(*lane.sockets, cfg_);
+        shared_ = std::make_unique<SharedTables>(cfg_, rules);
+      }
+    }
+    const auto flood_sets = npf::pipe::make_flood_sets(npf::pipe::make_port_table(cfg_),
+                                                       link_states(*lanes_.front().sockets));
+    for (Lane& lane : lanes_) {
+      lane.recycler = std::make_unique<npf::pipe::Recycler>(*lane.pool);
+      lane.worker = std::make_unique<Worker>(cfg_, shared_->fib, shared_->filter, *lane.sockets,
+                                             *lane.recycler, flood_sets);
+    }
+  }
+
+  // One RX thread per port, each receiving on its port only, and N workers, each transmitting
+  // through sockets that receive nothing.
+  void build_pipeline(const npf::core::FilterConfig& rules) {
+    const std::size_t n_ports = cfg_.interfaces.size();
+    for (std::size_t k = 0; k < n_ports; ++k) {
+      RxLane& lane = rx_lanes_.emplace_back();
+      lane.pool = std::make_unique<PacketPool>(cfg_.pool_size);
+      npf::io::AfPacketOptions options;
+      options.receive.assign(n_ports, false);
+      options.receive[k] = true;
+      options.quiet = k != 0;
+      lane.sockets =
+          std::make_unique<npf::io::AfPacketBackend>(cfg_.interfaces, *lane.pool, options);
+    }
+    take_macs(*rx_lanes_.front().sockets, cfg_);
+    shared_ = std::make_unique<SharedTables>(cfg_, rules);
+    rings_ = std::make_unique<npf::pipe::PipelineRings>(n_ports, cfg_.workers);
+    const auto flood_sets = npf::pipe::make_flood_sets(npf::pipe::make_port_table(cfg_),
+                                                       link_states(*rx_lanes_.front().sockets));
+    std::vector<npf::pipe::Doorbell*> bells;
+    for (std::size_t w = 0; w < cfg_.workers; ++w) {
+      Lane& lane = lanes_.emplace_back();
+      lane.pool = std::make_unique<PacketPool>(cfg_.pool_size);
+      npf::io::AfPacketOptions transmit_only;
+      transmit_only.receive.assign(n_ports, false);
+      transmit_only.quiet = true;
+      lane.sockets =
+          std::make_unique<npf::io::AfPacketBackend>(cfg_.interfaces, *lane.pool, transmit_only);
+      lane.recycler = std::make_unique<npf::pipe::Recycler>(*lane.pool);
+      std::vector<npf::pipe::PacketRing*> in;
+      for (std::size_t k = 0; k < n_ports; ++k) {
+        lane.recycler->add_home(*rx_lanes_[k].pool, rings_->home(w, k));
+        in.push_back(&rings_->to_worker(k, w));
+      }
+      lane.bell = std::make_unique<npf::pipe::Doorbell>();
+      bells.push_back(lane.bell.get());
+      lane.rings = std::make_unique<npf::pipe::RingBackend<npf::io::AfPacketBackend>>(
+          std::move(in), *lane.sockets, *lane.recycler, *lane.bell);
+      lane.worker = std::make_unique<Worker>(cfg_, shared_->fib, shared_->filter, *lane.rings,
+                                             *lane.recycler, flood_sets);
+    }
+    for (std::size_t k = 0; k < n_ports; ++k) {
+      RxLane& lane = rx_lanes_[k];
+      lane.stage = std::make_unique<npf::pipe::RxStage>(*lane.sockets, *lane.pool, *rings_, k,
+                                                        bells, cfg_.burst);
+    }
+  }
+
+  void run_worker(Lane& lane) noexcept {
+    Worker& worker = *lane.worker;
+    const auto burst = [&worker] { return worker.run_one_burst(npf::core::Clock::now()); };
+    if (lane.rings) {
+      npf::pipe::RingBackend<npf::io::AfPacketBackend>& rings = *lane.rings;
+      std::array<pollfd, 2> fds{
+          {{rings.bell().fd(), POLLIN, 0}, {rendezvous_->wake_fd(), POLLIN, 0}}};
+      npf::pipe::serve_loop(*rendezvous_, burst, [this, &rings, &fds] {
+        if (busy_poll_) {
+          return;
+        }
+        if (rings.arm_and_check_empty()) {
+          ::poll(fds.data(), fds.size(), kPollTimeoutMs);
+        }
+        rings.bell().disarm();
+      });
+      return;
+    }
+    run_polling(lane.sockets->fds(), burst);
+  }
+
+  void run_rx(RxLane& lane) noexcept {
+    npf::pipe::RxStage& stage = *lane.stage;
+    run_polling(lane.sockets->fds(), [&stage] { return stage.run_once(); });
+  }
+
+  // A thread whose work arrives on sockets: when a burst finds nothing, it sleeps in poll() until
+  // one is readable, the rendezvous wakes it, or kPollTimeoutMs passes -- the timers run at least
+  // that often.
+  template <class Burst>
+  void run_polling(const std::vector<int>& sockets, Burst burst) noexcept {
+    std::vector<pollfd> fds;
+    fds.reserve(sockets.size() + 1);
+    for (const int fd : sockets) {
+      fds.push_back({fd, POLLIN, 0});
+    }
+    fds.push_back({rendezvous_->wake_fd(), POLLIN, 0});
+    const int timeout_ms = busy_poll_ ? 0 : kPollTimeoutMs;
+    npf::pipe::serve_loop(*rendezvous_, burst,
+                          [&fds, timeout_ms] { ::poll(fds.data(), fds.size(), timeout_ms); });
+  }
+
+  // The text f makes of each worker, under a heading per worker when there are several.
+  template <class F>
+  [[nodiscard]] std::string per_worker(F f) const {
+    if (lanes_.size() == 1) {
+      return f(*lanes_.front().worker);
+    }
+    std::string out;
+    for (std::size_t w = 0; w < lanes_.size(); ++w) {
+      out += std::format("# worker {}\n", w);
+      out += f(*lanes_[w].worker);
+    }
+    return out;
+  }
+
+  npf::core::Config cfg_;
+  bool busy_poll_;
+  std::unique_ptr<SharedTables> shared_;
+  std::unique_ptr<npf::pipe::PipelineRings> rings_;
+  std::vector<RxLane> rx_lanes_;
+  std::vector<Lane> lanes_;
+  std::unique_ptr<npf::pipe::NewsRings> news_;
+  std::unique_ptr<npf::pipe::Rendezvous> rendezvous_;
+  std::vector<std::jthread> threads_;  // last: joined before anything they use is destroyed
 };
 
-void report(const npf::stat::Counters& stats, const PacketPool& pool,
-            const std::filesystem::path& stats_file) {
-  const std::string table = counter_table(stats, pool);
+void report(const Totals& t, const std::filesystem::path& stats_file) {
+  const std::string table = counter_table(t.counters, t.pools);
   print(table);
   write_snapshot(stats_file, table);
 }
 
-// The loop: forwards until SIGINT or SIGTERM; answers SIGUSR1 with the counters, SIGRTMIN with the
-// MAC table and SIGRTMIN+1 with the ARP cache, and SIGUSR2 by flushing the ARP cache.
-void serve(const Options& o, const npf::io::AfPacketBackend& backend, const PacketPool& pool,
-           Router& router) {
-  const int show_mac = SIGRTMIN;
-  const int show_arp = SIGRTMIN + 1;
-  const SignalFd signals{SIGINT, SIGTERM, SIGUSR1, SIGUSR2, show_mac, show_arp};
-  const Pidfile pidfile(o.pidfile);
-  npf::table::ArpCache& arp = router.arp;
-  const npf::stat::Counters& stats = router.stats;
-  std::vector<pollfd> fds;
-  for (const int fd : backend.fds()) {
-    fds.push_back({fd, POLLIN, 0});
+// One signal, answered: SIGUSR1 with the counters, SIGRTMIN with the MAC tables and SIGRTMIN+1
+// with the ARP caches, all read with the threads parked, and SIGUSR2 by flushing the ARP caches.
+// False for SIGINT and SIGTERM: time to stop.
+bool answer(int sig, const Options& o, Engine& engine) {
+  if (sig == SIGUSR1) {
+    report(engine.parked([&engine] { return engine.totals(); }), o.stats_file);
+  } else if (sig == SIGRTMIN) {
+    write_snapshot(show_request("mac", o.stats_file).file,
+                   engine.parked([&engine] { return engine.mac_tables(npf::core::Clock::now()); }));
+  } else if (sig == SIGRTMIN + 1) {
+    write_snapshot(show_request("arp", o.stats_file).file,
+                   engine.parked([&engine] { return engine.arp_caches(); }));
+  } else if (sig == SIGUSR2) {
+    const std::size_t kept = engine.parked([&engine] { return engine.flush_arp(); });
+    npf::core::log_info("ARP cache flushed; {} static entries kept", kept);
+  } else {
+    return false;
   }
-  fds.push_back({signals.fd(), POLLIN, 0});
-  const int timeout_ms = o.busy_poll ? 0 : kPollTimeoutMs;
+  return true;
+}
 
-  npf::core::log_info("forwarding on {} ports{}; Ctrl-C to stop", backend.ports().size(),
+// The control thread: lets the workers go, then answers signals, with a stats line every
+// kStatsPeriod, until SIGINT or SIGTERM. Stops the workers on the way out.
+void serve(const Options& o, Engine& engine) {
+  const SignalFd signals{SIGINT, SIGTERM, SIGUSR1, SIGUSR2, SIGRTMIN, SIGRTMIN + 1};
+  const Pidfile pidfile(o.pidfile);
+  engine.start();  // after the mask: every thread inherits it, so signals come only to this one
+  npf::core::log_info("forwarding on {} ports: {} worker{}{}{}; Ctrl-C to stop", engine.ports(),
+                      engine.workers(), engine.workers() == 1 ? "" : "s",
+                      engine.rx_threads() == 0
+                          ? ", run to completion"
+                          : std::format(" fed by {} RX thread{}", engine.rx_threads(),
+                                        engine.rx_threads() == 1 ? "" : "s"),
                       o.busy_poll ? ", busy-polling" : "");
+  pollfd fd{signals.fd(), POLLIN, 0};
   const auto start = npf::core::Clock::now();
   auto next_report = start + kStatsPeriod;
   for (bool running = true; running;) {
-    if (::poll(fds.data(), fds.size(), timeout_ms) < 0 && errno != EINTR) {
+    const auto wait =
+        std::chrono::ceil<std::chrono::milliseconds>(next_report - npf::core::Clock::now());
+    if (::poll(&fd, 1, static_cast<int>(std::max<std::int64_t>(wait.count(), 0))) < 0 &&
+        errno != EINTR) {
       throw_errno("poll");
     }
-    while ((fds.back().revents & POLLIN) != 0) {
-      const std::optional<int> sig = signals.next();
-      if (!sig) {
-        break;
-      }
-      if (*sig == SIGUSR1) {
-        report(stats, pool, o.stats_file);
-      } else if (*sig == show_mac) {
-        write_snapshot(show_request("mac", o.stats_file).file,
-                       mac_table_text(router.macs, npf::core::Clock::now()));
-      } else if (*sig == show_arp) {
-        write_snapshot(show_request("arp", o.stats_file).file, arp_cache_text(arp));
-      } else if (*sig == SIGUSR2) {
-        arp.flush();
-        npf::core::log_info("ARP cache flushed; {} static entries kept", arp.size());
-      } else {
-        running = false;
-      }
+    for (std::optional<int> sig = signals.next(); sig && running; sig = signals.next()) {
+      running = answer(*sig, o, engine);
     }
     const auto now = npf::core::Clock::now();
-    router.worker.run_one_burst(now);
     if (now >= next_report) {
       next_report += kStatsPeriod;
+      const Totals t = engine.parked([&engine] { return engine.totals(); });
+      const npf::stat::Counters& c = t.counters;
       print(std::format(
           "npf: {:>6}s  rx {}  forwarded {}  flooded {}  to_host {}  dropped {}  tx {}  pool "
           "{}/{}\n",
-          std::chrono::duration_cast<std::chrono::seconds>(now - start).count(), stats.rx_packets,
-          stats.forwarded, stats.flooded, stats.to_host, stats.total_drops(), stats.tx_packets,
-          pool.available(), pool.capacity()));
+          std::chrono::duration_cast<std::chrono::seconds>(now - start).count(), c.rx_packets,
+          c.forwarded, c.flooded, c.to_host, c.total_drops(), c.tx_packets, t.pools.available,
+          t.pools.capacity));
     }
   }
+  engine.stop();
 }
 
 int run(const Options& o) {
-  npf::core::Config cfg = load_config_for(o.config, npf::core::IoKind::AfPacket);
+  npf::core::Config cfg = load_config_for(o, npf::core::IoKind::AfPacket);
   const npf::core::FilterConfig rules = load_filter_for(cfg, o.config);
   if (!cfg.filter.empty()) {
     npf::core::log_info("packet filter: {} rules from {}, policy {}", rules.rules.size(),
                         npf::core::filter_path(cfg, o.config).string(),
                         rules.policy == npf::pipe::Action::Allow ? "allow" : "deny");
   }
-  PacketPool pool(cfg.pool_size);
-  npf::io::AfPacketBackend backend(cfg.interfaces, pool);
-  take_macs(backend, cfg);
-  Router router(cfg, rules, backend, pool);
+  Engine engine(std::move(cfg), rules, o.busy_poll);
 
-  serve(o, backend, pool, router);
+  serve(o, engine);
 
-  router.arp.flush();  // packets still waiting on ARP are dropped now, and so counted
   print("npf: stopped; final counters:\n");
-  report(router.stats, pool, o.stats_file);
-  if (backend.rx_oversized() != 0) {
+  report(engine.totals(), o.stats_file);
+  if (engine.rx_oversized() != 0) {
     npf::core::log_warn("{} frames were too big for a buffer and never reached the pipeline",
-                        backend.rx_oversized());
+                        engine.rx_oversized());
   }
   return 0;
 }
@@ -893,16 +963,19 @@ void write_text(const std::filesystem::path& path, const std::string& text) {
 int replay(const Options& o) {
   const std::filesystem::path& in = o.files.at(0);
   const std::filesystem::path& out = o.files.at(1);
-  npf::core::Config cfg = load_config_for(o.config, npf::core::IoKind::Pcap);
+  npf::core::Config cfg = load_config_for(o, npf::core::IoKind::Pcap);
   const npf::core::FilterConfig rules = load_filter_for(cfg, o.config);
   PacketPool pool(cfg.pool_size);
   npf::io::PcapFileBackend backend({.in = in, .out = out}, cfg.interfaces, pool);
   take_macs(backend, cfg);
-  Router router(cfg, rules, backend, pool);
+  SharedTables shared(cfg, rules);
+  npf::pipe::Recycler recycler(pool);
+  Worker worker(cfg, shared.fib, shared.filter, backend, recycler,
+                npf::pipe::make_flood_sets(npf::pipe::make_port_table(cfg), link_states(backend)));
 
   while (!backend.done()) {
     const std::size_t read = backend.records_read();
-    router.worker.run_one_burst(kReplayTime);
+    worker.run_one_burst(kReplayTime);
     // Between bursts only the ARP cache holds buffers, and a replay never answers its requests.
     if (backend.records_read() == read) {
       throw std::runtime_error(std::format(
@@ -911,13 +984,13 @@ int replay(const Options& o) {
           cfg.pool_size));
     }
   }
-  router.arp.flush();  // packets still waiting on ARP are dropped now, and so counted
+  worker.arp().flush();  // packets still waiting on ARP are dropped now, and so counted
   backend.tx_flush();
   if (!backend.ok()) {
     throw std::runtime_error("cannot write " + out.string());
   }
   if (!o.stats_json.empty()) {
-    write_text(o.stats_json, counter_json(router.stats, pool));
+    write_text(o.stats_json, counter_json(worker.stats(), {pool.available(), pool.capacity()}));
   }
   npf::core::log_info("replayed {} frames from {}, and wrote {} to {}", backend.records_read(),
                       in.string(), backend.records_written(), out.string());

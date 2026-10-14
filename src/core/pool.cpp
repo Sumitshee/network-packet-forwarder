@@ -39,10 +39,4 @@ PacketPool::PacketPool(std::size_t count) : available_{count}, capacity_{count} 
 
 PacketPool::~PacketPool() = default;
 
-bool PacketPool::owns(const Packet* p) const noexcept {
-  const auto addr = reinterpret_cast<std::uintptr_t>(p);
-  const auto base = reinterpret_cast<std::uintptr_t>(storage_.get());
-  return addr >= base && addr - base < capacity_ * kSlotSize && (addr - base) % kSlotSize == 0;
-}
-
 }  // namespace npf::core
