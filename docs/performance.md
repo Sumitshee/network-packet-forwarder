@@ -339,6 +339,102 @@ All of the methodology's list, and besides:
   measured.
 - **Other frame sizes, flow counts or rates.** Only 70-byte frames, 16 flows, and the two rates.
 
+## Phase 15: optimization pass
+
+One change at a time, each measured before and after on the same machine, each its own commit
+with its numbers. `docs/BUILD_PLAN.md` lists the candidates; the phase 14 baseline added its own.
+
+**Method.** Tier A comparisons use `scripts/ab_bench.sh`:
+
+- **Builds.** It builds the benchmark twice with the bench preset. The before side is a commit,
+  checked out in a git worktree; the after side is the change, uncommitted. The result records
+  the change's diff.
+- **Order.** It runs them before, after, after, before: two rounds, so that drift during the run
+  shows up as rounds that disagree.
+- **Each run** is pinned to CPU 2, 7 repetitions, started once the load average is below 0.5.
+- **Comparison.** `scripts/bench_compare.py` pools each side's 14 repetitions and reports, per
+  metric:
+  - the median, the min and the p95 (nearest rank, which of 14 is the slowest);
+  - the delta between the medians;
+  - the noise band, the larger of the two sides' p95 minus median;
+  - each round's delta on its own.
+- **The noise rule** (`docs/BUILD_PLAN.md`): a change is **noise** if its delta is smaller than
+  the band, or if the two rounds disagree in sign. A change that is noise is reverted, and its
+  entry stays.
+- **The metric.** Tier A's primary metric is **cycles per packet**, counted in user mode through
+  `perf_event_open`. Nanoseconds are reported beside it, but this laptop's clock follows turbo
+  and the power plan, and its wall times wander too much to decide anything (entry 0).
+- **Evidence.** Each comparison's JSON is `bench/results/<date>-<sha>-ab-<name>.json`, the four
+  Google Benchmark runs inside it whole.
+
+### Entry 0: the noise floor (no change)
+
+**Before and after:** the same code, commit `e09965c`, built twice. Only the comparison tooling
+differed, and it is not part of the benchmark.
+
+| Benchmark, metric | Before: median (min – p95) | After: median (min – p95) | Delta | Noise band | Rounds | Verdict |
+|---|---:|---:|---:|---:|---:|---|
+| `parse_only`, cycles | 23.7 (23.0 – 26.0) | 25.3 (23.2 – 30.6) | +1.5 (+6.5%) | 5.3 | -1.5, +4.0 | NOISE |
+| `parse_only`, ns | 6.3 (5.8 – 9.9) | 9.5 (5.9 – 20.0) | +3.2 (+50.0%) | 10.5 | -1.3, +8.8 | NOISE |
+| `full_datapath/linear/topology`, cycles | 286.1 (283.4 – 315.5) | 285.9 (282.5 – 291.1) | -0.2 (-0.1%) | 29.4 | -2.2, +1.2 | NOISE |
+| `full_datapath/linear/topology`, ns | 88.4 (81.2 – 153.3) | 92.4 (72.9 – 103.8) | +4.0 (+4.5%) | 64.9 | +0.2, +6.8 | NOISE |
+| `full_datapath/dir24_8/topology`, cycles | 281.1 (275.8 – 313.2) | 278.3 (276.6 – 284.5) | -2.7 (-1.0%) | 32.1 | -2.7, -2.8 | NOISE |
+| `full_datapath/dir24_8/topology`, ns | 98.3 (79.4 – 184.7) | 84.2 (77.8 – 96.1) | -14.0 (-14.3%) | 86.4 | -10.9, -12.1 | NOISE |
+
+**Delta:** none, as there should be. Every metric is noise, in both rounds.
+
+**What it says about the method:**
+
+- **Cycles are steady enough to use.** `full_datapath`'s noise band is 32.1 cycles per packet on
+  DIR-24-8 and 29.4 on the linear table.
+- **Wall time is not.** The bands on ns are up to 86.4 ns, more than a packet's whole median.
+- **So a change worth fewer cycles per packet than that band is unmeasurable here** with tier A as
+  it stands. Every entry below is judged against its own band, not this one.
+
+**Caveat:** the floor is this run's; another day's may differ.
+
+### Entry 1: where `full_datapath`'s cycles go (diagnosis, no change kept)
+
+The phase 14 baseline left 254 cycles per packet of `full_datapath` unexplained beyond parsing and
+the FIB lookup.
+
+**Method:** the same comparison, seven times. Each time the after side is commit `e09965c` with one
+step of `Forwarder::process()` removed from `include/npf/pipe/forward.hpp`, and the benchmark is
+`full_datapath/dir24_8/topology`. A removed step's saving is that step's cost. None of these
+changes is kept: each removes behaviour the router must have.
+
+| `full_datapath/dir24_8/topology`, cycles per packet | Before: median (min – p95) | After: median (min – p95) | Delta | Noise band | Rounds | Verdict |
+|---|---:|---:|---:|---:|---:|---|
+| without the packet filter, step 10 (`filter_denies`) | 282.2 (275.9 – 296.6) | 203.6 (198.2 – 211.4) | -78.6 (-27.8%) | 14.4 | -76.3, -79.4 | FASTER |
+| without the ARP lookup, step 12 | 277.2 (275.4 – 288.4) | 219.3 (217.9 – 222.6) | -57.9 (-20.9%) | 11.2 | -60.3, -56.4 | FASTER |
+| without the header checksum check, step 6 | 277.7 (276.0 – 285.2) | 243.1 (242.2 – 248.0) | -34.6 (-12.5%) | 7.5 | -35.0, -34.2 | FASTER |
+| without the rewrite, step 13 | 278.1 (275.6 – 285.8) | 258.0 (255.4 – 265.5) | -20.0 (-7.2%) | 7.7 | -19.6, -20.6 | FASTER |
+| without the martian source check, step 7 | 278.6 (274.8 – 285.1) | 267.7 (266.8 – 275.8) | -11.0 (-3.9%) | 8.1 | -12.7, -5.8 | FASTER |
+| without the local-destination check, step 8 | 277.8 (275.2 – 309.0) | 278.4 (266.0 – 309.0) | +0.6 (+0.2%) | 31.1 | +1.2, +1.3 | NOISE |
+| without the protocol counter, after step 6 | 275.9 (274.4 – 284.1) | 279.0 (277.1 – 287.6) | +3.0 (+1.1%) | 8.6 | +4.2, +2.1 | NOISE |
+
+**Result:**
+
+- Five steps cost a measurable amount, 202.1 cycles per packet together.
+- **The filter is the largest, with no rules in it at all**:
+  78.6 cycles to decide that the
+  default policy applies. `filter_denies()` parses the transport header again, and makes an
+  out-of-line call to `Filter::evaluate()`, which loops over no rules.
+- **Next is the ARP lookup**, 57.9 cycles: an
+  out-of-line call to `ArpCache::lookup()`, a linear search, and a write of the entry's last-used
+  time.
+- **Then the header checksum check**, 34.6
+  cycles, summing ten 16-bit words.
+- The local-destination check and the protocol counter are noise.
+- Entries 2 to 4 take the three largest, in that order.
+
+**Caveat:**
+
+- Removing a step can change what the compiler does with the steps around it, so the savings need
+  not add up to what the steps cost together. The five significant ones come to 202.1 of the
+  254.
+- One FIB, one table size and one traffic mix: frames to one neighbour, all forwarded.
+
 ## Phase 3: checksum microbenchmark (tier A)
 
 **What.** `bench/micro/bench_checksum.cpp` times the three checksum paths in

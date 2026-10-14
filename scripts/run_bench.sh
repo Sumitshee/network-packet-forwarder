@@ -41,18 +41,29 @@ TIER_A=0
 TIER_B=0
 KERNEL=0
 QUICK=0
-for arg in "$@"; do
-  case "$arg" in
+LABEL=""
+ONLY_CONFIGS=""
+BURST=""
+NPF_ARGS=""
+while (($#)); do
+  case "$1" in
     --tier-a) TIER_A=1 ;;
     --tier-b) TIER_B=1 ;;
     --kernel-baseline) KERNEL=1 ;;
     --all) TIER_A=1 TIER_B=1 KERNEL=1 ;;
     --quick) QUICK=1 ;;
+    # [phase 15] for one experiment's tier B runs: a name for the result, the npf configurations
+    # to run ("rtc:2,pipeline:4"), a burst size in place of router.conf's, extra npf run flags.
+    --label) LABEL=$2; shift ;;
+    --configs) ONLY_CONFIGS=$2; shift ;;
+    --burst) BURST=$2; shift ;;
+    --npf-args) NPF_ARGS=$2; shift ;;
     *)
       sed -n '2,10p' "${BASH_SOURCE[0]}" >&2
       exit 2
       ;;
   esac
+  shift
 done
 if ((TIER_A + TIER_B + KERNEL == 0)); then
   sed -n '2,10p' "${BASH_SOURCE[0]}" >&2
@@ -78,12 +89,19 @@ GEN_CPU=6
 SINK_CPU=7
 NPF_CPUS=0-5
 CONFIGS=("rtc 1" "rtc 2" "rtc 4" "pipeline 1" "pipeline 2" "pipeline 4")
+if [[ -n $ONLY_CONFIGS ]]; then
+  IFS=',' read -r -a picked <<< "$ONLY_CONFIGS"
+  CONFIGS=()
+  for c in "${picked[@]}"; do
+    CONFIGS+=("${c/:/ }")
+  done
+fi
 
 # Under sudo, git refuses a repository root does not own unless told it is safe.
 SHA=$(git -c safe.directory="$ROOT" -C "$ROOT" rev-parse --short HEAD)
 DATE=$(date -u +%F)
-RAW="$ROOT/bench/results/raw/$DATE-$SHA"
-OUT="$ROOT/bench/results/$DATE-$SHA.json"
+RAW="$ROOT/bench/results/raw/$DATE-$SHA${LABEL:+-$LABEL}"
+OUT="$ROOT/bench/results/$DATE-$SHA${LABEL:+-$LABEL}.json"
 NPF_PID=""
 SINK_PID=""
 
@@ -243,8 +261,9 @@ npf_config() { # npf_config <mode> <workers>
   mkdir -p "$dir"
   log="$dir/npf.log"
   log "tier B: npf, mode $1, $2 workers"
+  # shellcheck disable=SC2086
   ip netns exec ns-router taskset -c "$NPF_CPUS" "$NPF" run --config "$CONFIG" --mode "$1" \
-    --workers "$2" --pidfile "$dir/npf.pid" --stats-file "$dir/npf.stats" > "$log" 2>&1 &
+    --workers "$2" $NPF_ARGS --pidfile "$dir/npf.pid" --stats-file "$dir/npf.stats" > "$log" 2>&1 &
   NPF_PID=$!
   for _ in $(seq 100); do
     grep -qs 'forwarding on' "$log" && break
@@ -286,6 +305,12 @@ fi
 rm -rf "$RAW"
 mkdir -p "$RAW"
 log "raw results in $RAW"
+# The configuration npf runs, as it was: router.conf, with --burst's size in place of its own.
+sed "${BURST:+s/^burst .*/burst $BURST/}" "$ROOT/configs/router.conf" > "$RAW/router.conf"
+if [[ -n $BURST ]] && ! grep -q "^burst $BURST\$" "$RAW/router.conf"; then
+  die "configs/router.conf has no burst line to replace"
+fi
+CONFIG="$RAW/router.conf"
 ((TIER_A)) && tier_a
 if ((TIER_B + KERNEL)); then
   mkdir -p "$RAW/tier_b"
@@ -293,6 +318,7 @@ if ((TIER_B + KERNEL)); then
     "$FLOWS" "$FRAME" "$LATENCY_RATE" "$REPS" > "$RAW/tier_b/method.json"
   printf '"seconds_per_repetition": %d, "warmup_s": %d, ' "$SECONDS_PER_REP" "$WARMUP" \
     >> "$RAW/tier_b/method.json"
+  printf '"label": "%s", "npf_args": "%s", ' "$LABEL" "$NPF_ARGS" >> "$RAW/tier_b/method.json"
   printf '"cpus": {"gen": %d, "sink": %d, "npf": "%s"}}\n' "$GEN_CPU" "$SINK_CPU" "$NPF_CPUS" \
     >> "$RAW/tier_b/method.json"
 fi

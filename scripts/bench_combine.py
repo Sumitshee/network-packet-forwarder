@@ -76,8 +76,13 @@ def compile_command(build, source):
     return None
 
 
-def router_setting(name):
-    with open(os.path.join(ROOT, "configs", "router.conf"), encoding="utf-8") as f:
+def router_setting(name, raw):
+    # The configuration npf ran, as run_bench.sh copied it into the raw directory; before that copy
+    # existed, configs/router.conf.
+    path = os.path.join(raw, "router.conf")
+    if not os.path.exists(path):
+        path = os.path.join(ROOT, "configs", "router.conf")
+    with open(path, encoding="utf-8") as f:
         for line in f:
             words = line.split("#")[0].split()
             if len(words) == 2 and words[0] == name:
@@ -124,8 +129,8 @@ def context(args, tier_a):
         "cmake_build_type": cache.get("CMAKE_BUILD_TYPE"),
         "compile_command_npf": compile_command(args.build, "src/main.cpp"),
         "compile_command_bench_datapath": compile_command(args.build, "bench/micro/bench_datapath.cpp"),
-        "burst": router_setting("burst"),
-        "pool_size": router_setting("pool_size"),
+        "burst": router_setting("burst", args.raw),
+        "pool_size": router_setting("pool_size", args.raw),
         "perf_stat_cycles": {"succeeded": code == 0, "output": perf[-300:]},
         "perf_event_open_cycles": datapath.get("npf_perf_event_open_cycles"),
         "quick_rehearsal": args.quick,
