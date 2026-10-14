@@ -478,6 +478,37 @@ records it. The test stays: it holds either way.
 change significant. The rule was fixed before any change was measured, and is not changed after
 one.
 
+### Entry 3: the ARP lookup inline (NOISE: reverted)
+
+**Change:** `ArpCache::lookup()` and `find()` move from `src/table/arp_cache.cpp` into the header,
+so the hit path compiles into the pipeline instead of being a call into another translation unit.
+Nothing else changes.
+
+**Before:** commit `ed276a5`. **After:** that, plus the change.
+
+| Benchmark, metric | Before: median (min – p95) | After: median (min – p95) | Delta | Noise band | Rounds | Verdict |
+|---|---:|---:|---:|---:|---:|---|
+| `full_datapath/dir24_8/topology`, cycles | 288.7 (281.2 – 293.7) | 286.7 (281.8 – 291.8) | -2.1 (-0.7%) | 5.1 | -4.0, -3.0 | NOISE |
+| `full_datapath/linear/topology`, cycles | 297.8 (291.4 – 314.5) | 296.6 (288.6 – 301.0) | -1.2 (-0.4%) | 16.8 | -0.0, -2.7 | NOISE |
+| `full_datapath/dir24_8/topology`, ns | 121.1 (105.2 – 137.4) | 114.3 (107.2 – 126.1) | -6.8 (-5.6%) | 16.3 | -11.7, +3.8 | NOISE |
+| `full_datapath/linear/topology`, ns | 113.5 (104.4 – 139.8) | 111.5 (98.7 – 120.1) | -2.0 (-1.7%) | 26.3 | -0.7, -5.0 | NOISE |
+
+**Delta:** -2.1 cycles per packet on DIR-24-8 (rounds -4.0
+and -3.0), against a noise band of 5.1.
+
+**Verdict: noise. The change is reverted** in the next commit.
+
+**What it says:**
+
+- Entry 1 put the ARP step at 57.9 cycles. The call into another translation unit is almost
+  none of that: inlining it saved 2.1.
+- What the remaining cycles are was not found here. With one neighbour the search is a single
+  compare; what is left is the store of the entry's last-used time, and whatever removing the
+  whole step let the compiler do with the steps around it.
+
+**Caveat:** a cache with many neighbours spends more in the search, which this benchmark does not
+exercise.
+
 ## Phase 3: checksum microbenchmark (tier A)
 
 **What.** `bench/micro/bench_checksum.cpp` times the three checksum paths in

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstddef>
@@ -7,6 +8,7 @@
 #include <npf/core/packet.hpp>
 #include <npf/proto/mac.hpp>
 #include <optional>
+#include <span>
 #include <utility>
 #include <vector>
 
@@ -89,7 +91,20 @@ class ArpCache {
 
   // Hit refreshes the entry's timer. Miss does NOT create an entry -- the caller decides.
   // The timer is the idle one; a hit on a Stale entry also starts its revalidation.
-  [[nodiscard]] std::optional<proto::MacAddr> lookup(std::uint32_t ip) noexcept;
+  // Inline: it is on every forwarded packet's path (docs/performance.md, entry 3).
+  [[nodiscard]] std::optional<proto::MacAddr> lookup(std::uint32_t ip) noexcept {
+    Entry* e = find(ip);
+    if (e == nullptr || e->state == ArpState::Incomplete) {
+      return std::nullopt;
+    }
+    e->used = now_;
+    // Forward on the MAC the cache has, and ask in the background whether it still holds. tick()
+    // sends the rest of the revalidation's probes, so a stream of packets is not a stream of them.
+    if (e->state == ArpState::Stale && e->probes == 0) {
+      probe(*e);
+    }
+    return e->mac;
+  }
 
   // Creates an Incomplete entry if absent, sends a probe, and queues the packet.
   // Returns false if the queue is full; the caller must then release the packet and
@@ -151,8 +166,16 @@ class ArpCache {
     TimePoint used;      // when the router last needed the entry
   };
 
-  [[nodiscard]] Entry* find(std::uint32_t ip) noexcept;
-  [[nodiscard]] const Entry* find(std::uint32_t ip) const noexcept;
+  [[nodiscard]] Entry* find(std::uint32_t ip) noexcept {
+    const std::span<Entry> live(entries_.data(), size_);
+    const auto it = std::ranges::find(live, ip, &Entry::ip);
+    return it == live.end() ? nullptr : &*it;
+  }
+  [[nodiscard]] const Entry* find(std::uint32_t ip) const noexcept {
+    const std::span<const Entry> live(entries_.data(), size_);
+    const auto it = std::ranges::find(live, ip, &Entry::ip);
+    return it == live.end() ? nullptr : &*it;
+  }
   void probe(Entry& e) noexcept;
   void confirm(Entry& e, proto::MacAddr mac) noexcept;
   void give_up(Entry& e) noexcept;
