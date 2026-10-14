@@ -114,6 +114,17 @@ Every number quoted is a median over the repetitions, with p95 and the spread fr
 beside it, never a mean alone. A later change whose difference from the baseline lies inside the
 baseline's spread is noise: the change is reverted, and the negative result is written down here.
 
+[phase 15] Phase 15 compares changes by `scripts/ab_bench.sh`, whose before and after run
+interleaved within the same minutes, and decides tier A by cycles per packet rather than wall time
+(entries 0 to 14 below). Its entry 14 found that a run's own spread does not cover what a number
+does from one session to the next: a rerun of the whole benchmark the same day reproduced 29 of 44
+tier A numbers and 20 of 42 tier B ones inside the baseline's range. So, from phase 16 on:
+
+- a tier B number is reported as the range across at least two sessions, and called reproduced
+  only inside that range;
+- a comparison is still made within one session, interleaved, as phase 15's were;
+- `scripts/bench_reproduce.py` checks a rerun against a baseline, number by number.
+
 ### What these numbers do not measure
 
 - **A NIC.**

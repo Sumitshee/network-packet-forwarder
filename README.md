@@ -4,7 +4,7 @@ A userspace Layer-2/Layer-3 packet forwarding engine — a software router — w
 Linux. It receives raw Ethernet frames from network interfaces, parses them, makes forwarding
 decisions, rewrites headers and transmits them out of the correct interface.
 
-**Status: phase 14 of 19.** `npf` routes IPv4 between Linux interfaces. It runs every packet
+**Status: phase 15 of 19.** `npf` routes IPv4 between Linux interfaces. It runs every packet
 through a fixed fourteen-step pipeline: parse, validate, route,
 resolve the next hop, rewrite the MAC addresses, decrement the TTL and patch the checksum. Every
 packet it drops is counted under a reason. It resolves its neighbours with ARP itself: a packet
@@ -51,7 +51,10 @@ arrives -- datagrams per second, loss, one-way latency, CPU time -- for each thr
 worker count, and for the same topology forwarded by the Linux kernel instead, the control every npf
 number is read against. `scripts/run_bench.sh --all` runs both and writes one JSON with the context
 of the run; [`docs/performance.md`](docs/performance.md) gives the method, the baseline, and what
-the numbers do not measure.
+the numbers do not measure. Phase 15 measured twelve changes one at a time, each before and after
+on the same machine: most were noise and were reverted, and the document says so, entry by entry.
+Link-time optimisation measured faster and is on in the `release` preset. `--busy-poll` cuts
+latency at a low rate, at the price of a CPU per thread kept spinning, so it stays a switch.
 
 `npf replay` runs the same router over a pcap file instead of live interfaces, and writes what it
 sends to another: deterministically, and with no root. The golden-file tests use it in CI. Each
@@ -325,7 +328,7 @@ cmake --preset dev && cmake --build --preset dev -j && ctest --preset dev
 ```
 
 The binary is `build/dev/npf`. Other presets: `ci` (warnings as errors),
-`asan` (AddressSanitizer + UBSan), `tsan` (ThreadSanitizer), `release` (`-O2 -g`),
+`asan` (AddressSanitizer + UBSan), `tsan` (ThreadSanitizer), `release` (`-O2 -g`, LTO),
 `bench` (`-O2 -g -march=native`, benchmarks on). Select the compiler with `CXX`, e.g.
 `CXX=clang++-18 cmake --preset dev`. Tests that need root are skipped when `ctest` is not run as
 root.
