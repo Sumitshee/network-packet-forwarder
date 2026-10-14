@@ -31,27 +31,18 @@ namespace npf::proto {
 // exactly 0xFFFFFFFF. Far above any frame this project handles.
 inline constexpr std::size_t kMaxSummedBytes = 131'074;
 
-// 2. Production: 32-bit big-endian words into a 64-bit accumulator, then a 16-bit word for a
-//    remainder of two or three bytes, then the odd byte. Summing a 32-bit word adds its two
-//    16-bit halves at once: 2^16 = 1 (mod 2^16 - 1), so the high half counts as itself, and the
-//    folded result is the same as summing the halves apart (phase 15, docs/performance.md entry 4).
-//    A 64-bit accumulator cannot overflow below kMaxSummedBytes. Folding 64 bits to 32 twice, then
-//    32 to 16 twice, always lands within 16 bits.
+// 2. Production: a 32-bit accumulator over 16-bit words, folded twice at the end. After the first
+//    fold the value is at most 0x1FFFE, so a second fold always brings it within 16 bits.
 [[nodiscard]] constexpr std::uint16_t ones_complement_sum(core::CBytes data) noexcept {
   assert(data.size() <= kMaxSummedBytes);
-  std::uint64_t sum = 0;
+  std::uint32_t sum = 0;
   std::size_t i = 0;
-  for (; i + 3 < data.size(); i += 4) {
-    sum += core::rd_be32(data, i);
-  }
   for (; i + 1 < data.size(); i += 2) {
     sum += core::rd_be16(data, i);
   }
   if (i < data.size()) {
-    sum += std::uint64_t{core::rd_u8(data, i)} << 8U;
+    sum += std::uint32_t{core::rd_u8(data, i)} << 8U;
   }
-  sum = (sum & 0xFFFFFFFFU) + (sum >> 32U);
-  sum = (sum & 0xFFFFFFFFU) + (sum >> 32U);
   sum = (sum & 0xFFFFU) + (sum >> 16U);
   sum = (sum & 0xFFFFU) + (sum >> 16U);
   return static_cast<std::uint16_t>(sum);
