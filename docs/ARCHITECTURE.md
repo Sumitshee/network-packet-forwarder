@@ -38,6 +38,8 @@ enum class DropReason : std::uint8_t {
   NoOutPort,         // route named a port that does not exist or is down
   UnknownDestPort,   // L2 lookup miss on a port with no bridge domain
   SamePort,          // [phase 12] L2: the destination was learned on the port the frame came in on
+  RingFull,          // [phase 13] pipeline mode: the ring to the chosen worker was full, so the RX
+                     // thread dropped the packet before any worker saw it
   TxFull,            // transmit ring or socket buffer full
   PoolExhausted,     // no free packet buffer
   _Count
@@ -160,6 +162,10 @@ class PacketPool {
 
   [[nodiscard]] std::size_t capacity()  const noexcept;
   [[nodiscard]] std::size_t available() const noexcept;   // for leak assertions in tests
+
+  // [phase 13] Whether p is one of this pool's packets: how a pipeline worker tells which
+  // thread a packet it is done with goes home to.
+  [[nodiscard]] bool owns(const Packet* p) const noexcept;
 };
 
 }  // namespace npf::core
@@ -169,6 +175,12 @@ class PacketPool {
 packet: it is transmitted (and released by the backend after transmission completes), it is
 released explicitly on a drop, or it is handed to the ARP pending queue which becomes responsible
 for releasing it. Nothing else.
+
+[phase 13] In pipeline mode a received packet also travels: the RX thread that received it hands
+it to a worker through an `SpscRing`, and the worker, once the packet has been transmitted or
+dropped, hands it back through a second ring, for the RX thread to release. A pool is touched only
+by the thread that owns it, in either mode. The return ring holds as many packets as the pool, so
+handing one back never fails: pipeline mode refuses a `pool_size` above the return ring's size.
 
 ---
 
@@ -575,6 +587,14 @@ static_assert(alignof(Counters) == 64);
 Each worker owns one `Counters`. The stats reporter sums them on demand. Plain `uint64_t`, not
 `atomic` — a torn read of a statistic does not matter, and atomics on the hot path do.
 
+[phase 13] "On demand" means while every thread is parked between two bursts: the control thread
+asks, each thread stops at its next burst boundary and says so, the control thread reads (or, for
+the SIGUSR2 flush, changes) what the threads own, and lets them go. The handshake's
+release/acquire pairs order those reads after the threads' writes, so no thread ever reads memory
+another is writing — which is a data race, however harmless the torn value, and which TSan would
+rightly report. A thread pays one acquire load per burst for this. In pipeline mode the RX threads
+own a `Counters` each too, for the packets they drop (`RingFull`).
+
 ---
 
 ## 11. The pipeline  [phase 6, extended 7/11/12]
@@ -652,13 +672,19 @@ switches a frame whatever its EtherType, before step 2 could refuse it:
 
 | State | Owner | Sharing | Rule |
 |---|---|---|---|
-| `PacketPool` | one per worker | none | Never crosses threads in run-to-completion mode |
-| `Counters` | one per worker | none | `alignas(64)`; summed only when stats are read |
-| `Fib` | control thread | read-mostly, shared | Built at start-up. Live updates use a pointer swap, never a mutex in `lookup()` |
-| `ArpCache` | shared | sharded by `next_hop & (kShards-1)` | Writes are rare; reads are per-packet |
-| `MacTable` | shared | sharded by MAC hash | Learning writes on every frame — sharding matters more here |
+| `PacketPool` | one per worker, and one per RX thread in pipeline mode | none | Never crosses threads in run-to-completion mode. In pipeline mode its packets do, through rings, and come home the same way (§3) |
+| `Counters` | one per worker, and one per RX thread | none | `alignas(64)`; summed only while every thread is parked (§10) |
+| `Fib` | control thread | read-only, shared | Built at start-up, before any worker starts. Live updates, when they come, use a pointer swap, never a mutex in `lookup()` |
+| `Filter` | control thread | read-only, shared | Built at start-up |
+| `ArpCache` | one per worker | none; news passed on | [phase 13] Each worker resolves for itself, static entries copied into every cache. A reply or announcement one worker receives goes to every other as an `ArpNews` record through an `SpscRing` per ordered pair of workers, and each applies it as if it had received the frame. A full news ring loses the record; that worker's next probe asks again |
+| `MacTable` | one per worker | none | [phase 13] Bridged ports need `workers 1`: with per-worker tables and an asymmetric fanout hash, each worker would learn only half the stations |
+| `IcmpRateLimiter` | one per worker | none | The router's total error rate is N times one limiter's |
 | `SpscRing` | one producer, one consumer | lock-free | See §13 |
-| `IoBackend` sockets | one per worker in fanout mode | none | `PACKET_FANOUT_HASH` distributes in-kernel |
+| `IoBackend` sockets | one per worker in run-to-completion mode | none | Every worker's socket on a port joins that port's `PACKET_FANOUT_HASH` group, which distributes in-kernel |
+| `IoBackend` sockets, pipeline | one receiving socket per port, one RX thread each; every worker its own transmit-only sockets | none | The RX thread steers by `symmetric_hash_5tuple & (workers-1)`, so the worker count is a power of two |
+
+[phase 13] Not built: NUMA awareness (a laptop has one node), work stealing, dynamic worker
+scaling, CPU pinning.
 
 ---
 
@@ -675,6 +701,7 @@ class SpscRing {
   [[nodiscard]] bool pop(T& out) noexcept;                                // consumer thread only
   [[nodiscard]] std::size_t push_bulk(const T* v, std::size_t n) noexcept;
   [[nodiscard]] std::size_t pop_bulk(T* out, std::size_t n) noexcept;
+  [[nodiscard]] bool empty() const noexcept;  // consumer thread only: before it sleeps
  private:
   alignas(64) std::atomic<std::size_t> head_{0};   // written by producer
   alignas(64) std::atomic<std::size_t> tail_{0};   // written by consumer
