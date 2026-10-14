@@ -620,6 +620,44 @@ matter is a mix of drops and forwards. No branch-miss counter was read.
 **Caveat:** only GCC 13 was measured; another compiler may lay the code out differently with or
 without the hints.
 
+### Entry 8: the incremental checksum against a full recompute (SLOWER: the incremental update stays)
+
+`docs/BUILD_PLAN.md`'s candidate 2 is the RFC 1624 incremental checksum update. The router has
+used it since phase 6, so this entry runs the comparison the other way: what would a full
+recompute cost?
+
+**Change (an experiment):** `rewrite_for_forwarding()` writes the decremented TTL and then
+recomputes the whole header's checksum with `ipv4_header_checksum()`, instead of patching it with
+`checksum_update16()`. The golden tests passed, byte for byte, either way.
+
+**Before:** commit `99bb96c`, incremental. **After:** the full recompute.
+
+| Benchmark, metric | Before: median (min – p95) | After: median (min – p95) | Delta | Noise band | Rounds | Verdict |
+|---|---:|---:|---:|---:|---:|---|
+| `full_datapath/dir24_8/topology`, cycles | 286.6 (278.5 – 296.5) | 302.3 (291.5 – 306.7) | +15.7 (+5.5%) | 9.9 | +17.1, +13.4 | SLOWER |
+| `full_datapath/linear/topology`, cycles | 298.1 (293.4 – 308.1) | 308.6 (300.2 – 318.5) | +10.5 (+3.5%) | 10.0 | +6.7, +11.1 | SLOWER |
+
+**Delta:**
+
+- The full recompute costs +15.7 cycles per packet on DIR-24-8, against a noise band
+  of 9.9, with rounds +17.1 and
+  +13.4.
+- On the linear table it costs +10.5, against 10.0.
+
+**Verdict: slower, significant on both tables.** The incremental update is worth
+15.7 and 10.5 cycles a packet here, and stays. The experiment is reverted
+in the next commit.
+
+**What it says:**
+
+- A recompute sums the header's ten 16-bit words again, where the update needs three additions on
+  one word.
+- `docs/BUILD_PLAN.md` expected this to be "real but small", and it is:
+  5.5% of a packet's cycles on DIR-24-8.
+
+**Caveat:** a header with options is longer, so a recompute would cost more; this benchmark's
+headers have none.
+
 ## Phase 3: checksum microbenchmark (tier A)
 
 **What.** `bench/micro/bench_checksum.cpp` times the three checksum paths in

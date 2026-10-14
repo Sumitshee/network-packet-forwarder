@@ -206,10 +206,8 @@ inline void rewrite_for_forwarding(core::Packet& p, const proto::EthView& eth,
   proto::wr_mac(frame, 6, out.mac);
   const core::Bytes hdr = frame.subspan(eth.header_len(), ip.header_len());
   // The TTL shares a 16-bit word with the protocol, and words are what the checksum sums.
-  const std::uint16_t before = core::rd_be16(hdr, 8);
   core::wr_u8(hdr, 8, static_cast<std::uint8_t>(core::rd_u8(hdr, 8) - 1));
-  core::wr_be16(hdr, 10,
-                proto::checksum_update16(core::rd_be16(hdr, 10), before, core::rd_be16(hdr, 8)));
+  core::wr_be16(hdr, 10, proto::ipv4_header_checksum(hdr));  // entry 8: the full recompute
   p.set_offsets(static_cast<std::uint16_t>(eth.header_len()),
                 static_cast<std::uint16_t>(eth.header_len() + ip.header_len()));
 }
