@@ -1,0 +1,882 @@
+{
+ "baseline": {
+  "path": "bench/results/2026-10-14-8f4c957.json",
+  "git_sha": "8f4c957649a1c6cd7e9e66cd0acafef07c6c2733"
+ },
+ "rerun": {
+  "path": "bench/results/2026-10-14-8cb694a.json",
+  "git_sha": "8cb694a4ed1fcc65fd2ff44fa65ab0b20d6e9fd8"
+ },
+ "counts": {
+  "A": {
+   "inside": 29,
+   "of": 44
+  },
+  "B": {
+   "inside": 20,
+   "of": 42
+  }
+ },
+ "numbers": [
+  {
+   "tier": "A",
+   "what": "bench_checksum BM_ChecksumReference/20",
+   "metric": "ns",
+   "baseline": 17.21143337518482,
+   "min": 16.8099628178011,
+   "max": 18.584768096554786,
+   "rerun": 16.89972700780864,
+   "inside": true
+  },
+  {
+   "tier": "A",
+   "what": "bench_checksum BM_ChecksumReference/60",
+   "metric": "ns",
+   "baseline": 65.02388215394798,
+   "min": 57.97033561554997,
+   "max": 69.79034961631275,
+   "rerun": 64.79381109966197,
+   "inside": true
+  },
+  {
+   "tier": "A",
+   "what": "bench_checksum BM_ChecksumReference/1500",
+   "metric": "ns",
+   "baseline": 1558.5828659239485,
+   "min": 1261.4821109080026,
+   "max": 1799.533114610797,
+   "rerun": 1358.4045473872563,
+   "inside": true
+  },
+  {
+   "tier": "A",
+   "what": "bench_checksum BM_OnesComplementSum/20",
+   "metric": "ns",
+   "baseline": 11.98574548282185,
+   "min": 8.907867112400943,
+   "max": 13.59074365278563,
+   "rerun": 9.375141395719648,
+   "inside": true
+  },
+  {
+   "tier": "A",
+   "what": "bench_checksum BM_OnesComplementSum/60",
+   "metric": "ns",
+   "baseline": 28.632719319389714,
+   "min": 27.94749402718217,
+   "max": 34.51965532815404,
+   "rerun": 26.846581302085042,
+   "inside": false
+  },
+  {
+   "tier": "A",
+   "what": "bench_checksum BM_OnesComplementSum/1500",
+   "metric": "ns",
+   "baseline": 624.0557040000567,
+   "min": 533.887003000018,
+   "max": 665.7454059995871,
+   "rerun": 617.9936010128291,
+   "inside": true
+  },
+  {
+   "tier": "A",
+   "what": "bench_checksum BM_ChecksumUpdate16",
+   "metric": "ns",
+   "baseline": 2.231114327422802,
+   "min": 2.0803927844177643,
+   "max": 2.568783051708128,
+   "rerun": 2.2547343780196156,
+   "inside": true
+  },
+  {
+   "tier": "A",
+   "what": "bench_datapath parse_only",
+   "metric": "cycles",
+   "baseline": 25.589842896142848,
+   "min": 23.271904881338557,
+   "max": 27.34123031914191,
+   "rerun": 24.684500691064148,
+   "inside": true
+  },
+  {
+   "tier": "A",
+   "what": "bench_datapath parse_only",
+   "metric": "ns",
+   "baseline": 9.816836036412585,
+   "min": 8.849254898613646,
+   "max": 12.805011609533228,
+   "rerun": 7.8607042828225975,
+   "inside": false
+  },
+  {
+   "tier": "A",
+   "what": "bench_datapath parse_only/refilled",
+   "metric": "cycles",
+   "baseline": 24.729904844655294,
+   "min": 24.486663336126146,
+   "max": 26.021024755806877,
+   "rerun": 24.28976251697615,
+   "inside": false
+  },
+  {
+   "tier": "A",
+   "what": "bench_datapath parse_only/refilled",
+   "metric": "ns",
+   "baseline": 10.846923978984167,
+   "min": 9.863918219230246,
+   "max": 10.992433940992177,
+   "rerun": 9.58275122903073,
+   "inside": false
+  },
+  {
+   "tier": "A",
+   "what": "bench_datapath parse_and_lookup/linear/topology",
+   "metric": "cycles",
+   "baseline": 38.2330348639926,
+   "min": 37.636482355883984,
+   "max": 39.83307099025423,
+   "rerun": 37.71123110669045,
+   "inside": true
+  },
+  {
+   "tier": "A",
+   "what": "bench_datapath parse_and_lookup/linear/topology",
+   "metric": "ns",
+   "baseline": 16.510828795676446,
+   "min": 13.599021946484086,
+   "max": 17.621562117402693,
+   "rerun": 14.547077038209974,
+   "inside": true
+  },
+  {
+   "tier": "A",
+   "what": "bench_datapath full_datapath/linear/topology",
+   "metric": "cycles",
+   "baseline": 288.5651749232621,
+   "min": 285.8829950607077,
+   "max": 293.69967440114084,
+   "rerun": 287.3820782089094,
+   "inside": true
+  },
+  {
+   "tier": "A",
+   "what": "bench_datapath full_datapath/linear/topology",
+   "metric": "ns",
+   "baseline": 122.55956085355525,
+   "min": 109.0333977361259,
+   "max": 138.60757293883114,
+   "rerun": 119.46048762868402,
+   "inside": true
+  },
+  {
+   "tier": "A",
+   "what": "bench_datapath parse_and_lookup/binary_trie/topology",
+   "metric": "cycles",
+   "baseline": 247.98678861300547,
+   "min": 240.29152819133608,
+   "max": 249.26456317236577,
+   "rerun": 242.85552036129275,
+   "inside": true
+  },
+  {
+   "tier": "A",
+   "what": "bench_datapath parse_and_lookup/binary_trie/topology",
+   "metric": "ns",
+   "baseline": 99.90877992631228,
+   "min": 95.66728400253872,
+   "max": 127.54869458977568,
+   "rerun": 94.01563868883211,
+   "inside": false
+  },
+  {
+   "tier": "A",
+   "what": "bench_datapath full_datapath/binary_trie/topology",
+   "metric": "cycles",
+   "baseline": 480.03852916115574,
+   "min": 473.7378698058224,
+   "max": 484.9768274094153,
+   "rerun": 478.7391777513646,
+   "inside": true
+  },
+  {
+   "tier": "A",
+   "what": "bench_datapath full_datapath/binary_trie/topology",
+   "metric": "ns",
+   "baseline": 202.90319349307075,
+   "min": 194.0883952586542,
+   "max": 217.98996910163837,
+   "rerun": 183.95820360227506,
+   "inside": false
+  },
+  {
+   "tier": "A",
+   "what": "bench_datapath parse_and_lookup/binary_trie/100k",
+   "metric": "cycles",
+   "baseline": 457.914809375,
+   "min": 437.17015125,
+   "max": 461.802426875,
+   "rerun": 450.0420645286387,
+   "inside": true
+  },
+  {
+   "tier": "A",
+   "what": "bench_datapath parse_and_lookup/binary_trie/100k",
+   "metric": "ns",
+   "baseline": 169.56578718748003,
+   "min": 152.20602031263297,
+   "max": 198.21115937503464,
+   "rerun": 179.8560806726836,
+   "inside": true
+  },
+  {
+   "tier": "A",
+   "what": "bench_datapath full_datapath/binary_trie/100k",
+   "metric": "cycles",
+   "baseline": 812.6103382337604,
+   "min": 791.0052640755563,
+   "max": 927.4594451903899,
+   "rerun": 793.0422089446284,
+   "inside": true
+  },
+  {
+   "tier": "A",
+   "what": "bench_datapath full_datapath/binary_trie/100k",
+   "metric": "ns",
+   "baseline": 393.20224527174304,
+   "min": 304.5666641749243,
+   "max": 428.83283565711747,
+   "rerun": 307.32676359061963,
+   "inside": true
+  },
+  {
+   "tier": "A",
+   "what": "bench_datapath parse_and_lookup/patricia/topology",
+   "metric": "cycles",
+   "baseline": 45.47518259098934,
+   "min": 42.11845654612086,
+   "max": 47.46848881615929,
+   "rerun": 43.549378411707856,
+   "inside": true
+  },
+  {
+   "tier": "A",
+   "what": "bench_datapath parse_and_lookup/patricia/topology",
+   "metric": "ns",
+   "baseline": 18.960255368760546,
+   "min": 15.700838322161427,
+   "max": 23.048892554847452,
+   "rerun": 17.32358260025688,
+   "inside": true
+  },
+  {
+   "tier": "A",
+   "what": "bench_datapath full_datapath/patricia/topology",
+   "metric": "cycles",
+   "baseline": 302.9801399774869,
+   "min": 298.7508901025598,
+   "max": 317.3970703396426,
+   "rerun": 295.17615466419716,
+   "inside": false
+  },
+  {
+   "tier": "A",
+   "what": "bench_datapath full_datapath/patricia/topology",
+   "metric": "ns",
+   "baseline": 127.24808256287517,
+   "min": 105.78057842885333,
+   "max": 150.4336133625621,
+   "rerun": 105.52045578394596,
+   "inside": false
+  },
+  {
+   "tier": "A",
+   "what": "bench_datapath parse_and_lookup/patricia/100k",
+   "metric": "cycles",
+   "baseline": 631.6739806673338,
+   "min": 609.9869687002739,
+   "max": 655.9773433783363,
+   "rerun": 592.4142181506002,
+   "inside": false
+  },
+  {
+   "tier": "A",
+   "what": "bench_datapath parse_and_lookup/patricia/100k",
+   "metric": "ns",
+   "baseline": 299.6875143538715,
+   "min": 229.9801218849047,
+   "max": 331.7250364997629,
+   "rerun": 223.05582088147804,
+   "inside": false
+  },
+  {
+   "tier": "A",
+   "what": "bench_datapath full_datapath/patricia/100k",
+   "metric": "cycles",
+   "baseline": 1005.6854208158553,
+   "min": 987.8433958502238,
+   "max": 1031.612516082696,
+   "rerun": 998.639569622284,
+   "inside": true
+  },
+  {
+   "tier": "A",
+   "what": "bench_datapath full_datapath/patricia/100k",
+   "metric": "ns",
+   "baseline": 414.113081183744,
+   "min": 395.37751429266683,
+   "max": 493.2502500557725,
+   "rerun": 369.47220011511246,
+   "inside": false
+  },
+  {
+   "tier": "A",
+   "what": "bench_datapath parse_and_lookup/dir24_8/topology",
+   "metric": "cycles",
+   "baseline": 32.73370504742835,
+   "min": 32.37897607784526,
+   "max": 34.5926467863494,
+   "rerun": 31.772881262106996,
+   "inside": false
+  },
+  {
+   "tier": "A",
+   "what": "bench_datapath parse_and_lookup/dir24_8/topology",
+   "metric": "ns",
+   "baseline": 13.565930438409998,
+   "min": 12.303619088491331,
+   "max": 15.498557554243845,
+   "rerun": 12.866091068725774,
+   "inside": true
+  },
+  {
+   "tier": "A",
+   "what": "bench_datapath full_datapath/dir24_8/topology",
+   "metric": "cycles",
+   "baseline": 287.00019106750324,
+   "min": 278.6272162313967,
+   "max": 288.08477725775066,
+   "rerun": 278.4533640187937,
+   "inside": false
+  },
+  {
+   "tier": "A",
+   "what": "bench_datapath full_datapath/dir24_8/topology",
+   "metric": "ns",
+   "baseline": 116.20633454864638,
+   "min": 92.88948458813387,
+   "max": 121.54035374987245,
+   "rerun": 104.64977448981486,
+   "inside": true
+  },
+  {
+   "tier": "A",
+   "what": "bench_datapath parse_and_lookup/dir24_8/100k",
+   "metric": "cycles",
+   "baseline": 33.56538220673409,
+   "min": 33.14172603271208,
+   "max": 36.61004165513044,
+   "rerun": 33.334450456445765,
+   "inside": true
+  },
+  {
+   "tier": "A",
+   "what": "bench_datapath parse_and_lookup/dir24_8/100k",
+   "metric": "ns",
+   "baseline": 13.320998097080158,
+   "min": 11.495592663990498,
+   "max": 15.01615959565161,
+   "rerun": 12.774826980770527,
+   "inside": true
+  },
+  {
+   "tier": "A",
+   "what": "bench_datapath full_datapath/dir24_8/100k",
+   "metric": "cycles",
+   "baseline": 300.3451189899657,
+   "min": 295.6828305264254,
+   "max": 306.38697791964444,
+   "rerun": 308.4531134647901,
+   "inside": false
+  },
+  {
+   "tier": "A",
+   "what": "bench_datapath full_datapath/dir24_8/100k",
+   "metric": "ns",
+   "baseline": 120.96032842807965,
+   "min": 117.38815271608273,
+   "max": 130.8118461234282,
+   "rerun": 126.86567037316931,
+   "inside": true
+  },
+  {
+   "tier": "A",
+   "what": "bench_pool pool_acquire_release",
+   "metric": "ns",
+   "baseline": 4.9916677988621245,
+   "min": 4.458783969520005,
+   "max": 5.622247586764692,
+   "rerun": 4.566238843262332,
+   "inside": true
+  },
+  {
+   "tier": "A",
+   "what": "bench_pool pool_acquire_release/burst",
+   "metric": "ns",
+   "baseline": 3.444393384977301,
+   "min": 2.972236486639538,
+   "max": 4.108967572072549,
+   "rerun": 2.8284244531256144,
+   "inside": false
+  },
+  {
+   "tier": "A",
+   "what": "bench_ring ring_push_pop",
+   "metric": "ns",
+   "baseline": 2.3193912320032566,
+   "min": 2.0306611279596374,
+   "max": 2.9050035665192246,
+   "rerun": 2.0785199389821134,
+   "inside": true
+  },
+  {
+   "tier": "A",
+   "what": "bench_ring ring_round_trip/real_time/threads:2",
+   "metric": "ns",
+   "baseline": 155.72261246596344,
+   "min": 94.52166215516395,
+   "max": 227.2564654159698,
+   "rerun": 112.87490326178796,
+   "inside": true
+  },
+  {
+   "tier": "A",
+   "what": "bench_ring ring_throughput/real_time/threads:2",
+   "metric": "ns",
+   "baseline": 2.25883611931436,
+   "min": 1.9127628746445857,
+   "max": 2.492830795268193,
+   "rerun": 2.003866975104735,
+   "inside": true
+  },
+  {
+   "tier": "B",
+   "what": "kernel control, throughput",
+   "metric": "delivered, pps",
+   "baseline": 306596.38899896713,
+   "min": 283814.116002935,
+   "max": 335998.37797857984,
+   "rerun": 240124.78232791682,
+   "inside": false
+  },
+  {
+   "tier": "B",
+   "what": "kernel control, throughput",
+   "metric": "loss, %",
+   "baseline": 0.0,
+   "min": 0.0,
+   "max": 0.0,
+   "rerun": 0.0,
+   "inside": true
+  },
+  {
+   "tier": "B",
+   "what": "kernel control, throughput",
+   "metric": "p50 latency, ns",
+   "baseline": 5179.4,
+   "min": 4915.3,
+   "max": 5448.1,
+   "rerun": 6521.6,
+   "inside": false
+  },
+  {
+   "tier": "B",
+   "what": "kernel control, throughput",
+   "metric": "p99 latency, ns",
+   "baseline": 100242.6,
+   "min": 81339.2,
+   "max": 155679.2,
+   "rerun": 1588822.3,
+   "inside": false
+  },
+  {
+   "tier": "B",
+   "what": "kernel control, latency",
+   "metric": "p50 latency, ns",
+   "baseline": 28481.7,
+   "min": 27777.4,
+   "max": 29316.3,
+   "rerun": 28549.5,
+   "inside": true
+  },
+  {
+   "tier": "B",
+   "what": "kernel control, latency",
+   "metric": "p99 latency, ns",
+   "baseline": 431680.0,
+   "min": 185169.9,
+   "max": 593270.1,
+   "rerun": 244987.9,
+   "inside": true
+  },
+  {
+   "tier": "B",
+   "what": "npf pipeline, 1 workers, throughput",
+   "metric": "delivered, pps",
+   "baseline": 99889.08733564943,
+   "min": 91897.72012323917,
+   "max": 106056.7823091515,
+   "rerun": 74989.66334080824,
+   "inside": false
+  },
+  {
+   "tier": "B",
+   "what": "npf pipeline, 1 workers, throughput",
+   "metric": "loss, %",
+   "baseline": 62.180414695623085,
+   "min": 60.6442344224924,
+   "max": 65.82243222819878,
+   "rerun": 63.00301517443357,
+   "inside": true
+  },
+  {
+   "tier": "B",
+   "what": "npf pipeline, 1 workers, throughput",
+   "metric": "p50 latency, ns",
+   "baseline": 7950378.2,
+   "min": 6433208.5,
+   "max": 9064401.9,
+   "rerun": 11640469.3,
+   "inside": false
+  },
+  {
+   "tier": "B",
+   "what": "npf pipeline, 1 workers, throughput",
+   "metric": "p99 latency, ns",
+   "baseline": 31737461.5,
+   "min": 30341976.2,
+   "max": 33207352.4,
+   "rerun": 34433815.4,
+   "inside": false
+  },
+  {
+   "tier": "B",
+   "what": "npf pipeline, 1 workers, latency",
+   "metric": "p50 latency, ns",
+   "baseline": 115064.9,
+   "min": 103619.7,
+   "max": 118769.4,
+   "rerun": 113473.9,
+   "inside": true
+  },
+  {
+   "tier": "B",
+   "what": "npf pipeline, 1 workers, latency",
+   "metric": "p99 latency, ns",
+   "baseline": 771254.3,
+   "min": 394683.6,
+   "max": 1767102.8,
+   "rerun": 808633.9,
+   "inside": true
+  },
+  {
+   "tier": "B",
+   "what": "npf pipeline, 2 workers, throughput",
+   "metric": "delivered, pps",
+   "baseline": 203764.37829893467,
+   "min": 171994.54211541312,
+   "max": 211244.06608104904,
+   "rerun": 199381.94416741678,
+   "inside": true
+  },
+  {
+   "tier": "B",
+   "what": "npf pipeline, 2 workers, throughput",
+   "metric": "loss, %",
+   "baseline": 15.626157821443172,
+   "min": 11.383854990770041,
+   "max": 16.051623128426826,
+   "rerun": 17.906992440604753,
+   "inside": false
+  },
+  {
+   "tier": "B",
+   "what": "npf pipeline, 2 workers, throughput",
+   "metric": "p50 latency, ns",
+   "baseline": 3753917.3,
+   "min": 3197998.0,
+   "max": 3877536.1,
+   "rerun": 4534985.2,
+   "inside": false
+  },
+  {
+   "tier": "B",
+   "what": "npf pipeline, 2 workers, throughput",
+   "metric": "p99 latency, ns",
+   "baseline": 17271797.0,
+   "min": 16666525.3,
+   "max": 18528484.4,
+   "rerun": 18594043.2,
+   "inside": false
+  },
+  {
+   "tier": "B",
+   "what": "npf pipeline, 2 workers, latency",
+   "metric": "p50 latency, ns",
+   "baseline": 114067.8,
+   "min": 111343.0,
+   "max": 129168.7,
+   "rerun": 120755.2,
+   "inside": true
+  },
+  {
+   "tier": "B",
+   "what": "npf pipeline, 2 workers, latency",
+   "metric": "p99 latency, ns",
+   "baseline": 422152.7,
+   "min": 329057.5,
+   "max": 1417007.7,
+   "rerun": 244245.2,
+   "inside": false
+  },
+  {
+   "tier": "B",
+   "what": "npf pipeline, 4 workers, throughput",
+   "metric": "delivered, pps",
+   "baseline": 251626.04885174392,
+   "min": 225872.5489039489,
+   "max": 258206.99690816712,
+   "rerun": 245380.18385372893,
+   "inside": true
+  },
+  {
+   "tier": "B",
+   "what": "npf pipeline, 4 workers, throughput",
+   "metric": "loss, %",
+   "baseline": 0.06460214590097403,
+   "min": 0.015566142942109437,
+   "max": 0.7508944135177688,
+   "rerun": 0.03593012971698113,
+   "inside": true
+  },
+  {
+   "tier": "B",
+   "what": "npf pipeline, 4 workers, throughput",
+   "metric": "p50 latency, ns",
+   "baseline": 163623.5,
+   "min": 156974.1,
+   "max": 173680.9,
+   "rerun": 179535.4,
+   "inside": false
+  },
+  {
+   "tier": "B",
+   "what": "npf pipeline, 4 workers, throughput",
+   "metric": "p99 latency, ns",
+   "baseline": 2029373.7,
+   "min": 1851981.7,
+   "max": 15757940.7,
+   "rerun": 2289027.3,
+   "inside": true
+  },
+  {
+   "tier": "B",
+   "what": "npf pipeline, 4 workers, latency",
+   "metric": "p50 latency, ns",
+   "baseline": 116850.1,
+   "min": 113283.7,
+   "max": 138774.8,
+   "rerun": 2068863.3,
+   "inside": false
+  },
+  {
+   "tier": "B",
+   "what": "npf pipeline, 4 workers, latency",
+   "metric": "p99 latency, ns",
+   "baseline": 409643.3,
+   "min": 325132.2,
+   "max": 1932514.7,
+   "rerun": 53632816.9,
+   "inside": false
+  },
+  {
+   "tier": "B",
+   "what": "npf rtc, 1 workers, throughput",
+   "metric": "delivered, pps",
+   "baseline": 257527.1947553172,
+   "min": 224261.57808429885,
+   "max": 275500.6311312355,
+   "rerun": 254904.270456584,
+   "inside": true
+  },
+  {
+   "tier": "B",
+   "what": "npf rtc, 1 workers, throughput",
+   "metric": "loss, %",
+   "baseline": 37.55951797676739,
+   "min": 36.388427228907865,
+   "max": 39.20773358204447,
+   "rerun": 39.067779935882626,
+   "inside": true
+  },
+  {
+   "tier": "B",
+   "what": "npf rtc, 1 workers, throughput",
+   "metric": "p50 latency, ns",
+   "baseline": 1619966.8,
+   "min": 1559633.0,
+   "max": 1861746.7,
+   "rerun": 1844449.7,
+   "inside": true
+  },
+  {
+   "tier": "B",
+   "what": "npf rtc, 1 workers, throughput",
+   "metric": "p99 latency, ns",
+   "baseline": 3676925.9,
+   "min": 3662794.1,
+   "max": 4374293.5,
+   "rerun": 3596190.8,
+   "inside": false
+  },
+  {
+   "tier": "B",
+   "what": "npf rtc, 1 workers, latency",
+   "metric": "p50 latency, ns",
+   "baseline": 58211.8,
+   "min": 56712.5,
+   "max": 58902.1,
+   "rerun": 58657.4,
+   "inside": true
+  },
+  {
+   "tier": "B",
+   "what": "npf rtc, 1 workers, latency",
+   "metric": "p99 latency, ns",
+   "baseline": 409788.7,
+   "min": 277011.3,
+   "max": 688466.9,
+   "rerun": 211085.5,
+   "inside": false
+  },
+  {
+   "tier": "B",
+   "what": "npf rtc, 2 workers, throughput",
+   "metric": "delivered, pps",
+   "baseline": 292309.9705764892,
+   "min": 260190.73114204404,
+   "max": 309942.3683424546,
+   "rerun": 304372.2034751156,
+   "inside": true
+  },
+  {
+   "tier": "B",
+   "what": "npf rtc, 2 workers, throughput",
+   "metric": "loss, %",
+   "baseline": 2.6319558428547065,
+   "min": 2.3771399587014983,
+   "max": 3.350526071599617,
+   "rerun": 1.081823263311148,
+   "inside": false
+  },
+  {
+   "tier": "B",
+   "what": "npf rtc, 2 workers, throughput",
+   "metric": "p50 latency, ns",
+   "baseline": 84114.9,
+   "min": 82420.2,
+   "max": 85601.0,
+   "rerun": 59421.3,
+   "inside": false
+  },
+  {
+   "tier": "B",
+   "what": "npf rtc, 2 workers, throughput",
+   "metric": "p99 latency, ns",
+   "baseline": 2913072.4,
+   "min": 2711986.3,
+   "max": 3894615.2,
+   "rerun": 2830351.6,
+   "inside": true
+  },
+  {
+   "tier": "B",
+   "what": "npf rtc, 2 workers, latency",
+   "metric": "p50 latency, ns",
+   "baseline": 58490.8,
+   "min": 58193.2,
+   "max": 58834.2,
+   "rerun": 59938.4,
+   "inside": false
+  },
+  {
+   "tier": "B",
+   "what": "npf rtc, 2 workers, latency",
+   "metric": "p99 latency, ns",
+   "baseline": 311388.0,
+   "min": 233565.5,
+   "max": 389160.8,
+   "rerun": 196869.6,
+   "inside": false
+  },
+  {
+   "tier": "B",
+   "what": "npf rtc, 4 workers, throughput",
+   "metric": "delivered, pps",
+   "baseline": 82908.62687483209,
+   "min": 79887.49837926304,
+   "max": 84360.34830877084,
+   "rerun": 80536.41106460246,
+   "inside": true
+  },
+  {
+   "tier": "B",
+   "what": "npf rtc, 4 workers, throughput",
+   "metric": "loss, %",
+   "baseline": 0.16727377300613497,
+   "min": 0.0,
+   "max": 1.5198441411138923,
+   "rerun": 0.0,
+   "inside": true
+  },
+  {
+   "tier": "B",
+   "what": "npf rtc, 4 workers, throughput",
+   "metric": "p50 latency, ns",
+   "baseline": 54611.8,
+   "min": 50360.9,
+   "max": 64176.6,
+   "rerun": 53807.0,
+   "inside": true
+  },
+  {
+   "tier": "B",
+   "what": "npf rtc, 4 workers, throughput",
+   "metric": "p99 latency, ns",
+   "baseline": 5258522.5,
+   "min": 824252.7,
+   "max": 8743127.9,
+   "rerun": 500210.5,
+   "inside": false
+  },
+  {
+   "tier": "B",
+   "what": "npf rtc, 4 workers, latency",
+   "metric": "p50 latency, ns",
+   "baseline": 62728.2,
+   "min": 61675.7,
+   "max": 65467.4,
+   "rerun": 70365.4,
+   "inside": false
+  },
+  {
+   "tier": "B",
+   "what": "npf rtc, 4 workers, latency",
+   "metric": "p99 latency, ns",
+   "baseline": 306724.8,
+   "min": 224619.2,
+   "max": 8692952.4,
+   "rerun": 162552.0,
+   "inside": false
+  }
+ ]
+}

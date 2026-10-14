@@ -557,6 +557,61 @@ buffer, which CI's `-Werror` would have refused.
 **Caveat:** the 1500-byte result is `bench_checksum`'s, a loop over one buffer that stays in the
 L1 cache.
 
+### Entry 5: the burst size, from 1 to 64 (no knee in process; 32 kept)
+
+`docs/BUILD_PLAN.md`'s candidate 1: sweep the batch size and pick from the curve. 128 is not
+swept: ARCHITECTURE.md fixes `kMaxBurst` at 64, and the configuration parser refuses more.
+
+**Tier A.** `full_datapath/dir24_8/topology/burst:<n>`, one run of 7 repetitions at commit
+`ffd3591` (`bench/results/2026-10-14-ffd3591-burst-sweep-tier-a.json`):
+
+| Burst | Cycles per packet, median (min – max) | ns per packet, median |
+|---:|---:|---:|
+| 1 | 301.6 (295.6 – 304.6) | 118.3 |
+| 2 | 291.1 (287.1 – 297.1) | 128.7 |
+| 4 | 292.6 (286.0 – 309.2) | 125.4 |
+| 8 | 290.0 (287.2 – 294.3) | 123.2 |
+| 16 | 285.6 (281.1 – 293.6) | 124.2 |
+| 32 | 306.5 (285.7 – 310.4) | 130.4 |
+| 64 | 291.7 (286.6 – 294.9) | 133.1 |
+
+The medians run from 285.6 to 306.5 cycles, with no trend. In process, a burst
+has no fixed cost to spread: `process_burst()` is a loop over `process()`.
+
+**Tier B.** npf with 1 run-to-completion worker and `router.conf`'s burst replaced by each size,
+each a 2 s warm-up and 5 repetitions of 10 s, 16 flows of 70-byte frames, gen on CPU 6, sink on CPU 7, npf on CPUs 0-5, all in one session on 2026-10-14 from 18:16 UTC, at commit `8cb694a` (`bench/results/2026-10-14-8cb694a-burst-<n>.json`):
+
+| Burst | Offered, kpps | Delivered, kpps (min – max) | Loss, % (min – max) | p50 at 20,000/s, µs (min – max) | npf CPU, % |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 402.1 | 218.1 (153.1 – 226.2) | 45.7 (43.7 – 46.3) | 58.9 (57.4 – 59.8) | 100 |
+| 2 | 398.2 | 194.0 (191.8 – 219.1) | 50.4 (49.5 – 51.3) | 57.7 (57.1 – 57.9) | 100 |
+| 4 | 412.5 | 196.4 (194.0 – 208.2) | 52.5 (51.7 – 55.1) | 57.9 (57.2 – 59.0) | 99 |
+| 8 | 371.9 | 176.8 (165.0 – 204.3) | 52.8 (51.8 – 54.2) | 58.1 (57.2 – 61.4) | 100 |
+| 16 | 423.9 | 236.3 (223.0 – 237.9) | 46.4 (44.3 – 47.2) | 58.1 (57.8 – 58.3) | 100 |
+| 32 | 440.4 | 264.6 (259.9 – 272.9) | 38.7 (37.9 – 39.9) | 58.1 (56.9 – 58.1) | 100 |
+| 64 | 428.0 | 279.7 (268.8 – 294.5) | 34.6 (33.1 – 35.2) | 57.5 (57.4 – 57.8) | 99 |
+
+**What it shows:**
+
+- The throughput curve is not a knee. Delivered datagrams fall from burst 1 to bursts 2-8 and
+  then rise to 32 and 64; loss mirrors it.
+- At 20,000 datagrams a second the burst size makes no difference to latency.
+- npf's one worker is at a full CPU at every size: the burst decides how much each wake-up
+  receives, but every frame still costs a `recvfrom()` and a `sendto()` of its own on this
+  backend, so there is little fixed cost per burst for a larger one to spread.
+
+**Verdict: 32, the default, is kept.**
+
+- 64 delivered the most: 279.7 kpps against 32's 264.6, a
+  difference of +15.1 kpps against a band of 14.8. By the rule that is
+  outside the noise, by 0.3 kpps.
+- It is one run per point, and the curve's dip at 2 to 8 suggests that the sizes' differences move
+  by more than any one point's spread from run to run -- entry 14 shows that too. Changing a default on that margin would be
+  choosing on noise in all but name.
+- The sweep should be run again with the PACKET_MMAP backend of phase 16, whose batches are real.
+
+**Caveat:** one worker, one mode; the rest of the matrix was not swept.
+
 ### Entry 6: prefetch the next packet's headers (NOISE: reverted)
 
 **Change:** `Forwarder::process_burst()` issues `__builtin_prefetch` for the first cache line of
@@ -811,8 +866,179 @@ summary, not a fifth comparison.
 
 - GCC 13 only: the bench preset's compiler. Clang 18's `-flto=thin` was checked for correctness,
   not measured.
-- The tier B half of this entry, the same builds through the namespaces, follows from the phase 15
-  tier B session.
+
+**Tier B.** npf with 1 run-to-completion worker, built each way, with gen and sink always the bench
+preset's, each a 2 s warm-up and 5 repetitions of 10 s, 16 flows of 70-byte frames, gen on CPU 6, sink on CPU 7, npf on CPUs 0-5, all in one session on 2026-10-14 from 18:16 UTC, at commit `8cb694a` (`bench/results/2026-10-14-8cb694a-flags-<build>.json`; the default build's is
+`burst-32`):
+
+| npf built with | Offered, kpps | Delivered, kpps (min – max) | p50 at 20,000/s, µs (min – max) | npf CPU, % |
+|---|---:|---:|---:|---:|
+| bench preset: `-march=native`, no LTO | 440.4 | 264.6 (259.9 – 272.9) | 58.1 (56.9 – 58.1) | 100 |
+| no native, no LTO | 438.6 | 266.7 (260.0 – 275.1) | 57.5 (57.4 – 58.2) | 100 |
+| `-march=native` and LTO | 422.5 | 262.3 (259.0 – 267.9) | 58.2 (57.6 – 58.5) | 100 |
+| LTO, no native | 370.5 | 228.5 (226.0 – 261.4) | 58.9 (58.3 – 61.9) | 100 |
+
+- Every build gives the same latency within its spread: the three variants against the default
+  are noise, noise, noise by the rule.
+- The throughputs are within each other's ranges, except that gen offered less to the last build
+  (as entry 14 shows, the offered rate moves from run to run).
+- The worker uses a full CPU in every build. Through the namespaces the cost per packet is the
+  system calls' and the kernel's, which no compiler flag reaches: LTO's 18% of tier A is invisible
+  at tier B, as `docs/performance.md`'s methodology warns that tier A numbers are not tier B ones.
+
+### Entry 12: busy-polling against `poll()` (LOWER latency, at a full CPU per thread; stays opt-in)
+
+`docs/BUILD_PLAN.md`'s candidate 11. `npf run --busy-poll` has existed since phase 6: a thread with
+nothing to do goes round again at once, instead of sleeping in `poll()` until a socket is readable.
+The candidate's "when a load threshold is exceeded" is in effect already: a thread polls only after a
+burst that found nothing, so under load neither mode sleeps.
+
+**Before:** `poll()`, the default. **After:** `--busy-poll`. Each a 2 s warm-up and 5 repetitions of 10 s, 16 flows of 70-byte frames, gen on CPU 6, sink on CPU 7, npf on CPUs 0-5, all in one session on 2026-10-14 from 18:16 UTC, at commit `8cb694a`. rtc's `poll()` run is
+the burst sweep's at 32, the default (`burst-32`); the others are `busy-poll` and `poll`.
+
+| Configuration, scenario | Metric | `poll()` | `--busy-poll` | Delta | Band | Verdict |
+|---|---|---:|---:|---:|---:|---|
+| rtc, 1 worker, latency | p50 latency, µs | 58.1 | 33.1 | -25.0 | 0.3 | LOWER |
+| rtc, 1 worker, latency | p99 latency, µs | 321.6 | 206.4 | -115.2 | 310.9 | NOISE |
+| rtc, 1 worker, latency | npf CPU, % | 47.6 | 100.1 | +52.4 | 0.6 | HIGHER |
+| rtc, 1 worker, throughput | p50 latency, µs | 1709.2 | 1720.0 | +10.9 | 81.6 | NOISE |
+| rtc, 1 worker, throughput | p99 latency, µs | 3432.9 | 3364.1 | -68.8 | 241.1 | NOISE |
+| rtc, 1 worker, throughput | delivered, kpps | 264.6 | 255.5 | -9.2 | 13.1 | NOISE |
+| rtc, 1 worker, throughput | loss, % | 38.7 | 37.5 | -1.1 | 1.2 | NOISE |
+| rtc, 1 worker, throughput | npf CPU, % | 99.6 | 99.9 | +0.3 | 0.1 | HIGHER |
+| pipeline, 2 workers, latency | p50 latency, µs | 111.3 | 48.8 | -62.4 | 3.6 | LOWER |
+| pipeline, 2 workers, latency | p99 latency, µs | 317.0 | 943.8 | +626.8 | 1255.8 | NOISE |
+| pipeline, 2 workers, latency | npf CPU, % | 138.7 | 400.2 | +261.5 | 1.3 | HIGHER |
+| pipeline, 2 workers, throughput | p50 latency, µs | 4062.3 | 47.3 | -4015.0 | 1232.1 | LOWER |
+| pipeline, 2 workers, throughput | p99 latency, µs | 17465.5 | 6730.8 | -10734.6 | 1890.3 | LOWER |
+| pipeline, 2 workers, throughput | delivered, kpps | 208.6 | 259.4 | +50.9 | 17.8 | HIGHER |
+| pipeline, 2 workers, throughput | loss, % | 15.7 | 1.5 | -14.2 | 1.1 | LOWER |
+| pipeline, 2 workers, throughput | npf CPU, % | 307.8 | 400.3 | +92.5 | 1.8 | HIGHER |
+
+**Delta:**
+
+- At 20,000 datagrams a second, busy-polling cuts the median latency from 58.1 to
+  33.1 µs with 1 run-to-completion worker, and from 111.3 to 48.8 µs
+  in pipeline mode with 2 workers.
+- It costs CPU: npf goes from 48% to 100% of a CPU, and in pipeline mode
+  from 139% to 400%, every thread spinning whether or not there is traffic.
+- Under full load in pipeline mode, loss falls from 15.7% to 1.5%.
+
+**Verdict: the latency gain is real and large, and so is its price.** The default stays `poll()`:
+a router that burns a CPU per thread when idle is the wrong default for this one, which shares a
+laptop. `--busy-poll` stays the switch for whoever wants the latency; the README says so.
+
+**What it says:** the wake-up is most of npf's latency at a low rate. A thread asleep in `poll()`
+costs the kernel a wake-up and the scheduler a context switch before the first packet is read; in
+pipeline mode there are two (the RX thread's, then the worker's doorbell).
+
+**Caveat:** the `poll` run for pipeline mode started at a load average of 4.55, straight after the
+busy-poll run, whose spinning threads the average still remembered; the load gate checks only at
+the session's start. A threshold-adaptive mode -- spin for a while after traffic, then sleep -- was
+not built, and is a candidate.
+
+### Entry 13: `Counters` without `alignas(64)`, the false-sharing experiment (NOISE: `alignas` stays)
+
+`docs/BUILD_PLAN.md`'s candidate 3 expects this to be "often large". ARCHITECTURE.md §10 has
+required `alignas(64)` on `Counters` since phase 6, so the experiment takes it away: a build of
+`8cb694a` with `struct Counters` unaligned and its `static_assert` removed (`build/p15/noalign`,
+made by the session's prep script; no commit has the change).
+
+**Before:** `alignas(64)`. **After:** without. npf in run-to-completion mode with 4 and 8 workers,
+each a 2 s warm-up and 5 repetitions of 10 s, 16 flows of 70-byte frames, gen on CPU 6, sink on CPU 7, npf on CPUs 0-5, all in one session on 2026-10-14 from 18:16 UTC, at commit `8cb694a` (`bench/results/2026-10-14-8cb694a-{align,noalign}.json`):
+
+| Workers, scenario | Metric | `alignas(64)` | without | Delta | Band | Verdict |
+|---|---|---:|---:|---:|---:|---|
+| 4, latency | p50 latency, µs | 62.2 | 62.3 | +0.2 | 3.4 | NOISE |
+| 4, latency | p99 latency, µs | 395.0 | 272.4 | -122.7 | 14931.1 | NOISE |
+| 4, latency | npf CPU, % | 55.2 | 54.6 | -0.5 | 10.6 | NOISE |
+| 4, throughput | offered, kpps | 73.5 | 85.5 | +12.0 | 17.6 | NOISE |
+| 4, throughput | delivered, kpps | 73.3 | 85.5 | +12.2 | 17.8 | NOISE |
+| 8, latency | p50 latency, µs | 64.1 | 63.8 | -0.3 | 0.4 | NOISE |
+| 8, latency | p99 latency, µs | 364.1 | 219.2 | -144.9 | 481.9 | NOISE |
+| 8, latency | npf CPU, % | 60.3 | 59.6 | -0.7 | 2.6 | NOISE |
+| 8, throughput | offered, kpps | 61.0 | 60.0 | -1.1 | 3.2 | NOISE |
+| 8, throughput | delivered, kpps | 60.4 | 60.0 | -0.4 | 3.2 | NOISE |
+
+**Delta:** every latency and CPU figure is noise;
+the throughput rows are gen's limit, not npf's -- delivered equals offered, which differs from run to run
+(entry 14).
+
+**Verdict: noise. `alignas(64)` stays**, as §10 requires: removing it bought nothing, and it is what
+guarantees the separation below whatever the layout around it.
+
+**What it says -- why the "great story" did not happen here:**
+
+- False sharing needs two threads' hot counters in one cache line.
+- Each worker's `Counters` is a member of its own `Worker`, and each `Worker` is a separate heap
+  allocation of several kilobytes: the queues, the ARP cache and the tables around the counters
+  keep any two workers' counters far apart, aligned or not.
+- To show false sharing would take putting the workers' counters side by side, in one array -- a
+  layout this code never had. That is the candidate, as a tier A microbenchmark, if the story is
+  wanted.
+
+**Caveat:** with 8 workers on the 6 CPUs npf was allowed, some threads shared CPUs.
+
+### Entry 14: reproducibility -- the whole benchmark again (NOT MET at the within-run spread)
+
+`docs/BUILD_PLAN.md`'s exit test asks that `run_bench.sh` at the tagged commit "produces it again
+within the reported spread". Every datapath change of this phase was reverted, so the code the
+router runs is the code of the phase 14 baseline; the only change kept, LTO, is in the release
+preset, which `run_bench.sh` does not build.
+
+**Method:** `sudo ./scripts/run_bench.sh --all` at commit `8cb694a`, at the end of the phase 15 tier
+B session (`bench/results/2026-10-14-8cb694a.json`), against the phase 14 baseline taken the same
+day eight hours earlier (`bench/results/2026-10-14-8f4c957.json`). `scripts/bench_reproduce.py`
+asks, for every number the baseline reports, whether the rerun's median lies inside the baseline's
+own range, min to max (`bench/results/2026-10-14-8cb694a-reproduce.json`). `bench_lpm` is left
+out: phase 10 reports it.
+
+| Tier | Metric | Inside the baseline's range |
+|---|---|---:|
+| A | cycles | 10 of 16 |
+| A | ns | 19 of 28 |
+| B | delivered, pps | 5 of 7 |
+| B | loss, % | 5 of 7 |
+| B | p50 latency, ns | 6 of 14 |
+| B | p99 latency, ns | 4 of 14 |
+
+**Result: 29 of 44 tier A numbers and 20 of 42 tier B numbers reproduce. The exit
+criterion is not met.**
+
+- **The misses are mostly small and both ways.** `full_datapath/dir24_8/topology` was
+  287.0 cycles per packet in the baseline, with a range of 278.6 to
+  288.1; the rerun's median is 278.5, just below it.
+- **Tier B moves more.** The kernel control delivered 240.1 kpps against the
+  baseline's 306.6 (283.8 to 336.0):
+  gen offered less, and the control delivers what it is offered.
+- **One configuration broke down.** npf in pipeline mode with 4 workers, at 20,000 datagrams a
+  second, had a median p50 latency of 2068.9 µs against the baseline's
+  116.9, and lost 0.8% where the baseline lost nothing. Why was not found:
+  it is one run, and it ran last, after an hour of the session.
+
+**What it says -- about the method, which is the finding:**
+
+- The spread a run reports is the spread of its repetitions, taken back to back within minutes.
+  It measures how steady the machine is within a run. It does not measure how steady it is from
+  one run to the next.
+- On this laptop -- a Hyper-V guest whose clock follows turbo and the power plan, with Windows
+  beside it -- the second is wider than the first. A number "reproduces within the reported
+  spread" only if the reported spread includes the run-to-run variation, and so far it has not.
+- That also bears on every verdict of this phase: each comparison's before and after ran
+  interleaved, within the same minutes, which is what made them comparable. The verdicts stand on
+  that; the absolute numbers move from session to session.
+
+**What should change, for the phases after this one:**
+
+- report each tier B number as the range across at least two sessions;
+- start every repetition, not only the run, behind the load gate;
+- read the kernel's own counters (PACKET_STATISTICS) so that a run like pipeline-4's can be told
+  apart from a disturbed machine.
+
+These are in the Candidates.
+
+**Caveat:** two sessions are the least that can show this. They cannot say how wide the run-to-run
+spread really is.
 
 ## Phase 3: checksum microbenchmark (tier A)
 
@@ -1179,6 +1405,21 @@ trie and 21.1 for DIR-24-8.
 
 Ideas noted for later phases, not done.
 
+- **Run-to-run ranges for tier B** (phase 15, entry 14). Report each tier B number as the range
+  across at least two sessions, and put each repetition, not only each run, behind the load gate.
+  Within one session's repetitions, the spread understates how much a number moves from one
+  session to the next.
+- **An adaptive busy-poll** (phase 15, entry 12): spin for a while after traffic, then sleep in
+  `poll()`. It would aim at busy-polling's latency without its idle CPU, and should be measured
+  against both.
+- **The false-sharing story, where it can happen** (phase 15, entry 13): a tier A microbenchmark of
+  threads incrementing counters side by side in one array, with and without padding. npf's own
+  layout keeps workers' counters apart either way.
+- **The burst sweep again on PACKET_MMAP** (phase 16; phase 15, entry 5), where a burst is a real
+  batch rather than a loop of system calls.
+- **The 32-bit checksum sum, if the router ever sums a whole packet** (phase 15, entry 4): it was
+  26% faster at 1500 bytes, and noise at a header's 20.
+- **Why `-march=native` slows `parse_only`, and makes LTO's effect unstable** (phase 15, entry 11).
 - **Where `full_datapath`'s time goes** (phase 15). In the phase 14 baseline, the steps of
   `process()` beyond parsing and the FIB lookup cost 254 cycles per packet with DIR-24-8. Timing
   each step on its own -- or counting cycles around it -- would say which of them to look at
