@@ -14,6 +14,8 @@
 //   parse_and_lookup/<fib>/<size>  the same, plus a FIB lookup of the destination
 //   full_datapath/<fib>/<size>     the real Forwarder::process_burst: all fourteen steps,
 //                                  rewrite and incremental checksum included
+//   full_datapath/dir24_8/topology/burst:<n>
+//                                  [phase 15] the same with bursts of 1 to 64; `packets` says n
 //
 // <fib> is linear, binary_trie, patricia or dir24_8. <size> is `topology`, the three routes of
 // configs/router.conf, or `100k`, those plus the 100,000-route sample of the RouteViews table,
@@ -240,7 +242,10 @@ class Frames {
     }
   }
 
-  [[nodiscard]] Packet** burst(std::size_t i) { return &packets_[(i * kBurst) % kFrames]; }
+  // The i-th burst of n frames: n divides kFrames, so bursts never straddle the end.
+  [[nodiscard]] Packet** burst(std::size_t i, std::size_t n = kBurst) {
+    return &packets_[(i * n) % kFrames];
+  }
 
  private:
   npf::core::PacketPool pool_;
@@ -248,19 +253,19 @@ class Frames {
   std::vector<Packet*> packets_;
 };
 
-// The loop all three share: one burst per iteration and the counters, and with `refill`, the
-// frames restored after every lap, with the timer and the cycle counter stopped.
+// The loop all three share: one burst of `n` per iteration and the counters, and with `refill`,
+// the frames restored after every lap, with the timer and the cycle counter stopped.
 template <class Body>
-void run(benchmark::State& state, Frames& frames, bool refill, Body body) {
+void run(benchmark::State& state, Frames& frames, bool refill, Body body, std::size_t n = kBurst) {
   const CycleCounter cycles;
-  constexpr std::size_t kBurstsPerLap = kFrames / kBurst;
+  const std::size_t bursts_per_lap = kFrames / n;
   std::size_t i = 0;
   std::size_t packets = 0;
   cycles.start();
   for ([[maybe_unused]] auto _ : state) {
-    body(frames.burst(i));
-    packets += kBurst;
-    if (++i == kBurstsPerLap) {
+    body(frames.burst(i, n));
+    packets += n;
+    if (++i == bursts_per_lap) {
       i = 0;
       if (refill) {
         state.PauseTiming();
@@ -272,7 +277,7 @@ void run(benchmark::State& state, Frames& frames, bool refill, Body body) {
     }
   }
   cycles.pause();
-  state.counters["packets"] = static_cast<double>(kBurst);
+  state.counters["packets"] = static_cast<double>(n);
   state.SetItemsProcessed(static_cast<std::int64_t>(packets));
   if (cycles.available() && packets != 0) {
     state.counters["cycles_per_packet"] =
@@ -344,8 +349,9 @@ npf::core::Config router_config() {
   return c;
 }
 
+// n: the burst size, from 1 to kMaxBurst, a divisor of kFrames.
 template <class Fib>
-void full_datapath(benchmark::State& state, const Workload& w) {
+void full_datapath(benchmark::State& state, const Workload& w, std::size_t n = kBurst) {
   const npf::core::Config cfg = router_config();
   const std::unique_ptr<Fib> fib = built<Fib>(w.routes);
   NoEvents events;
@@ -359,14 +365,14 @@ void full_datapath(benchmark::State& state, const Workload& w) {
 
   // Every frame of a lap must be forwarded, before timing and after, or this would be timing some
   // other path.
-  std::array<npf::Decision, kBurst> decisions{};
+  std::array<npf::Decision, npf::core::kMaxBurst> decisions{};
+  const std::span<const npf::Decision> decided(decisions.data(), n);
   const auto every_frame_forwarded = [&] {
     frames.refill();
-    for (std::size_t b = 0; b < kFrames / kBurst; ++b) {
-      forwarder.process_burst(frames.burst(b), kBurst, decisions.data());
-      if (!std::ranges::all_of(decisions, [](const npf::Decision& d) {
-            return d.verdict == npf::Verdict::Forward;
-          })) {
+    for (std::size_t b = 0; b < kFrames / n; ++b) {
+      forwarder.process_burst(frames.burst(b, n), n, decisions.data());
+      if (!std::ranges::all_of(
+              decided, [](const npf::Decision& d) { return d.verdict == npf::Verdict::Forward; })) {
         return false;
       }
     }
@@ -377,10 +383,13 @@ void full_datapath(benchmark::State& state, const Workload& w) {
     state.SkipWithError("a frame was not forwarded");
     return;
   }
-  run(state, frames, true, [&forwarder, &decisions](Packet** burst) {
-    forwarder.process_burst(burst, kBurst, decisions.data());
-    benchmark::DoNotOptimize(decisions);
-  });
+  run(
+      state, frames, true,
+      [&forwarder, &decisions, n](Packet** burst) {
+        forwarder.process_burst(burst, n, decisions.data());
+        benchmark::DoNotOptimize(decisions);
+      },
+      n);
   if (stats.total_drops() != 0 || !every_frame_forwarded()) {
     state.SkipWithError("a frame was dropped while timed, or not forwarded after");
   }
@@ -433,6 +442,14 @@ int main(int argc, char** argv) {
   register_fib<npf::table::BinaryTrie>("binary_trie", workloads);
   register_fib<npf::table::PatriciaLpm>("patricia", workloads);
   register_fib<npf::table::Dir24_8Lpm>("dir24_8", workloads);
+  // [phase 15] The burst size swept, docs/performance.md entry 5: one benchmark per size.
+  for (const std::size_t n : {1UL, 2UL, 4UL, 8UL, 16UL, 32UL, 64UL}) {
+    benchmark::RegisterBenchmark(std::format("full_datapath/dir24_8/topology/burst:{}", n),
+                                 [n](benchmark::State& s) {
+                                   full_datapath<npf::table::Dir24_8Lpm>(s, workloads.front(), n);
+                                 })
+        ->Apply(with_spread);
+  }
   benchmark::RunSpecifiedBenchmarks();
   benchmark::Shutdown();
   return 0;
