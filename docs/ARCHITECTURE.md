@@ -560,6 +560,21 @@ class IoBackend {
 }  // namespace npf::io
 ```
 
+[phase 16] `PacketMmapBackend` opens two sockets per port, because `PACKET_VERSION` is a property of
+a socket and RX and TX want different versions:
+
+- **RX:** a `TPACKET_V3` ring, whose blocks let the kernel fill many frames before one wake-up.
+  Frames are copied out of the ring into pool buffers. The ring is the plan's (8 blocks of 4 MiB)
+  for one socket per port, and is split between a port's sockets when there are several (fanout),
+  so that its size per port stays the same.
+- **TX:** a `TPACKET_V2` ring of fixed 2048-byte slots, with `PACKET_QDISC_BYPASS`. A frame is
+  copied into a slot; `tx_flush()` kicks each port with pending frames once, with one `send()`.
+  V3's blocks buy nothing on TX, where every slot is filled by the sender either way.
+
+Both socket backends read the kernel's `PACKET_STATISTICS` when asked, for the frames the kernel
+dropped before the router could read them. That count is reported beside `Counters`, not in it:
+it is the kernel's, not a decision of the pipeline.
+
 ---
 
 ## 10. Statistics  [phase 6]
