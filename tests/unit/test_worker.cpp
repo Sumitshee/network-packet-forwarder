@@ -341,9 +341,10 @@ TEST(Recycler, SendsEachPacketHomeToItsOwnPool) {
   rx.release(back);
 }
 
-// A worker that never takes its packets: the ring fills, and every packet after that is dropped
-// by the RX stage -- counted as received and as RingFull, its buffer straight back in the pool.
-TEST(RxStage, APacketForAFullRingIsCountedAsRingFull) {
+// [phase 16] A worker that does not take its packets: the ring fills, and then the RX stage
+// receives nothing more -- the rest wait in the source, as they would in the kernel -- and drops
+// nothing. Once the worker makes room, the stage receives again, as much as fits.
+TEST(RxStage, AFullRingHoldsBackTheSourceAndDropsNothing) {
   const Config cfg = topology();
   constexpr std::size_t kSent = npf::pipe::kWorkerRingSize + 300;
   PacketPool pool(kSent + 16);
@@ -357,12 +358,24 @@ TEST(RxStage, APacketForAFullRingIsCountedAsRingFull) {
   Doorbell bell;
   std::array<Doorbell*, 1> bells{&bell};
   RxStage stage(source, pool, rings, 0, bells, cfg.burst);
-  while (!source.drained()) {
+  for (int i = 0; i < 1000; ++i) {
     stage.run_once();
   }
-  EXPECT_EQ(stage.stats().rx_packets, kSent - npf::pipe::kWorkerRingSize);
-  EXPECT_EQ(stage.stats().drop(DropReason::RingFull), kSent - npf::pipe::kWorkerRingSize);
+  EXPECT_FALSE(source.drained());
+  EXPECT_EQ(stage.run_once(), 0U);  // the ring is full: nothing received
+  EXPECT_EQ(stage.stats().drop(DropReason::RingFull), 0U);
   EXPECT_EQ(pool.available(), pool.capacity() - npf::pipe::kWorkerRingSize);  // in the ring
+
+  std::array<npf::core::Packet*, 300> taken{};  // the worker takes 300, and lets them go
+  ASSERT_EQ(rings.to_worker(0, 0).pop_bulk(taken.data(), taken.size()), taken.size());
+  for (npf::core::Packet* p : taken) {
+    pool.release(p);
+  }
+  for (int i = 0; i < 1000 && !source.drained(); ++i) {
+    stage.run_once();
+  }
+  EXPECT_TRUE(source.drained());
+  EXPECT_EQ(stage.stats().drop(DropReason::RingFull), 0U);
   stage.reclaim();
   EXPECT_EQ(pool.available(), pool.capacity());
 }

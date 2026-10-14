@@ -382,7 +382,16 @@ RxStage::RxStage(io::IoBackend& rx, core::PacketPool& pool, PipelineRings& rings
 
 std::size_t RxStage::run_once() noexcept {
   take_home();  // first: every buffer back is one more to receive into
-  const std::size_t n = source_->rx_burst(rx_.data(), burst_);
+  // Back-pressure (ARCHITECTURE.md §12): no more than the fullest ring can take, wherever the
+  // packets steer. The rest wait in the kernel, which counts what it then has to drop.
+  std::size_t room = burst_;
+  for (PacketRing* ring : out_) {
+    room = ring->room(room);
+  }
+  if (room == 0) {
+    return 0;
+  }
+  const std::size_t n = source_->rx_burst(rx_.data(), room);
   for (core::Packet* p : std::span(rx_.data(), n)) {
     const std::size_t w = steer(*p, out_.size());
     // A burst is at most kMaxBurst, so no worker's staging can overflow.

@@ -108,6 +108,17 @@ class SpscRing {
     return head_.load(std::memory_order_acquire) == tail_.load(std::memory_order_relaxed);
   }
 
+  // [phase 16] Producer thread only: how many of want elements a push_bulk would take now. The
+  // stale view of tail_ is reloaded only when it says there is less room than wanted, as in
+  // push_bulk; it can only under-report, so a push of that many always succeeds.
+  [[nodiscard]] std::size_t room(std::size_t want) noexcept {
+    const std::size_t head = head_.load(std::memory_order_relaxed);
+    if (N - (head - cached_tail_) < want) {
+      cached_tail_ = tail_.load(std::memory_order_acquire);
+    }
+    return std::min(want, N - (head - cached_tail_));
+  }
+
   [[nodiscard]] static constexpr std::size_t capacity() noexcept { return N; }
 
  private:

@@ -103,6 +103,23 @@ TEST(SpscRing, PushBulkTakesWhatFits) {
   }
 }
 
+// [phase 16] room() answers for a push_bulk: never more than was asked, never more than fits.
+TEST(SpscRing, RoomIsWhatAPushWouldTake) {
+  SpscRing<int, 8> ring;
+  EXPECT_EQ(ring.room(3), 3U);
+  EXPECT_EQ(ring.room(20), 8U);
+  const std::array<int, 6> six{0, 1, 2, 3, 4, 5};
+  ASSERT_EQ(ring.push_bulk(six.data(), six.size()), 6U);
+  EXPECT_EQ(ring.room(8), 2U);
+  EXPECT_EQ(ring.room(1), 1U);
+  ASSERT_EQ(ring.push_bulk(six.data(), 2), 2U);
+  EXPECT_EQ(ring.room(8), 0U);
+  std::array<int, 5> out{};
+  ASSERT_EQ(ring.pop_bulk(out.data(), out.size()), 5U);
+  EXPECT_EQ(ring.room(8), 5U);  // the stale view of the consumer's index is reloaded
+  EXPECT_EQ(ring.push_bulk(six.data(), ring.room(6)), 5U);
+}
+
 TEST(SpscRing, PopBulkTakesWhatThereIs) {
   SpscRing<int, 8> ring;
   std::array<int, 4> out{};
