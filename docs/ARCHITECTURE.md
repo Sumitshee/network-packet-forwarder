@@ -39,7 +39,8 @@ enum class DropReason : std::uint8_t {
   UnknownDestPort,   // L2 lookup miss on a port with no bridge domain
   SamePort,          // [phase 12] L2: the destination was learned on the port the frame came in on
   RingFull,          // [phase 13] pipeline mode: the ring to the chosen worker was full, so the RX
-                     // thread dropped the packet before any worker saw it
+                     // thread dropped the packet before any worker saw it. [phase 16] A guard:
+                     // the RX thread receives no more than every ring has room for (§12)
   TxFull,            // transmit ring or socket buffer full
   PoolExhausted,     // no free packet buffer
   _Count
@@ -698,6 +699,18 @@ switches a frame whatever its EtherType, before step 2 could refuse it:
 | `IoBackend` sockets | one per worker in run-to-completion mode | none | Every worker's socket on a port joins that port's `PACKET_FANOUT_HASH` group, which distributes in-kernel |
 | `IoBackend` sockets, pipeline | one receiving socket per port, one RX thread each; every worker its own transmit-only sockets | none | The RX thread steers by `symmetric_hash_5tuple & (workers-1)`, so the worker count is a power of two |
 
+[phase 16] Back-pressure in pipeline mode. Before each receive, the RX thread asks every ring to a
+worker how much room it has, `SpscRing::room(burst)`, and receives at most the smallest answer —
+so whichever workers a burst steers to, every packet of it fits, and none is dropped as `RingFull`.
+What the workers cannot take yet stays in the kernel: in the socket's receive buffer
+(`af_packet`), or in the ring's block (`mmap`). If that overflows in turn, the kernel drops and
+counts it, and npf reports the count as `kernel_rx_drops`. Phase 13 dropped instead, as `RingFull`;
+that cost little while a system call per frame paced the RX thread, but a `mmap` RX thread copies
+a whole block out in microseconds — thousands of frames, against 1024 slots a ring — and dropped
+most of them. While every ring is full the RX thread finds nothing to do and polls its socket,
+which is readable, so it spins in `poll()` until a worker makes room; a wake-up from the workers
+would save that CPU, and is not built.
+
 [phase 13] Not built: NUMA awareness (a laptop has one node), work stealing, dynamic worker
 scaling, CPU pinning.
 
@@ -717,6 +730,8 @@ class SpscRing {
   [[nodiscard]] std::size_t push_bulk(const T* v, std::size_t n) noexcept;
   [[nodiscard]] std::size_t pop_bulk(T* out, std::size_t n) noexcept;
   [[nodiscard]] bool empty() const noexcept;  // consumer thread only: before it sleeps
+  [[nodiscard]] std::size_t room(std::size_t want) noexcept;  // [phase 16] producer only: how
+                                                             // many of want a push would take
  private:
   alignas(64) std::atomic<std::size_t> head_{0};   // written by producer
   alignas(64) std::atomic<std::size_t> tail_{0};   // written by consumer
