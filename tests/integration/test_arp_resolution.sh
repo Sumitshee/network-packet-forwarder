@@ -10,6 +10,8 @@
 # even after one fails; the exit status is non-zero if any did. Not root: exit status 77, which
 # CTest reports as skipped.
 set -uo pipefail
+# NPF_RUN_ARGS: more for npf run, such as "--io mmap" to run the same test on PACKET_MMAP.
+read -ra RUN_ARGS <<< "${NPF_RUN_ARGS:-}"
 
 if [[ $(id -u) -ne 0 ]]; then
   echo "SKIP: needs root, for network namespaces and AF_PACKET"
@@ -51,7 +53,7 @@ route 10.0.2.0/24 dev 1
 EOF
 
 echo "\$ ip netns exec ns-router $NPF run --config router.conf &"
-ip netns exec ns-router "$NPF" run --config "$WORK/router.conf" --pidfile "$WORK/npf.pid" \
+ip netns exec ns-router "$NPF" run "${RUN_ARGS[@]}" --config "$WORK/router.conf" --pidfile "$WORK/npf.pid" \
   --stats-file "$WORK/npf.stats" > "$WORK/npf.log" 2>&1 &
 NPF_PID=$!
 for _ in $(seq 50); do

@@ -19,6 +19,8 @@
 # Any npf binary will do -- a plain build soaks too -- but only a tsan one checks for races.
 # Not root: exit status 77, which CTest reports as skipped.
 set -uo pipefail
+# NPF_RUN_ARGS: more for npf run, such as "--io mmap" to run the same test on PACKET_MMAP.
+read -ra RUN_ARGS <<< "${NPF_RUN_ARGS:-}"
 
 if [[ $(id -u) -ne 0 ]]; then
   echo "SKIP: needs root, for network namespaces and AF_PACKET"
@@ -71,7 +73,7 @@ soak() { # soak <mode>
   echo
   echo "--- $mode, $WORKERS workers, ${SECONDS_PER_MODE} s"
   TSAN_OPTIONS="halt_on_error=1 exitcode=66 second_deadlock_stack=1" \
-    ip netns exec ns-router "$NPF" run --config "$ROOT/configs/router.conf" --mode "$mode" \
+    ip netns exec ns-router "$NPF" run "${RUN_ARGS[@]}" --config "$ROOT/configs/router.conf" --mode "$mode" \
     --workers "$WORKERS" --pidfile "$WORK/npf.pid" --stats-file "$WORK/npf.stats" > "$log" 2>&1 &
   NPF_PID=$!
   for _ in $(seq 300); do  # a TSan build starts slowly

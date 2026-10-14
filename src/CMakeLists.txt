@@ -16,6 +16,8 @@ target_link_libraries(npf_table PUBLIC npf_core PRIVATE npf_warnings)
 
 add_library(npf_io
   io/af_packet.cpp
+  io/link.cpp
+  io/packet_mmap.cpp
   io/pcap_file.cpp)
 target_link_libraries(npf_io PUBLIC npf_core PRIVATE npf_warnings)
 

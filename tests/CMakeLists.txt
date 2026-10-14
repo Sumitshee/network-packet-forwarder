@@ -85,7 +85,7 @@ add_dependencies(test_golden npf)
 
 # Integration tests that need root. Run by anyone else, each exits 77, which CTest reports as
 # skipped rather than failed -- so in CI they are skipped.
-foreach(name forward_netns traceroute arp_resolution switching ordering)
+foreach(name forward_netns traceroute arp_resolution switching ordering io_equivalence)
   add_test(NAME integration.${name}
            COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/integration/test_${name}.sh $<TARGET_FILE:npf>)
   set_tests_properties(integration.${name} PROPERTIES
@@ -101,6 +101,11 @@ set_tests_properties(integration.ordering PROPERTIES TIMEOUT 400)
 add_test(NAME integration.soak
          COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/integration/test_soak.sh $<TARGET_FILE:npf>)
 set_tests_properties(integration.soak PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 400)
+
+# 60 s of full-rate traffic through the PACKET_MMAP backend, watched for ring stalls.
+add_test(NAME integration.mmap_soak
+         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/integration/test_mmap_soak.sh $<TARGET_FILE:npf>)
+set_tests_properties(integration.mmap_soak PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 200)
 
 # libFuzzer ships only with Clang, and ThreadSanitizer cannot be combined with the fuzzers' ASan.
 if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang" AND NOT NPF_SANITIZER STREQUAL "tsan")

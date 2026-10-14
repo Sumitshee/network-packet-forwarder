@@ -344,7 +344,8 @@ class RingBackend final : public io::IoBackend {
     return sent;
   }
 
-  void tx_flush() noexcept override {}
+  // Tx's own: a ring backend sends what send() queued only when kicked.
+  void tx_flush() noexcept override { tx_->tx_flush(); }
   [[nodiscard]] std::span<const io::PortInfo> ports() const noexcept override {
     return tx_->ports();
   }

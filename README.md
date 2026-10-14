@@ -295,7 +295,11 @@ ctest --preset dev -R golden --output-on-failure
 - **VLANs.** One 802.1Q (`0x8100`) or 802.1ad (`0x88a8`) tag is parsed and carried, not
   interpreted: the frame is routed as if it were untagged and leaves with the same tag, or is
   switched with the tag untouched. A second tag (QinQ) is not unwrapped, and a frame for the router
-  with one is dropped as an unsupported EtherType.
+  with one is dropped as an unsupported EtherType. That is what `npf replay` does. **Live, on
+  either socket backend, the tag is lost:** the kernel takes it out of a received frame before a
+  packet socket reads it, passing it alongside instead (`PACKET_AUXDATA`, or the TPACKET_V3
+  header), and npf does not read it back, so a tagged frame is forwarded untagged.
+  `tests/integration/test_io_equivalence.sh` checks exactly this.
 - **IPv4 options.** A header's options are skipped using its length field; none is interpreted.
 - **Fragment reassembly.** Fragments are never reassembled. Only a first (or only) fragment carries
   the transport header, so every other fragment is handled with no ports at all.

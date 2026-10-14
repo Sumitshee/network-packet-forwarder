@@ -49,14 +49,17 @@ def tier_b(base, rerun):
     out = []
 
     def by_key(d):
-        return {(c['config'], c.get('mode'), c.get('workers')): c
+        # Results from before phase 16 ran on af_packet alone, and do not say so.
+        return {(c['config'], c.get('mode'), c.get('workers'),
+                 c.get('io', 'af_packet') if c['config'] == 'npf' else None): c
                 for c in d.get('tier_b', {}).get('configurations', [])}
 
     ca, cb = by_key(base), by_key(rerun)
     for key, c in ca.items():
         if key not in cb:
             continue
-        label = 'kernel control' if key[0] == 'kernel' else f"npf {key[1]}, {key[2]} workers"
+        label = ('kernel control' if key[0] == 'kernel'
+                 else f"npf {key[1]}, {key[2]} workers, {key[3]}"
         for scen in ('throughput', 'latency'):
             metrics = [('latency_p50_ns', 'p50 latency, ns'), ('latency_p99_ns', 'p99 latency, ns')]
             if scen == 'throughput':  # at a fixed rate, what is delivered is what was sent

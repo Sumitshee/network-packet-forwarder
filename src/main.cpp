@@ -1,15 +1,16 @@
 // npf, the router.
 //
-//   npf run --config <file> [--mode rtc|pipeline] [--workers <n>] [--pidfile <path>]
-//           [--stats-file <path>] [--busy-poll]
+//   npf run --config <file> [--io af_packet|mmap] [--mode rtc|pipeline] [--workers <n>]
+//           [--pidfile <path>] [--stats-file <path>] [--busy-poll]
 //       Forwards until SIGINT or SIGTERM, with a stats line every 5 s. --mode and --workers stand
 //       in for the configuration's own: n workers, each running to completion on sockets of its
-//       own (rtc), or fed by an RX thread per port (pipeline). SIGUSR1 prints the whole
-//       counter table and writes it to the stats file, which is how `npf show stats` reads it.
-//       SIGRTMIN and SIGRTMIN+1 write the MAC table and the ARP cache next to it, with the
-//       extensions .mac and .arp, for `npf show mac` and `npf show arp`, a section per worker when
-//       there are several. SIGUSR2 empties the ARP caches of all but their static entries, for
-//       tests.
+//       own (rtc), or fed by an RX thread per port (pipeline). --io likewise stands in for the
+//       configuration's io: AF_PACKET with a system call per frame, or PACKET_MMAP's rings. SIGUSR1
+//       prints the whole counter table and writes it to the stats file, which is how `npf show
+//       stats` reads it. SIGRTMIN and SIGRTMIN+1 write the MAC table and the ARP cache next to it,
+//       with the extensions .mac and .arp, for `npf show mac` and `npf show arp`, a section per
+//       worker when there are several. SIGUSR2 empties the ARP caches of all but their static
+//       entries, for tests.
 //   npf dump --iface <name>
 //       Prints the parsed headers of every frame received on one interface.
 //   npf show stats|mac|arp [--pidfile <path>] [--stats-file <path>]
@@ -55,6 +56,7 @@
 #include <npf/core/unique_fd.hpp>
 #include <npf/io/af_packet.hpp>
 #include <npf/io/backend.hpp>
+#include <npf/io/packet_mmap.hpp>
 #include <npf/io/pcap_file.hpp>
 #include <npf/pipe/decision.hpp>
 #include <npf/pipe/filter.hpp>
@@ -80,6 +82,7 @@
 #include <string_view>
 #include <system_error>
 #include <thread>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -93,8 +96,8 @@ using npf::proto::format_ipv4;
 using npf::proto::format_mac;
 
 constexpr std::string_view kUsage =
-    "usage: npf run --config <file> [--mode rtc|pipeline] [--workers <n>] [--pidfile <path>]\n"
-    "               [--stats-file <path>] [--busy-poll]\n"
+    "usage: npf run --config <file> [--io af_packet|mmap] [--mode rtc|pipeline] [--workers <n>]\n"
+    "               [--pidfile <path>] [--stats-file <path>] [--busy-poll]\n"
     "       npf dump --iface <name>\n"
     "       npf show stats|mac|arp [--pidfile <path>] [--stats-file <path>]\n"
     "       npf replay <in.pcap> <out.pcap> --config <file> [--stats-json <path>]\n";
@@ -128,6 +131,7 @@ struct Options {
   std::string iface;
   bool busy_poll{false};
   std::optional<npf::core::RunMode> mode;  // run's: nullopt keeps the configuration's
+  std::optional<npf::core::IoKind> io;
   std::optional<std::size_t> workers;
   std::vector<std::filesystem::path> files;  // replay's: the pcap to read, then the one to write
   std::filesystem::path stats_json;
@@ -147,6 +151,20 @@ std::size_t parse_count(std::string_view text, std::string_view what) {
   return n;
 }
 
+npf::core::IoKind parse_io(std::string_view value) {
+  if (value != "af_packet" && value != "mmap") {
+    throw UsageError(std::format("--io is af_packet or mmap, not '{}'", value));
+  }
+  return value == "mmap" ? npf::core::IoKind::Mmap : npf::core::IoKind::AfPacket;
+}
+
+npf::core::RunMode parse_mode(std::string_view value) {
+  if (value != "rtc" && value != "pipeline") {
+    throw UsageError(std::format("--mode is rtc or pipeline, not '{}'", value));
+  }
+  return value == "rtc" ? npf::core::RunMode::Rtc : npf::core::RunMode::Pipeline;
+}
+
 // Applies one "--name value" pair. False if the command has no such option.
 bool set_option(Options& o, const Flag& flag) {
   const bool run_or_replay = o.command == "run" || o.command == "replay";
@@ -163,11 +181,10 @@ bool set_option(Options& o, const Flag& flag) {
     o.stats_json = flag.value;
   } else if (flag.name == "--workers" && o.command == "run") {
     o.workers = parse_count(flag.value, "--workers");
+  } else if (flag.name == "--io" && o.command == "run") {
+    o.io = parse_io(flag.value);
   } else if (flag.name == "--mode" && o.command == "run") {
-    if (flag.value != "rtc" && flag.value != "pipeline") {
-      throw UsageError(std::format("--mode is rtc or pipeline, not '{}'", flag.value));
-    }
-    o.mode = flag.value == "rtc" ? npf::core::RunMode::Rtc : npf::core::RunMode::Pipeline;
+    o.mode = parse_mode(flag.value);
   } else {
     return false;
   }
@@ -310,7 +327,10 @@ struct PoolUse {
 
 // Every counter, by name, in one fixed order: the drop reasons in DropReason's, then only the IP
 // protocols seen, by number.
-CounterList counter_list(const npf::stat::Counters& c, PoolUse pool) {
+// kernel_drops: npf run's, the frames the kernel dropped before a socket was read
+// (PACKET_STATISTICS); none for a replay.
+CounterList counter_list(const npf::stat::Counters& c, PoolUse pool,
+                         std::optional<std::uint64_t> kernel_drops = std::nullopt) {
   CounterList out{
       {"rx_packets", c.rx_packets},
       {"rx_bytes", c.rx_bytes},
@@ -338,13 +358,17 @@ CounterList counter_list(const npf::stat::Counters& c, PoolUse pool) {
   }
   out.emplace_back("pool_available", pool.available);
   out.emplace_back("pool_capacity", pool.capacity);
+  if (kernel_drops) {
+    out.emplace_back("kernel_rx_drops", *kernel_drops);
+  }
   return out;
 }
 
 // One "name value" pair per line, so a script can pick out any counter with awk.
-std::string counter_table(const npf::stat::Counters& c, PoolUse pool) {
+std::string counter_table(const npf::stat::Counters& c, PoolUse pool,
+                          std::optional<std::uint64_t> kernel_drops = std::nullopt) {
   std::string out;
-  for (const auto& [name, value] : counter_list(c, pool)) {
+  for (const auto& [name, value] : counter_list(c, pool, kernel_drops)) {
     out += std::format("{:<18}{}\n", name, value);
   }
   return out;
@@ -448,16 +472,19 @@ void write_snapshot(const std::filesystem::path& path, const std::string& table)
 using npf::pipe::Worker;
 
 // What this phase can run. The parser accepts more, for the phases that will implement it. io is
-// what the command reads and writes through: af_packet for npf run, pcap for npf replay.
+// what the command reads and writes through: pcap for npf replay, live interfaces for npf run.
 void require_supported(const npf::core::Config& cfg, npf::core::IoKind io) {
   if (cfg.interfaces.empty()) {
     throw std::runtime_error("the configuration has no interfaces");
   }
-  if (cfg.io != io) {
-    throw std::runtime_error(io == npf::core::IoKind::Pcap
-                                 ? "npf replay needs 'io pcap' in the configuration"
-                                 : "npf run needs 'io af_packet': io mmap and io xdp are not "
-                                   "implemented yet, and io pcap is for npf replay");
+  if (io == npf::core::IoKind::Pcap && cfg.io != npf::core::IoKind::Pcap) {
+    throw std::runtime_error("npf replay needs 'io pcap' in the configuration");
+  }
+  if (io != npf::core::IoKind::Pcap && cfg.io != npf::core::IoKind::AfPacket &&
+      cfg.io != npf::core::IoKind::Mmap) {
+    throw std::runtime_error(
+        "npf run needs 'io af_packet' or 'io mmap': io xdp is not implemented yet, and io pcap is "
+        "for npf replay");
   }
   if (cfg.fib != npf::core::FibKind::Linear) {
     throw std::runtime_error("only 'fib linear' is implemented so far");
@@ -498,9 +525,9 @@ void require_supported(const npf::core::Config& cfg, npf::core::IoKind io) {
   }
 }
 
-// The configuration file, with the command line's --mode and --workers in place of its own.
+// The configuration file, with the command line's --io, --mode and --workers in place of its own.
 npf::core::Config load_config_for(const Options& o, npf::core::IoKind io) {
-  npf::core::ParseResult parsed = npf::core::load_config(o.config);
+  npf::core::ParseResult parsed = npf::core::load_config(o.config);  // io: replay's pcap or run's
   if (!parsed.value) {
     throw std::runtime_error(std::format("{}: {}", o.config.string(), parsed.error));
   }
@@ -510,6 +537,9 @@ npf::core::Config load_config_for(const Options& o, npf::core::IoKind io) {
   }
   if (o.workers) {
     cfg.workers = *o.workers;
+  }
+  if (o.io) {
+    cfg.io = *o.io;
   }
   require_supported(cfg, io);
   return cfg;
@@ -565,24 +595,41 @@ struct SharedTables {
 struct Totals {
   npf::stat::Counters counters;
   PoolUse pools;
+  std::optional<std::uint64_t> kernel_rx_drops;
 };
+
+// The sockets a lane opens: AF_PACKET's or PACKET_MMAP's. sockets_per_port: how many sockets of
+// this kind share each port, which PACKET_MMAP splits its RX ring between.
+template <class Socket>
+std::unique_ptr<Socket> open_sockets(const npf::core::Config& cfg, PacketPool& pool,
+                                     const npf::io::AfPacketOptions& options,
+                                     std::size_t sockets_per_port) {
+  if constexpr (std::is_same_v<Socket, npf::io::PacketMmapBackend>) {
+    return std::make_unique<Socket>(cfg.interfaces, pool, options,
+                                    npf::io::MmapRingSizes::shared_by(sockets_per_port));
+  } else {
+    return std::make_unique<Socket>(cfg.interfaces, pool, options);
+  }
+}
 
 // One worker and what it owns besides its tables: its pool, the recycler over it, and its backend
 // -- its own sockets in run-to-completion mode, the rings and its transmit-only sockets in
 // pipeline mode.
-struct Lane {
+template <class Socket>
+struct LaneOf {
   std::unique_ptr<PacketPool> pool;
   std::unique_ptr<npf::pipe::Recycler> recycler;
-  std::unique_ptr<npf::io::AfPacketBackend> sockets;
-  std::unique_ptr<npf::pipe::Doorbell> bell;                                // pipeline mode
-  std::unique_ptr<npf::pipe::RingBackend<npf::io::AfPacketBackend>> rings;  // pipeline mode
+  std::unique_ptr<Socket> sockets;
+  std::unique_ptr<npf::pipe::Doorbell> bell;              // pipeline mode
+  std::unique_ptr<npf::pipe::RingBackend<Socket>> rings;  // pipeline mode
   std::unique_ptr<Worker> worker;
 };
 
 // One pipeline RX thread's: its pool, its socket on its port, and the stage that steers.
-struct RxLane {
+template <class Socket>
+struct RxLaneOf {
   std::unique_ptr<PacketPool> pool;
-  std::unique_ptr<npf::io::AfPacketBackend> sockets;
+  std::unique_ptr<Socket> sockets;
   std::unique_ptr<npf::pipe::RxStage> stage;
 };
 
@@ -600,9 +647,14 @@ class ResumeOnExit {
   npf::pipe::Rendezvous* rv_;
 };
 
-// npf run's threads, in either model (ARCHITECTURE.md §12), and the control thread's hold on them.
-// Built whole by the constructor; start() lets the threads go, and stop() joins them.
+// npf run's threads, in either model (ARCHITECTURE.md §12), and the control thread's hold on them,
+// over either socket backend. Built whole by the constructor; start() lets the threads go, and
+// stop() joins them.
+template <class Socket>
 class Engine {
+  using Lane = LaneOf<Socket>;
+  using RxLane = RxLaneOf<Socket>;
+
  public:
   Engine(npf::core::Config cfg, const npf::core::FilterConfig& rules, bool busy_poll)
       : cfg_{std::move(cfg)}, busy_poll_{busy_poll} {
@@ -666,9 +718,18 @@ class Engine {
     return f();
   }
 
-  // Callers hold the threads parked, or have stopped them.
-  [[nodiscard]] Totals totals() const {
+  // Callers hold the threads parked, or have stopped them. Not const: reading the kernel's drop
+  // counts resets them, so the backends keep the totals.
+  [[nodiscard]] Totals totals() {
     Totals t;
+    t.kernel_rx_drops = 0;
+    for (Lane& lane : lanes_) {
+      *t.kernel_rx_drops +=
+          cfg_.mode == npf::core::RunMode::Rtc ? lane.sockets->kernel_rx_drops() : 0;
+    }
+    for (RxLane& lane : rx_lanes_) {
+      *t.kernel_rx_drops += lane.sockets->kernel_rx_drops();
+    }
     for (const Lane& lane : lanes_) {
       t.counters.merge(lane.worker->stats());
       t.pools.available += lane.pool->available();
@@ -724,8 +785,7 @@ class Engine {
       if (w != 0) {
         options.fanout_groups = lanes_.front().sockets->fanout_groups();
       }
-      lane.sockets =
-          std::make_unique<npf::io::AfPacketBackend>(cfg_.interfaces, *lane.pool, options);
+      lane.sockets = open_sockets<Socket>(cfg_, *lane.pool, options, cfg_.workers);
       if (w == 0) {
         take_macs(*lane.sockets, cfg_);
         shared_ = std::make_unique<SharedTables>(cfg_, rules);
@@ -751,8 +811,7 @@ class Engine {
       options.receive.assign(n_ports, false);
       options.receive[k] = true;
       options.quiet = k != 0;
-      lane.sockets =
-          std::make_unique<npf::io::AfPacketBackend>(cfg_.interfaces, *lane.pool, options);
+      lane.sockets = open_sockets<Socket>(cfg_, *lane.pool, options, 1);
     }
     take_macs(*rx_lanes_.front().sockets, cfg_);
     shared_ = std::make_unique<SharedTables>(cfg_, rules);
@@ -766,8 +825,7 @@ class Engine {
       npf::io::AfPacketOptions transmit_only;
       transmit_only.receive.assign(n_ports, false);
       transmit_only.quiet = true;
-      lane.sockets =
-          std::make_unique<npf::io::AfPacketBackend>(cfg_.interfaces, *lane.pool, transmit_only);
+      lane.sockets = open_sockets<Socket>(cfg_, *lane.pool, transmit_only, 1);
       lane.recycler = std::make_unique<npf::pipe::Recycler>(*lane.pool);
       std::vector<npf::pipe::PacketRing*> in;
       for (std::size_t k = 0; k < n_ports; ++k) {
@@ -776,8 +834,8 @@ class Engine {
       }
       lane.bell = std::make_unique<npf::pipe::Doorbell>();
       bells.push_back(lane.bell.get());
-      lane.rings = std::make_unique<npf::pipe::RingBackend<npf::io::AfPacketBackend>>(
-          std::move(in), *lane.sockets, *lane.recycler, *lane.bell);
+      lane.rings = std::make_unique<npf::pipe::RingBackend<Socket>>(std::move(in), *lane.sockets,
+                                                                    *lane.recycler, *lane.bell);
       lane.worker = std::make_unique<Worker>(cfg_, shared_->fib, shared_->filter, *lane.rings,
                                              *lane.recycler, flood_sets);
     }
@@ -792,7 +850,7 @@ class Engine {
     Worker& worker = *lane.worker;
     const auto burst = [&worker] { return worker.run_one_burst(npf::core::Clock::now()); };
     if (lane.rings) {
-      npf::pipe::RingBackend<npf::io::AfPacketBackend>& rings = *lane.rings;
+      npf::pipe::RingBackend<Socket>& rings = *lane.rings;
       std::array<pollfd, 2> fds{
           {{rings.bell().fd(), POLLIN, 0}, {rendezvous_->wake_fd(), POLLIN, 0}}};
       npf::pipe::serve_loop(*rendezvous_, burst, [this, &rings, &fds] {
@@ -856,7 +914,7 @@ class Engine {
 };
 
 void report(const Totals& t, const std::filesystem::path& stats_file) {
-  const std::string table = counter_table(t.counters, t.pools);
+  const std::string table = counter_table(t.counters, t.pools, t.kernel_rx_drops);
   print(table);
   write_snapshot(stats_file, table);
 }
@@ -864,6 +922,7 @@ void report(const Totals& t, const std::filesystem::path& stats_file) {
 // One signal, answered: SIGUSR1 with the counters, SIGRTMIN with the MAC tables and SIGRTMIN+1
 // with the ARP caches, all read with the threads parked, and SIGUSR2 by flushing the ARP caches.
 // False for SIGINT and SIGTERM: time to stop.
+template <class Engine>
 bool answer(int sig, const Options& o, Engine& engine) {
   if (sig == SIGUSR1) {
     report(engine.parked([&engine] { return engine.totals(); }), o.stats_file);
@@ -884,6 +943,7 @@ bool answer(int sig, const Options& o, Engine& engine) {
 
 // The control thread: lets the workers go, then answers signals, with a stats line every
 // kStatsPeriod, until SIGINT or SIGTERM. Stops the workers on the way out.
+template <class Engine>
 void serve(const Options& o, Engine& engine) {
   const SignalFd signals{SIGINT, SIGTERM, SIGUSR1, SIGUSR2, SIGRTMIN, SIGRTMIN + 1};
   const Pidfile pidfile(o.pidfile);
@@ -924,15 +984,9 @@ void serve(const Options& o, Engine& engine) {
   engine.stop();
 }
 
-int run(const Options& o) {
-  npf::core::Config cfg = load_config_for(o, npf::core::IoKind::AfPacket);
-  const npf::core::FilterConfig rules = load_filter_for(cfg, o.config);
-  if (!cfg.filter.empty()) {
-    npf::core::log_info("packet filter: {} rules from {}, policy {}", rules.rules.size(),
-                        npf::core::filter_path(cfg, o.config).string(),
-                        rules.policy == npf::pipe::Action::Allow ? "allow" : "deny");
-  }
-  Engine engine(std::move(cfg), rules, o.busy_poll);
+template <class Socket>
+int run_engine(const Options& o, npf::core::Config cfg, const npf::core::FilterConfig& rules) {
+  Engine<Socket> engine(std::move(cfg), rules, o.busy_poll);
 
   serve(o, engine);
 
@@ -943,6 +997,20 @@ int run(const Options& o) {
                         engine.rx_oversized());
   }
   return 0;
+}
+
+int run(const Options& o) {
+  npf::core::Config cfg = load_config_for(o, npf::core::IoKind::AfPacket);
+  const npf::core::FilterConfig rules = load_filter_for(cfg, o.config);
+  if (!cfg.filter.empty()) {
+    npf::core::log_info("packet filter: {} rules from {}, policy {}", rules.rules.size(),
+                        npf::core::filter_path(cfg, o.config).string(),
+                        rules.policy == npf::pipe::Action::Allow ? "allow" : "deny");
+  }
+  if (cfg.io == npf::core::IoKind::Mmap) {
+    return run_engine<npf::io::PacketMmapBackend>(o, std::move(cfg), rules);
+  }
+  return run_engine<npf::io::AfPacketBackend>(o, std::move(cfg), rules);
 }
 
 // --- npf replay ----------------------------------------------------------------------------------

@@ -5,6 +5,8 @@
 #   sudo ./scripts/run_bench.sh --kernel-baseline    the kernel control alone
 #   sudo ./scripts/run_bench.sh --tier-b             npf through the namespaces, every model
 #   sudo ./scripts/run_bench.sh --all                all three, into one result
+#   sudo ./scripts/run_bench.sh --compare-io         the kernel control, then each configuration
+#                                                    on AF_PACKET and on PACKET_MMAP in turn
 #   ... [--quick]                                    a rehearsal: 2 short repetitions, no
 #                                                    bench_lpm; written to bench/results/raw only
 #
@@ -48,12 +50,16 @@ LABEL=""
 ONLY_CONFIGS=""
 BURST=""
 NPF_ARGS=""
+COMPARE_IO=0
 while (($#)); do
   case "$1" in
     --tier-a) TIER_A=1 ;;
     --tier-b) TIER_B=1 ;;
     --kernel-baseline) KERNEL=1 ;;
     --all) TIER_A=1 TIER_B=1 KERNEL=1 ;;
+    # [phase 16] One session: the kernel control, then for each configuration npf on af_packet
+    # and straight after on mmap, so that the two backends are compared minutes apart, not hours.
+    --compare-io) TIER_B=1 KERNEL=1 COMPARE_IO=1 ;;
     --quick) QUICK=1 ;;
     # [phase 15] for one experiment's tier B runs: a name for the result, the npf configurations
     # to run ("rtc:2,pipeline:4"), a burst size in place of router.conf's, extra npf run flags.
@@ -62,14 +68,18 @@ while (($#)); do
     --burst) BURST=$2; shift ;;
     --npf-args) NPF_ARGS=$2; shift ;;
     *)
-      sed -n '2,10p' "${BASH_SOURCE[0]}" >&2
+      sed -n '2,12p' "${BASH_SOURCE[0]}" >&2
       exit 2
       ;;
   esac
   shift
 done
 if ((TIER_A + TIER_B + KERNEL == 0)); then
-  sed -n '2,10p' "${BASH_SOURCE[0]}" >&2
+  sed -n '2,12p' "${BASH_SOURCE[0]}" >&2
+  exit 2
+fi
+if ((COMPARE_IO)) && [[ $NPF_ARGS == *--io* ]]; then
+  echo "run_bench: --compare-io chooses the backend itself; take --io out of --npf-args" >&2
   exit 2
 fi
 
@@ -92,6 +102,14 @@ GEN_CPU=6
 SINK_CPU=7
 NPF_CPUS=0-5
 CONFIGS=("rtc 1" "rtc 2" "rtc 4" "pipeline 1" "pipeline 2" "pipeline 4")
+IOS=("")  # "": router.conf's io, unless --npf-args says otherwise
+if ((COMPARE_IO)); then
+  CONFIGS=("rtc 1" "rtc 2" "pipeline 2")
+  IOS=(af_packet mmap)
+  # Each session its own result: the comparison is made within a session, and the sessions'
+  # results are then set side by side (docs/performance.md, phase 15's lesson on spread).
+  LABEL=${LABEL:-compare-io-$(date -u +%H%M)}
+fi
 if [[ -n $ONLY_CONFIGS ]]; then
   IFS=',' read -r -a picked <<< "$ONLY_CONFIGS"
   CONFIGS=()
@@ -259,14 +277,22 @@ kernel_baseline() {
   fresh_topology
 }
 
-npf_config() { # npf_config <mode> <workers>
-  local dir="$RAW/tier_b/npf-$1-$2" log
+npf_config() { # npf_config <mode> <workers> [io]
+  local dir="$RAW/tier_b/npf-${3:+$3-}$1-$2" log io=${3:-} io_args=()
+  if [[ -n $io ]]; then
+    io_args=(--io "$io")
+  elif [[ $NPF_ARGS =~ --io[[:space:]]+([a-z_]+) ]]; then
+    io=${BASH_REMATCH[1]}
+  else
+    io=$(awk '$1 == "io" { print $2 }' "$CONFIG")
+  fi
   mkdir -p "$dir"
   log="$dir/npf.log"
-  log "tier B: npf, mode $1, $2 workers"
+  log "tier B: npf, mode $1, $2 workers, io $io"
   # shellcheck disable=SC2086
   ip netns exec ns-router taskset -c "$NPF_CPUS" "$NPF" run --config "$CONFIG" --mode "$1" \
-    --workers "$2" $NPF_ARGS --pidfile "$dir/npf.pid" --stats-file "$dir/npf.stats" > "$log" 2>&1 &
+    --workers "$2" "${io_args[@]}" $NPF_ARGS --pidfile "$dir/npf.pid" --stats-file "$dir/npf.stats" \
+    > "$log" 2>&1 &
   NPF_PID=$!
   for _ in $(seq 100); do
     grep -qs 'forwarding on' "$log" && break
@@ -281,8 +307,8 @@ npf_config() { # npf_config <mode> <workers>
   kill -TERM "$NPF_PID"
   wait "$NPF_PID"
   NPF_PID=""
-  python3 -c 'import json, sys; print(json.dumps({"config": "npf", "mode": sys.argv[1], "workers": int(sys.argv[2]), "npf_peak_rss_kib": int(sys.argv[3])}))' \
-    "$1" "$2" "$hwm" > "$dir/meta.json"
+  python3 -c 'import json, sys; print(json.dumps({"config": "npf", "mode": sys.argv[1], "workers": int(sys.argv[2]), "io": sys.argv[4], "npf_peak_rss_kib": int(sys.argv[3])}))' \
+    "$1" "$2" "$hwm" "$io" > "$dir/meta.json"
 }
 
 tier_b() {
@@ -290,8 +316,10 @@ tier_b() {
   log "tier B: load average $(wait_for_idle)"
   fresh_topology
   for c in "${CONFIGS[@]}"; do
-    # shellcheck disable=SC2086
-    npf_config $c
+    for io in "${IOS[@]}"; do
+      # shellcheck disable=SC2086
+      npf_config $c $io
+    done
   done
 }
 
@@ -332,8 +360,14 @@ if ((QUICK)); then
   python3 "$ROOT/scripts/bench_combine.py" "$RAW" --build "$BUILD" --quick \
     --out "$RAW/combined.json" || die "the results did not pass their checks"
   log "a rehearsal: $RAW/combined.json, not for bench/results"
+  if ((COMPARE_IO)); then
+    python3 "$ROOT/scripts/bench_compare_io.py" "$RAW/combined.json"
+  fi
 else
   python3 "$ROOT/scripts/bench_combine.py" "$RAW" --build "$BUILD" --out "$OUT" ||
     die "the results did not pass their checks"
   log "wrote $OUT"
+  if ((COMPARE_IO)); then
+    python3 "$ROOT/scripts/bench_compare_io.py" "$OUT"
+  fi
 fi

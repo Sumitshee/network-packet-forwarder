@@ -10,6 +10,8 @@
 # Not root: exit status 77, which CTest reports as skipped. NPF_CAPTURE=python captures with a raw
 # socket instead of tcpdump, which cannot drop privileges inside an unprivileged user namespace.
 set -uo pipefail
+# NPF_RUN_ARGS: more for npf run, such as "--io mmap" to run the same test on PACKET_MMAP.
+read -ra RUN_ARGS <<< "${NPF_RUN_ARGS:-}"
 
 if [[ $(id -u) -ne 0 ]]; then
   echo "SKIP: needs root, for network namespaces and AF_PACKET"
@@ -51,7 +53,7 @@ sed "s/^mac_age .*/mac_age $MAC_AGE/" "$ROOT/configs/bridge.conf" > "$WORK/bridg
 grep -qx "mac_age $MAC_AGE" "$WORK/bridge.conf" || { echo "FAIL  configs/bridge.conf has no mac_age"; exit 1; }
 
 echo "\$ ip netns exec ns-router $NPF run --config bridge.conf &   (mac_age $MAC_AGE)"
-ip netns exec ns-router "$NPF" run --config "$WORK/bridge.conf" --pidfile "$WORK/npf.pid" \
+ip netns exec ns-router "$NPF" run "${RUN_ARGS[@]}" --config "$WORK/bridge.conf" --pidfile "$WORK/npf.pid" \
   --stats-file "$WORK/npf.stats" > "$WORK/npf.log" 2>&1 &
 NPF_PID=$!
 for _ in $(seq 50); do

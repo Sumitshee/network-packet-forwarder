@@ -17,6 +17,8 @@
 # CTest reports as skipped. NPF_CAPTURE=python captures with a raw socket instead of tcpdump,
 # which cannot drop privileges inside an unprivileged user namespace.
 set -uo pipefail
+# NPF_RUN_ARGS: more for npf run, such as "--io mmap" to run the same test on PACKET_MMAP.
+read -ra RUN_ARGS <<< "${NPF_RUN_ARGS:-}"
 
 if [[ $(id -u) -ne 0 ]]; then
   echo "SKIP: needs root, for network namespaces and AF_PACKET"
@@ -62,7 +64,7 @@ if ! "$ROOT/scripts/setup_netns.sh"; then
 fi
 
 start_npf() { # start_npf <mode> <workers> <log>
-  ip netns exec ns-router "$NPF" run --config "$ROOT/configs/router.conf" --mode "$1" \
+  ip netns exec ns-router "$NPF" run "${RUN_ARGS[@]}" --config "$ROOT/configs/router.conf" --mode "$1" \
     --workers "$2" --pidfile "$WORK/npf.pid" --stats-file "$WORK/npf.stats" > "$3" 2>&1 &
   NPF_PID=$!
   for _ in $(seq 100); do

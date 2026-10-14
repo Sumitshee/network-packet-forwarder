@@ -64,6 +64,12 @@ class AfPacketBackend final : public IoBackend {
   // Frames thrown away before the pipeline saw them, because they did not fit in a buffer.
   [[nodiscard]] std::uint64_t rx_oversized() const noexcept { return rx_oversized_; }
 
+  // [phase 16] Frames the kernel dropped before this backend could read them -- its receive
+  // buffers full -- since the sockets were opened: PACKET_STATISTICS, summed over the receiving
+  // sockets. Not on the datapath: a system call per socket. Not const: the kernel resets its count
+  // on every read, so the backend keeps the running total.
+  [[nodiscard]] std::uint64_t kernel_rx_drops() noexcept;
+
  private:
   struct Socket {
     core::UniqueFd fd;
@@ -84,6 +90,7 @@ class AfPacketBackend final : public IoBackend {
   std::size_t next_port_{0};  // the index in rx_ports_ the next rx_burst starts at, so none is
                               // always last
   std::uint64_t rx_oversized_{0};
+  std::uint64_t kernel_rx_drops_{0};
 };
 
 }  // namespace npf::io
