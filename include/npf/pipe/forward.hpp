@@ -243,6 +243,11 @@ class Forwarder {
   // Batched entry point used by the worker loop.
   void process_burst(core::Packet** pkts, std::size_t n, Decision* out) noexcept {
     for (std::size_t i = 0; i < n; ++i) {
+      // The next frame's first cache line, its Ethernet and IPv4 headers, on its way in while this
+      // one is decided (docs/performance.md entry 6). A prefetch never faults.
+      if (i + 1 < n) {
+        __builtin_prefetch(pkts[i + 1]->data().data());
+      }
       out[i] = process(*pkts[i]);
     }
   }

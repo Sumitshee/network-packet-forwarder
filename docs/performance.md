@@ -557,6 +557,37 @@ buffer, which CI's `-Werror` would have refused.
 **Caveat:** the 1500-byte result is `bench_checksum`'s, a loop over one buffer that stays in the
 L1 cache.
 
+### Entry 6: prefetch the next packet's headers (NOISE: reverted)
+
+**Change:** `Forwarder::process_burst()` issues `__builtin_prefetch` for the first cache line of
+packet *i + 1*'s frame -- its Ethernet and IPv4 headers -- before deciding packet *i*. This is the
+DPDK habit `docs/BUILD_PLAN.md` names.
+
+**Before:** commit `3aacba3`. **After:** that, plus the change. Bursts of 32, the default.
+
+| Benchmark, metric | Before: median (min – p95) | After: median (min – p95) | Delta | Noise band | Rounds | Verdict |
+|---|---:|---:|---:|---:|---:|---|
+| `full_datapath/dir24_8/topology`, cycles | 286.3 (280.0 – 291.7) | 291.7 (283.6 – 304.9) | +5.5 (+1.9%) | 13.1 | +3.4, +13.1 | NOISE |
+| `full_datapath/linear/topology`, cycles | 298.4 (288.4 – 310.6) | 301.0 (291.7 – 308.5) | +2.6 (+0.9%) | 12.2 | +3.2, +3.9 | NOISE |
+
+**Delta:** +5.5 cycles per packet on DIR-24-8, and +2.6 on
+the linear table. Both are slower, if anything, and both are inside their bands.
+
+**Verdict: noise. The change is reverted** in the next commit.
+
+**What it says:**
+
+- A prefetch pays when the line it asks for is far away and nothing else would fetch it in time.
+  Here neither may be true.
+- `bench_datapath`'s 1024 frames take 2 MiB with their metadata, more than the 1.25 MiB of L2 but
+  well inside the L3, so a miss costs an L3 hit, not memory.
+- The pool lays the frames out at a fixed stride, in the order they are walked, which is the
+  pattern a hardware prefetcher follows on its own.
+- Which of these it was was not measured: no cache-miss counter was read.
+
+**Caveat:** a real backend's frames arrive from wherever the kernel copied them, with neither that
+order nor that stride. Phase 16's PACKET_MMAP ring is where to measure this again.
+
 ## Phase 3: checksum microbenchmark (tier A)
 
 **What.** `bench/micro/bench_checksum.cpp` times the three checksum paths in
