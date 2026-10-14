@@ -1,13 +1,48 @@
 #pragma once
 
+#include <sys/mman.h>
+
 #include <cstddef>
 #include <cstdint>
+#include <new>
 #include <npf/table/fib.hpp>
 #include <optional>
 #include <span>
 #include <vector>
 
 namespace npf::table {
+
+// [phase 15] Memory that asks the kernel for transparent huge pages before anything touches it
+// (docs/performance.md entry 10). tbl24's 32 MiB takes 8192 4 KiB pages, far more than a TLB
+// holds, so random lookups miss in the TLB as well as in the caches; in 2 MiB pages it is 16. The
+// allocation is aligned to 2 MiB, which huge pages need, and madvise() comes before the first
+// write, which is when the kernel chooses the page size. MADV_HUGEPAGE is a hint: a kernel that
+// refuses it leaves the table on small pages, working as before. Start-up code only.
+template <class T>
+struct HugePageAllocator {
+  using value_type = T;
+  static constexpr std::size_t kHugePage = std::size_t{2} << 20U;
+
+  HugePageAllocator() = default;
+  template <class U>
+  explicit HugePageAllocator(const HugePageAllocator<U>& /*other*/) noexcept {}
+
+  [[nodiscard]] T* allocate(std::size_t n) {
+    const std::size_t bytes = rounded(n);
+    void* p = ::operator new(bytes, std::align_val_t{kHugePage});
+    ::madvise(p, bytes, MADV_HUGEPAGE);
+    return static_cast<T*>(p);
+  }
+  void deallocate(T* p, std::size_t n) noexcept {
+    ::operator delete(p, rounded(n), std::align_val_t{kHugePage});
+  }
+  friend bool operator==(const HugePageAllocator&, const HugePageAllocator&) noexcept = default;
+
+ private:
+  static std::size_t rounded(std::size_t n) noexcept {
+    return (n * sizeof(T) + kHugePage - 1) / kHugePage * kHugePage;
+  }
+};
 
 // DIR-24-8 (Gupta, Lin and McKeown, 1998): the address's top 24 bits index a table of 2^24 two-byte
 // entries, so a match of /24 or shorter takes one load, and a longer one a second load from a group
@@ -88,7 +123,7 @@ class Dir24_8Lpm final : public Fib {
   void rewrite_owned(Prefix p, Owner next);
   void collapse_if_short(std::size_t block);
 
-  std::vector<std::uint16_t> tbl24_;
+  std::vector<std::uint16_t, HugePageAllocator<std::uint16_t>> tbl24_;
   std::vector<std::uint16_t> tbl_long_;
   std::vector<NextHop> nexthops_;         // by id
   std::vector<std::uint16_t> hop_order_;  // ids sorted by their NextHop, to find a hop's id

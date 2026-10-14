@@ -1,0 +1,10 @@
+# docs/performance.md entry 10: /proc/self/smaps_rollup of a process holding one empty
+# Dir24_8Lpm (tbl24, 32 MiB), built from commit f62ed72 without and with the change.
+# g++-13 -O2 -std=c++20 -Iinclude thp_check.cpp src/table/lpm_dir24_8.cpp
+# /sys/kernel/mm/transparent_hugepage/enabled: always [madvise] never
+before (f62ed72):
+Rss:               36088 kB
+AnonHugePages:         0 kB
+after (f62ed72 plus HugePageAllocator for tbl24):
+Rss:               36108 kB
+AnonHugePages:     32768 kB

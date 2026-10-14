@@ -31,9 +31,9 @@ struct Run {
   std::size_t count;
 };
 
-template <class T>
-std::size_t bytes(const std::vector<T>& v) noexcept {
-  return v.capacity() * sizeof(T);
+template <class Vector>
+std::size_t bytes(const Vector& v) noexcept {
+  return v.capacity() * sizeof(typename Vector::value_type);
 }
 
 template <class T>

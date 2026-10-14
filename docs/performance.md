@@ -692,6 +692,57 @@ an indirect call that is never mispredicted, and that is below the noise.
 the predictor more trouble. This entry does not claim the template was unnecessary, only that its
 saving is not measurable here.
 
+### Entry 10: DIR-24-8's table on transparent huge pages (NOISE: reverted)
+
+**Change:**
+
+- `tbl24`, DIR-24-8's first-level table, is 2^24 two-byte entries, 32 MiB: 8192 pages of 4 KiB,
+  far more than the TLB holds, so uniformly random lookups should miss in the TLB as well as in
+  the caches.
+- It now comes from a `HugePageAllocator`: 2 MiB-aligned memory, `madvise(MADV_HUGEPAGE)` before
+  the first write, which is when the kernel chooses the page size. This kernel's transparent huge
+  pages are in `madvise` mode, so without the hint it uses none.
+
+**It took effect.** `bench/results/2026-10-14-f62ed72-thp-check.txt` has the `AnonHugePages` of a
+process holding one table:
+
+- 0 kB before the change;
+- 32,768 kB after it: the whole table, in 16 pages of 2 MiB.
+
+**Before:** commit `f62ed72`. **After:** that, plus the change. The benchmark is `bench_lpm`'s
+lookups, on the full RouteViews table and the 100k sample. It counts no cycles, so it is decided on
+ns, which entry 0 showed to be the weaker metric.
+
+| `bench_lpm` (no cycle counter), ns per lookup | Before: median (min – p95) | After: median (min – p95) | Delta | Noise band | Rounds | Verdict |
+|---|---:|---:|---:|---:|---:|---|
+| `lookup/dir24_8/full/uniform`, ns | 17.5 (16.5 – 18.0) | 18.1 (16.2 – 19.2) | +0.7 (+3.8%) | 1.0 | +0.8, +0.5 | NOISE |
+| `lookup/dir24_8/full/zipf`, ns | 8.3 (7.5 – 10.1) | 7.9 (7.5 – 10.7) | -0.3 (-4.1%) | 2.8 | -0.4, -0.2 | NOISE |
+| `lookup/dir24_8/full/sequential`, ns | 5.4 (5.2 – 6.3) | 5.3 (5.2 – 5.9) | -0.1 (-1.9%) | 0.9 | -0.4, +0.3 | NOISE |
+| `lookup/dir24_8/100k/uniform`, ns | 14.6 (12.7 – 16.8) | 13.8 (12.7 – 14.7) | -0.8 (-5.3%) | 2.2 | -1.3, +0.1 | NOISE |
+| `lookup/dir24_8/100k/zipf`, ns | 7.3 (6.3 – 9.8) | 7.0 (6.2 – 11.0) | -0.3 (-3.9%) | 4.1 | -1.4, +1.5 | NOISE |
+| `lookup/dir24_8/100k/sequential`, ns | 5.4 (5.0 – 6.5) | 5.5 (5.2 – 6.2) | +0.1 (+1.7%) | 1.1 | -0.8, +0.8 | NOISE |
+
+**Delta:**
+
+- Every case is noise. With uniform keys on the full table, the case the change is for: the after
+  median is +0.66 ns (+3.8%), against a band of
+  1.03 ns.
+
+**Verdict: noise. The change is reverted** in the next commit.
+
+**What it says:**
+
+- The guest's huge pages exist, but the lookups did not speed up, so the TLB misses were not what
+  made them slow.
+- Why was not measured. One hypothesis: this is a Hyper-V guest, and a guest's 2 MiB page is only
+  as good as the host's backing for it. If the host maps it with 4 KiB pages, the second level of
+  translation still misses as before.
+- `docs/BUILD_PLAN.md` asked for this experiment with "`MAP_HUGETLB` may not work in WSL2, THP
+  usually does". THP did work; it did not help.
+
+**Caveat:** on bare metal, the same change may well pay. No TLB-miss counter was read, here or
+there.
+
 ## Phase 3: checksum microbenchmark (tier A)
 
 **What.** `bench/micro/bench_checksum.cpp` times the three checksum paths in
