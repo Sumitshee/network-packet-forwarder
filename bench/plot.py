@@ -97,7 +97,7 @@ def newest_result():
 
 def title(result, what):
     c = result["context"]
-    return f"{what}: commit {c['git_sha'][:7]}, {c['cpu_model']}"
+    return f"{what}\ncommit {c['git_sha'][:7]}, {c['cpu_model']}"
 
 
 def plot_tier_a(result, out):
@@ -115,8 +115,8 @@ def plot_tier_a(result, out):
     ax.errorbar(medians, ys, xerr=[[m - stats[n]["min"] for n, m in zip(names, medians)],
                                    [stats[n]["max"] - m for n, m in zip(names, medians)]],
                 fmt="none", ecolor="black", capsize=2, linewidth=0.8)
-    for y, m in zip(ys, medians):
-        ax.text(m, y, f" {m:.1f}", va="center", fontsize="x-small")
+    for y, n, m in zip(ys, names, medians):  # past the end of the error bar, clear of it
+        ax.text(stats[n]["max"], y, f"  {m:.1f}", va="center", fontsize="x-small")
     ax.set_yticks(list(ys), names, fontsize="small")
     ax.invert_yaxis()
     ax.set_xlabel("ns per packet (median of the repetitions; bar: min to max)")
@@ -152,8 +152,9 @@ def plot_throughput(result, out):
                 xerr=[[d - s["delivered_pps"]["min"] / 1e3 for d, s in zip(delivered, summaries)],
                       [s["delivered_pps"]["max"] / 1e3 - d for d, s in zip(delivered, summaries)]],
                 fmt="none", ecolor="black", capsize=2, linewidth=0.8)
-    for y, d in zip(ys, delivered):
-        ax.text(d, y + 0.2, f" {d:.0f}k", va="center", fontsize="x-small")
+    for y, d, s in zip(ys, delivered, summaries):
+        ax.text(s["delivered_pps"]["max"] / 1e3, y + 0.2, f"  {d:.0f}k", va="center",
+                fontsize="x-small")
     ax.set_yticks(ys, names)
     ax.invert_yaxis()
     ax.set_xlabel("thousand datagrams per second (median of the repetitions; bar: min to max)")
@@ -183,6 +184,8 @@ def plot_latency(result, out):
         for y, v in zip(ys, values):
             ax.text(v, y + offset, f" {v:.0f}", va="center", fontsize="xx-small")
     ax.set_xscale("log")
+    ticks = [10, 20, 50, 100, 200, 500, 1000]
+    ax.set_xticks(ticks, [str(t) for t in ticks])
     ax.set_yticks(ys, names)
     ax.invert_yaxis()
     ax.set_xlabel("one-way latency, µs, log scale (median over the repetitions of each percentile)")

@@ -168,7 +168,176 @@ were not tried.
 
 ## Phase 14: baseline (both tiers)
 
-TBD: the baseline run of `scripts/run_bench.sh --all` has not been made yet.
+**Run.** `bench/results/2026-10-14-8f4c957.json`, written by
+`sudo ./scripts/run_bench.sh --all` on 2026-10-14 (UTC):
+
+- **Code:** commit `8f4c957`, built from a tree cleaned with `git clean -xdf -e data -e .deps-cache`.
+- **Build:** the `bench` preset, GCC 13.3.0, `-O2 -g -DNDEBUG -std=c++20 -march=native` and the
+  project's warning flags. The JSON keeps the exact compile command.
+- **Machine:** same as above. The `perf` tool is still not installed, so `perf stat -e cycles`
+  failed. The counters work through `perf_event_open`.
+- **Duration:** the run took 27 minutes.
+- **Load:**
+  - The script started each tier A benchmark once the one-minute load average was below 0.5.
+  - Google Benchmark, which reads it a moment later with that benchmark's data loaded, recorded
+    between 0.47 and 0.61.
+
+### Tier A: the forwarding code
+
+`bench_datapath`, per packet. Each iteration is a burst of 32, and its time is divided by 32.
+Medians of 7 repetitions, p95 (the slowest of the 7), the range, and user-mode cycles per packet:
+
+| Benchmark | Median ns/packet | p95 | Min – max | Cycles/packet (median) |
+|---|---:|---:|---:|---:|
+| `parse_only` | 9.8 | 12.8 | 8.8 – 12.8 | 26 |
+| `parse_only/refilled` | 10.8 | 11.0 | 9.9 – 11.0 | 25 |
+| `parse_and_lookup/linear/topology` | 16.5 | 17.6 | 13.6 – 17.6 | 38 |
+| `full_datapath/linear/topology` | 122.6 | 138.6 | 109.0 – 138.6 | 289 |
+| `parse_and_lookup/binary_trie/topology` | 99.9 | 127.5 | 95.7 – 127.5 | 248 |
+| `full_datapath/binary_trie/topology` | 202.9 | 218.0 | 194.1 – 218.0 | 480 |
+| `parse_and_lookup/binary_trie/100k` | 169.6 | 198.2 | 152.2 – 198.2 | 458 |
+| `full_datapath/binary_trie/100k` | 393.2 | 428.8 | 304.6 – 428.8 | 813 |
+| `parse_and_lookup/patricia/topology` | 19.0 | 23.0 | 15.7 – 23.0 | 45 |
+| `full_datapath/patricia/topology` | 127.2 | 150.4 | 105.8 – 150.4 | 303 |
+| `parse_and_lookup/patricia/100k` | 299.7 | 331.7 | 230.0 – 331.7 | 632 |
+| `full_datapath/patricia/100k` | 414.1 | 493.3 | 395.4 – 493.3 | 1006 |
+| `parse_and_lookup/dir24_8/topology` | 13.6 | 15.5 | 12.3 – 15.5 | 33 |
+| `full_datapath/dir24_8/topology` | 116.2 | 121.5 | 92.9 – 121.5 | 287 |
+| `parse_and_lookup/dir24_8/100k` | 13.3 | 15.0 | 11.5 – 15.0 | 34 |
+| `full_datapath/dir24_8/100k` | 121.0 | 130.8 | 117.4 – 130.8 | 300 |
+
+What the table shows:
+
+- **The steps beyond parsing and lookup are most of the cost of a forwarded packet.**
+  - With DIR-24-8 and the topology's routes, `full_datapath` is 116.2 ns and 287 cycles per
+    packet. Parsing plus the lookup is 13.6 ns and 33 cycles of that, which leaves 102.6 ns and
+    254 cycles.
+  - That remainder covers the rest of the fourteen steps of ARCHITECTURE.md §11: the checksum
+    check, the martian and local-address checks, the filter, the ARP lookup, the rewrite with its
+    incremental checksum, and the burst's bookkeeping.
+  - Which of these costs what was not measured. It is the first candidate below.
+- **The table's size matters only for the tries.**
+  - DIR-24-8's parse and lookup takes 13.6 ns with the topology's 3 routes and 13.3 ns with 100k
+    routes.
+  - The binary trie goes from 99.9 to 169.6 ns, and Patricia from 19.0 to 299.7 ns.
+  - With 100k routes, `full_datapath` costs 121.0 ns on DIR-24-8 against 393.2 ns on the binary
+    trie and 414.1 ns on Patricia.
+- **The refill pause leaves little in the timings.** `parse_only/refilled`, which pauses as
+  `full_datapath` does, has a median 1.0 ns per packet above `parse_only` (10.8 against 9.8). That
+  is inside `parse_only`'s own range of 8.8 to 12.8 ns.
+
+`bench_pool` and `bench_ring`. The burst benchmarks are per packet; the others are per operation,
+and `ring_round_trip` is per round trip:
+
+| Benchmark | Median ns per packet or operation | p95 | Min – max |
+|---|---:|---:|---:|
+| `pool_acquire_release` | 4.99 | 5.62 | 4.46 – 5.62 |
+| `pool_acquire_release/burst` | 3.44 | 4.11 | 2.97 – 4.11 |
+| `ring_push_pop` | 2.32 | 2.91 | 2.03 – 2.91 |
+| `ring_round_trip/real_time/threads:2` | 155.72 | 227.26 | 94.52 – 227.26 |
+| `ring_throughput/real_time/threads:2` | 2.26 | 2.49 | 1.91 – 2.49 |
+
+- **A ring round trip between two cores** takes a median of 155.72 ns, with a range from 94.52 to
+  227.26 ns over 7 repetitions: the widest spread in tier A.
+- **Streamed in bursts of 32**, a packet costs 2.26 ns to pass from one thread to the other.
+
+The run also repeated `bench_lpm` on the full RouteViews table. Its numbers are in the same JSON;
+phase 10's section below remains the account of them.
+
+![bench_datapath: ns per packet of every benchmark](img/baseline_tier_a.svg)
+
+### Tier B: the router, through the namespaces
+
+**Throughput.** gen sends as fast as it can. Medians of 5 repetitions of 10 s, with the range of
+delivered rate and loss. npf's CPU is a share of one CPU; the machine's busy time is a share of
+all 8:
+
+| Configuration | Offered, kpps | Delivered, kpps (min – max) | Loss, % (min – max) | npf CPU, % of one | Machine busy, % of 8 | npf peak RSS, MiB |
+|---|---:|---:|---:|---:|---:|---:|
+| kernel control | 306.6 | 306.6 (283.8 – 336.0) | 0.0 (0.0 – 0.0) | – | 19 | – |
+| npf pipeline, 1 worker | 268.9 | 99.9 (91.9 – 106.1) | 62.2 (60.6 – 65.8) | 198 | 42 | 29.0 |
+| npf pipeline, 2 workers | 242.2 | 203.8 (172.0 – 211.2) | 15.6 (11.4 – 16.1) | 297 | 57 | 37.9 |
+| npf pipeline, 4 workers | 251.7 | 251.6 (225.9 – 258.2) | 0.1 (0.0 – 0.8) | 381 | 68 | 55.1 |
+| npf rtc, 1 worker | 423.6 | 257.5 (224.3 – 275.5) | 37.6 (36.4 – 39.2) | 95 | 30 | 12.2 |
+| npf rtc, 2 workers | 300.2 | 292.3 (260.2 – 309.9) | 2.6 (2.4 – 3.4) | 161 | 39 | 20.6 |
+| npf rtc, 4 workers | 83.1 | 82.9 (79.9 – 84.4) | 0.2 (0.0 – 1.5) | 137 | 31 | 37.2 |
+
+![tier B throughput: offered and delivered datagrams per second, and loss](img/baseline_throughput.svg)
+
+**Latency.** gen sends 20,000 datagrams a second. Medians over the 5 repetitions of each
+percentile, with the range of the p50:
+
+| Configuration | p50, µs (min – max) | p95, µs | p99, µs | p99.9, µs | npf CPU, % of one | Machine busy, % of 8 |
+|---|---:|---:|---:|---:|---:|---:|
+| kernel control | 28.5 (27.8 – 29.3) | 82 | 432 | 4269 | – | 13 |
+| npf pipeline, 1 worker | 115.1 (103.6 – 118.8) | 253 | 771 | 3904 | 112 | 28 |
+| npf pipeline, 2 workers | 114.1 (111.3 – 129.2) | 184 | 422 | 2656 | 145 | 32 |
+| npf pipeline, 4 workers | 116.9 (113.3 – 138.8) | 189 | 410 | 2867 | 164 | 34 |
+| npf rtc, 1 worker | 58.2 (56.7 – 58.9) | 148 | 410 | 3279 | 46 | 20 |
+| npf rtc, 2 workers | 58.5 (58.2 – 58.8) | 119 | 311 | 3651 | 49 | 20 |
+| npf rtc, 4 workers | 62.7 (61.7 – 65.5) | 128 | 307 | 2411 | 57 | 21 |
+
+![tier B latency: p50, p95 and p99 at 20,000 datagrams a second](img/baseline_latency.svg)
+
+npf's own counters at the end of each configuration's ten repetitions, warm-ups and pings
+included. They balanced in every configuration, and every buffer was back in its pool:
+
+| Configuration | rx_packets | forwarded | RingFull |
+|---|---:|---:|---:|
+| npf pipeline, 1 worker | 14,992,507 | 6,232,392 | 8,760,110 |
+| npf pipeline, 2 workers | 13,144,235 | 11,414,264 | 1,729,966 |
+| npf pipeline, 4 workers | 13,944,240 | 13,942,079 | 2,156 |
+| npf rtc, 1 worker | 14,260,892 | 14,260,887 | 0 |
+| npf rtc, 2 workers | 16,176,433 | 16,176,428 | 0 |
+| npf rtc, 4 workers | 5,337,316 | 5,337,312 | 0 |
+
+What the tables show, and what they cannot:
+
+- **The kernel control was not saturated.**
+  - It delivered everything gen offered, 306.6 kpps at a median, with 0.0% loss in every
+    repetition, so this run does not show the kernel's capacity.
+  - The machine was 19% busy.
+  - As the methodology says, on veth that work lands mostly on gen's own CPU.
+- **Run-to-completion with 1 worker loses packets before npf ever sees them.**
+  - gen offered 423.6 kpps; 257.5 kpps arrived, a loss of 37.6%.
+  - Yet npf's counters show 14,260,892 packets received and 14,260,887 forwarded: the other five
+    were the router's own (`to_host`), and none was dropped.
+  - Every lost packet was lost in the kernel, before npf read it, most likely when a socket's
+    receive buffer overflowed. npf has no counter for that, and the kernel's (`PACKET_STATISTICS`)
+    was not read. It is a candidate below.
+  - With 1 worker, npf used 95% of one CPU.
+- **Pipeline mode with 1 worker drops what its one worker cannot take, and counts it.**
+  - The RX threads received 14,992,507 packets and dropped 8,760,110 of them as `RingFull`.
+  - With 2 workers that fell to 1,729,966; with 4, to 2,156, at 0.1% loss.
+  - The RX threads are extra threads, and it shows in the CPU time: pipeline mode used 198% of a
+    CPU with 1 worker, against 95% for run-to-completion with 1.
+- **The offered rate is not the same from one configuration to the next.**
+  - gen sent 423.6 kpps into npf with 1 run-to-completion worker, but 83.1 kpps into npf with 4.
+  - With 4 workers, gen itself was slowed, by work it does on the receiving side's behalf
+    (methodology), and npf delivered all but 0.2% of what it was given.
+  - Why 4 workers cost the sender so much more than 1 or 2 was not measured. It is a candidate.
+  - Delivered rates compare as delivered rates only: none of these configurations was driven to
+    its own limit by a sender independent of it.
+- **At 20,000 datagrams a second nothing was lost, and latency separates the models.**
+  - The median one-way latency was 28.5 µs through the kernel, 58.2 µs through npf with 1
+    run-to-completion worker, and 115.1 µs with pipeline mode's 1 worker.
+  - Pipeline mode passes each packet through one more thread and one more wake-up.
+  - Every configuration's p99.9 was in the milliseconds, the kernel's included: 4269 µs. A run
+    this short on a virtual machine cannot say where those come from.
+- **An idle-ish npf is not free.** At 20,000 datagrams a second npf used 46% of a CPU with 1
+  run-to-completion worker, and 112% in pipeline mode with 1 worker. The machine was 13% busy
+  with the kernel forwarding the same traffic.
+
+### What this baseline does not measure
+
+All of the methodology's list, and besides:
+
+- **One run, on one day.** The spread shown is across the repetitions of this run. A second run
+  might differ by more, especially in tier B, whose throughput ranges are wide: the kernel
+  control's delivered rate ranged from 283.8 to 336.0 kpps.
+- **Busy-polling.** npf ran with `poll()` and its 100 ms timeout, the default; `--busy-poll` was not
+  measured.
+- **Other frame sizes, flow counts or rates.** Only 70-byte frames, 16 flows, and the two rates.
 
 ## Phase 3: checksum microbenchmark (tier A)
 
@@ -535,11 +704,22 @@ trie and 21.1 for DIR-24-8.
 
 Ideas noted for later phases, not done.
 
-- **Count cycles, not only wall time** (phase 14). The hardware counters work here, see above.
-  Reporting cycles per call next to nanoseconds would remove clock-speed swings like run 1's from
-  comparisons of code.
-- **Nodes visited and cache misses per lookup** (phase 14), to test what phase 10 offers as
-  explanations, Patricia's slowness above all.
+- **Where `full_datapath`'s time goes** (phase 15). In the phase 14 baseline, the steps of
+  `process()` beyond parsing and the FIB lookup cost 254 cycles per packet with DIR-24-8. Timing
+  each step on its own -- or counting cycles around it -- would say which of them to look at
+  first, before any change to the datapath.
+- **The kernel's own drop count** (phase 15 or 16). In the baseline, npf with 1 run-to-completion
+  worker lost 37.6% of what gen offered before reading it. Reading `PACKET_STATISTICS` from each
+  socket at the end of a run would put that loss in the result, as a number; PACKET_MMAP (phase 16)
+  may move it.
+- **Why 4 run-to-completion workers slow the sender** (phase 15). gen offered 83.1 kpps into npf
+  with 4 workers against 423.6 kpps with 1. What the sender's CPU does on the receiving side's
+  behalf, per fanout socket and per wake-up, was not measured.
+- **Busy-polling against `poll()`** (phase 15): the same baseline with `--busy-poll`, for latency
+  and for CPU time.
+- **Nodes visited and cache misses per lookup**, to test what phase 10 offers as explanations,
+  Patricia's slowness above all. Cycles per packet are now counted (`bench_datapath`); cache misses
+  are not yet.
 - **Sequential keys from the lowest prefix other than the default route**, in `bench_lpm`, so that
   at the full table that column passes through routed space.
 - **The latency of one lookup**: a variant of `bench_lpm`'s lookups in which each address depends on
