@@ -30,6 +30,32 @@ ArpCache::~ArpCache() {
   flush();
 }
 
+ArpCache::Entry* ArpCache::find(std::uint32_t ip) noexcept {
+  const std::span<Entry> live(entries_.data(), size_);
+  const auto it = std::ranges::find(live, ip, &Entry::ip);
+  return it == live.end() ? nullptr : &*it;
+}
+
+const ArpCache::Entry* ArpCache::find(std::uint32_t ip) const noexcept {
+  const std::span<const Entry> live(entries_.data(), size_);
+  const auto it = std::ranges::find(live, ip, &Entry::ip);
+  return it == live.end() ? nullptr : &*it;
+}
+
+std::optional<proto::MacAddr> ArpCache::lookup(std::uint32_t ip) noexcept {
+  Entry* e = find(ip);
+  if (e == nullptr || e->state == ArpState::Incomplete) {
+    return std::nullopt;
+  }
+  e->used = now_;
+  // Forward on the MAC the cache has, and ask in the background whether it still holds. tick()
+  // sends the rest of the revalidation's probes, so a stream of packets is not a stream of them.
+  if (e->state == ArpState::Stale && e->probes == 0) {
+    probe(*e);
+  }
+  return e->mac;
+}
+
 // NOLINTNEXTLINE(bugprone-easily-swappable-parameters): ARCHITECTURE.md §6's signature
 bool ArpCache::resolve_and_queue(std::uint32_t ip, std::uint16_t out_port,
                                  core::Packet* p) noexcept {
