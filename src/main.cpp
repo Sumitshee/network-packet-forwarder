@@ -1,14 +1,16 @@
 // npf, the router.
 //
-//   npf run --config <file> [--io af_packet|mmap] [--mode rtc|pipeline] [--workers <n>]
-//           [--pidfile <path>] [--stats-file <path>] [--busy-poll]
+//   npf run --config <file> [--io af_packet|mmap|xdp] [--xdp-mode skb|native]
+//           [--mode rtc|pipeline] [--workers <n>] [--pidfile <path>] [--stats-file <path>]
+//           [--busy-poll]
 //       Forwards until SIGINT or SIGTERM, with a stats line every 5 s. --mode and --workers stand
 //       in for the configuration's own: n workers, each running to completion on sockets of its
 //       own (rtc), or fed by an RX thread per port (pipeline). --io likewise stands in for the
-//       configuration's io: AF_PACKET with a system call per frame, or PACKET_MMAP's rings. SIGUSR1
-//       prints the whole counter table and writes it to the stats file, which is how `npf show
-//       stats` reads it. SIGRTMIN and SIGRTMIN+1 write the MAC table and the ARP cache next to it,
-//       with the extensions .mac and .arp, for `npf show mac` and `npf show arp`, a section per
+//       configuration's io: AF_PACKET with a system call per frame, PACKET_MMAP's rings, or
+//       AF_XDP (one worker, run to completion), its XDP program in --xdp-mode, skb by default.
+//       SIGUSR1 prints the whole counter table and writes it to the stats file, which is how `npf
+//       show stats` reads it. SIGRTMIN and SIGRTMIN+1 write the MAC table and the ARP cache next to
+//       it, with the extensions .mac and .arp, for `npf show mac` and `npf show arp`, a section per
 //       worker when there are several. SIGUSR2 empties the ARP caches of all but their static
 //       entries, for tests.
 //   npf dump --iface <name>
@@ -55,6 +57,7 @@
 #include <npf/core/time.hpp>
 #include <npf/core/unique_fd.hpp>
 #include <npf/io/af_packet.hpp>
+#include <npf/io/af_xdp.hpp>
 #include <npf/io/backend.hpp>
 #include <npf/io/packet_mmap.hpp>
 #include <npf/io/pcap_file.hpp>
@@ -96,8 +99,9 @@ using npf::proto::format_ipv4;
 using npf::proto::format_mac;
 
 constexpr std::string_view kUsage =
-    "usage: npf run --config <file> [--io af_packet|mmap] [--mode rtc|pipeline] [--workers <n>]\n"
-    "               [--pidfile <path>] [--stats-file <path>] [--busy-poll]\n"
+    "usage: npf run --config <file> [--io af_packet|mmap|xdp] [--xdp-mode skb|native]\n"
+    "               [--mode rtc|pipeline] [--workers <n>] [--pidfile <path>]\n"
+    "               [--stats-file <path>] [--busy-poll]\n"
     "       npf dump --iface <name>\n"
     "       npf show stats|mac|arp [--pidfile <path>] [--stats-file <path>]\n"
     "       npf replay <in.pcap> <out.pcap> --config <file> [--stats-json <path>]\n";
@@ -132,6 +136,7 @@ struct Options {
   bool busy_poll{false};
   std::optional<npf::core::RunMode> mode;  // run's: nullopt keeps the configuration's
   std::optional<npf::core::IoKind> io;
+  std::optional<npf::io::XdpMode> xdp_mode;  // run's, with --io xdp
   std::optional<std::size_t> workers;
   std::vector<std::filesystem::path> files;  // replay's: the pcap to read, then the one to write
   std::filesystem::path stats_json;
@@ -152,10 +157,23 @@ std::size_t parse_count(std::string_view text, std::string_view what) {
 }
 
 npf::core::IoKind parse_io(std::string_view value) {
-  if (value != "af_packet" && value != "mmap") {
-    throw UsageError(std::format("--io is af_packet or mmap, not '{}'", value));
+  if (value == "af_packet") {
+    return npf::core::IoKind::AfPacket;
   }
-  return value == "mmap" ? npf::core::IoKind::Mmap : npf::core::IoKind::AfPacket;
+  if (value == "mmap") {
+    return npf::core::IoKind::Mmap;
+  }
+  if (value == "xdp") {
+    return npf::core::IoKind::Xdp;
+  }
+  throw UsageError(std::format("--io is af_packet, mmap or xdp, not '{}'", value));
+}
+
+npf::io::XdpMode parse_xdp_mode(std::string_view value) {
+  if (value != "skb" && value != "native") {
+    throw UsageError(std::format("--xdp-mode is skb or native, not '{}'", value));
+  }
+  return value == "native" ? npf::io::XdpMode::Native : npf::io::XdpMode::Skb;
 }
 
 npf::core::RunMode parse_mode(std::string_view value) {
@@ -183,6 +201,8 @@ bool set_option(Options& o, const Flag& flag) {
     o.workers = parse_count(flag.value, "--workers");
   } else if (flag.name == "--io" && o.command == "run") {
     o.io = parse_io(flag.value);
+  } else if (flag.name == "--xdp-mode" && o.command == "run") {
+    o.xdp_mode = parse_xdp_mode(flag.value);
   } else if (flag.name == "--mode" && o.command == "run") {
     o.mode = parse_mode(flag.value);
   } else {
@@ -480,11 +500,22 @@ void require_supported(const npf::core::Config& cfg, npf::core::IoKind io) {
   if (io == npf::core::IoKind::Pcap && cfg.io != npf::core::IoKind::Pcap) {
     throw std::runtime_error("npf replay needs 'io pcap' in the configuration");
   }
-  if (io != npf::core::IoKind::Pcap && cfg.io != npf::core::IoKind::AfPacket &&
-      cfg.io != npf::core::IoKind::Mmap) {
+  if (io != npf::core::IoKind::Pcap && cfg.io == npf::core::IoKind::Pcap) {
     throw std::runtime_error(
-        "npf run needs 'io af_packet' or 'io mmap': io xdp is not implemented yet, and io pcap is "
-        "for npf replay");
+        "npf run needs 'io af_packet', 'io mmap' or 'io xdp': io pcap is for "
+        "npf replay");
+  }
+  if (io != npf::core::IoKind::Pcap && cfg.io == npf::core::IoKind::Xdp) {
+#ifndef NPF_HAVE_XDP
+    throw std::runtime_error(
+        "this npf was built without AF_XDP: install libbpf-dev and libxdp-dev, and configure "
+        "again");
+#endif
+    if (cfg.mode != npf::core::RunMode::Rtc || cfg.workers != 1) {
+      throw std::runtime_error(
+          "io xdp runs one worker, run to completion ('mode rtc', 'workers 1'): it has one AF_XDP "
+          "socket per port, on one queue, and no fanout");
+    }
   }
   if (cfg.fib != npf::core::FibKind::Linear) {
     throw std::runtime_error("only 'fib linear' is implemented so far");
@@ -540,6 +571,9 @@ npf::core::Config load_config_for(const Options& o, npf::core::IoKind io) {
   }
   if (o.io) {
     cfg.io = *o.io;
+  }
+  if (o.xdp_mode && cfg.io != npf::core::IoKind::Xdp) {
+    throw UsageError("--xdp-mode is for --io xdp");
   }
   require_supported(cfg, io);
   return cfg;
@@ -598,15 +632,25 @@ struct Totals {
   std::optional<std::uint64_t> kernel_rx_drops;
 };
 
-// The sockets a lane opens: AF_PACKET's or PACKET_MMAP's. sockets_per_port: how many sockets of
-// this kind share each port, which PACKET_MMAP splits its RX ring between.
+// The sockets a lane opens: AF_PACKET's, PACKET_MMAP's or AF_XDP's. sockets_per_port: how many
+// sockets of this kind share each port, which PACKET_MMAP splits its RX ring between.
 template <class Socket>
 std::unique_ptr<Socket> open_sockets(const npf::core::Config& cfg, PacketPool& pool,
                                      const npf::io::AfPacketOptions& options,
-                                     std::size_t sockets_per_port) {
+                                     std::size_t sockets_per_port,
+                                     [[maybe_unused]] npf::io::XdpMode xdp_mode) {
   if constexpr (std::is_same_v<Socket, npf::io::PacketMmapBackend>) {
     return std::make_unique<Socket>(cfg.interfaces, pool, options,
                                     npf::io::MmapRingSizes::shared_by(sockets_per_port));
+#ifdef NPF_HAVE_XDP
+  } else if constexpr (std::is_same_v<Socket, npf::io::AfXdpBackend>) {
+    // run-to-completion asks every worker's sockets to join a fanout group; with one worker, the
+    // only shape io xdp runs (require_supported), there is nothing to share with.
+    npf::io::AfPacketOptions single = options;
+    single.fanout = false;
+    single.fanout_groups.clear();
+    return std::make_unique<Socket>(cfg.interfaces, pool, single, xdp_mode);
+#endif
   } else {
     return std::make_unique<Socket>(cfg.interfaces, pool, options);
   }
@@ -661,8 +705,9 @@ class Engine {
                                                          : npf::pipe::RxOverflow::Drop;
 
  public:
-  Engine(npf::core::Config cfg, const npf::core::FilterConfig& rules, bool busy_poll)
-      : cfg_{std::move(cfg)}, busy_poll_{busy_poll} {
+  Engine(npf::core::Config cfg, const npf::core::FilterConfig& rules, bool busy_poll,
+         npf::io::XdpMode xdp_mode = npf::io::XdpMode::Skb)
+      : cfg_{std::move(cfg)}, busy_poll_{busy_poll}, xdp_mode_{xdp_mode} {
     if (cfg_.mode == npf::core::RunMode::Rtc) {
       build_rtc(rules);
     } else {
@@ -790,7 +835,7 @@ class Engine {
       if (w != 0) {
         options.fanout_groups = lanes_.front().sockets->fanout_groups();
       }
-      lane.sockets = open_sockets<Socket>(cfg_, *lane.pool, options, cfg_.workers);
+      lane.sockets = open_sockets<Socket>(cfg_, *lane.pool, options, cfg_.workers, xdp_mode_);
       if (w == 0) {
         take_macs(*lane.sockets, cfg_);
         shared_ = std::make_unique<SharedTables>(cfg_, rules);
@@ -816,7 +861,7 @@ class Engine {
       options.receive.assign(n_ports, false);
       options.receive[k] = true;
       options.quiet = k != 0;
-      lane.sockets = open_sockets<Socket>(cfg_, *lane.pool, options, 1);
+      lane.sockets = open_sockets<Socket>(cfg_, *lane.pool, options, 1, xdp_mode_);
     }
     take_macs(*rx_lanes_.front().sockets, cfg_);
     shared_ = std::make_unique<SharedTables>(cfg_, rules);
@@ -830,7 +875,7 @@ class Engine {
       npf::io::AfPacketOptions transmit_only;
       transmit_only.receive.assign(n_ports, false);
       transmit_only.quiet = true;
-      lane.sockets = open_sockets<Socket>(cfg_, *lane.pool, transmit_only, 1);
+      lane.sockets = open_sockets<Socket>(cfg_, *lane.pool, transmit_only, 1, xdp_mode_);
       lane.recycler = std::make_unique<npf::pipe::Recycler>(*lane.pool);
       std::vector<npf::pipe::PacketRing*> in;
       for (std::size_t k = 0; k < n_ports; ++k) {
@@ -909,6 +954,7 @@ class Engine {
 
   npf::core::Config cfg_;
   bool busy_poll_;
+  npf::io::XdpMode xdp_mode_;
   std::unique_ptr<SharedTables> shared_;
   std::unique_ptr<npf::pipe::PipelineRings> rings_;
   std::vector<RxLane> rx_lanes_;
@@ -991,7 +1037,8 @@ void serve(const Options& o, Engine& engine) {
 
 template <class Socket>
 int run_engine(const Options& o, npf::core::Config cfg, const npf::core::FilterConfig& rules) {
-  Engine<Socket> engine(std::move(cfg), rules, o.busy_poll);
+  Engine<Socket> engine(std::move(cfg), rules, o.busy_poll,
+                        o.xdp_mode.value_or(npf::io::XdpMode::Skb));
 
   serve(o, engine);
 
@@ -1015,6 +1062,11 @@ int run(const Options& o) {
   if (cfg.io == npf::core::IoKind::Mmap) {
     return run_engine<npf::io::PacketMmapBackend>(o, std::move(cfg), rules);
   }
+#ifdef NPF_HAVE_XDP
+  if (cfg.io == npf::core::IoKind::Xdp) {
+    return run_engine<npf::io::AfXdpBackend>(o, std::move(cfg), rules);
+  }
+#endif
   return run_engine<npf::io::AfPacketBackend>(o, std::move(cfg), rules);
 }
 

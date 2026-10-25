@@ -4,7 +4,7 @@ A userspace Layer-2/Layer-3 packet forwarding engine — a software router — w
 Linux. It receives raw Ethernet frames from network interfaces, parses them, makes forwarding
 decisions, rewrites headers and transmits them out of the correct interface.
 
-**Status: phase 16 of 19.** `npf` routes IPv4 between Linux interfaces. It runs every packet
+**Status: phase 17 of 19.** `npf` routes IPv4 between Linux interfaces. It runs every packet
 through a fixed fourteen-step pipeline: parse, validate, route,
 resolve the next hop, rewrite the MAC addresses, decrement the TTL and patch the checksum. Every
 packet it drops is counted under a reason. It resolves its neighbours with ARP itself: a packet
@@ -54,10 +54,26 @@ An integration test runs every golden case live through both and requires byte-i
 out of every port. In pipeline mode on `mmap`, the RX threads receive only what the workers'
 rings can take, and leave the rest waiting in the kernel. That measured as a large gain on
 `mmap` and a loss on `af_packet`, so `af_packet` keeps dropping as `RingFull`. The kernel's own
-receive drops are reported
-beside npf's counters as `kernel_rx_drops`. The 10 ms is a latency cost at low rates: a block
-that never fills waits for its timer. [`docs/performance.md`](docs/performance.md) compares the
-two backends.
+receive drops are reported beside npf's counters as `kernel_rx_drops`. The 10 ms is a latency
+cost at low rates: a block that never fills waits for its timer.
+[`docs/performance.md`](docs/performance.md) compares the backends.
+
+A third backend, `xdp`, uses AF_XDP:
+
+- On each port npf attaches a one-line XDP program, `bpf/xdp_redirect.c`, compiled with clang
+  and embedded in the binary. It hands every frame to an AF_XDP socket whose rings point into
+  memory npf registered with the kernel (a UMEM).
+- `--xdp-mode skb` runs the program in the kernel's generic receive path, and `native` in the
+  veth driver. Both work on veth, and are measured separately.
+- veth has no zero-copy, so the kernel copies each frame into the UMEM and out again. What
+  AF_XDP saves on receive is the kernel's network stack.
+- It runs one worker, run to completion: one socket per port, on one queue, with no fanout.
+- It is built only when libbpf and libxdp are installed.
+
+The stock WSL2 kernel already has AF_XDP, so no custom kernel was built.
+[`docs/wsl2-custom-kernel.md`](docs/wsl2-custom-kernel.md) says how to check, and how one would
+be built for a kernel that lacks it. The same integration test runs every golden case through
+`xdp` in both modes too.
 
 It is measured at two tiers, kept apart. Tier A times the forwarding code in process, with no I/O:
 parsing, FIB lookups in each of the four tables, the whole fourteen-step pipeline, the packet pool
@@ -156,6 +172,10 @@ sudo ip netns exec ns-router ./build/dev/npf run --config configs/router.conf --
 
 ```bash
 sudo ip netns exec ns-router ./build/dev/npf run --config configs/router.conf --io mmap
+```
+
+```bash
+sudo ip netns exec ns-router ./build/dev/npf run --config configs/router.conf --io xdp --xdp-mode native
 ```
 
 `bench/system/gen` sends numbered UDP flows from the client, and `scripts/check_ordering.py` checks a
@@ -325,14 +345,19 @@ ctest --preset dev -R golden --output-on-failure
   buffer, once on the way in and once on the way out. PACKET_MMAP saves the system call per
   frame, not the copies. With `mmap`, the 10 ms block timeout is fixed, as are the ring sizes:
   8 blocks of 4 MiB per port, shared between the sockets of a fanout group, and 512 TX slots.
+- **AF_XDP beyond one queue.** `--io xdp` binds one socket to queue 0 of each port: no
+  multi-queue, no shared UMEM, no fanout, so one worker, run to completion. It copies
+  (`XDP_COPY`), as it must on veth; zero-copy on a NIC that supports it is not tried. Native XDP
+  was only ever run on veth. The XDP program is not pinned: it lives as long as npf does.
 - **IPv4 options.** A header's options are skipped using its length field; none is interpreted.
 - **Fragment reassembly.** Fragments are never reassembled. Only a first (or only) fragment carries
   the transport header, so every other fragment is handled with no ports at all.
 - **TCP.** Only the header's fields are read: ports, sequence and acknowledgement numbers, flags.
   There is no connection state.
 - **Most configuration choices.** The configuration parser accepts every value the file format
-  defines, but `npf run` runs only `io af_packet` and `io mmap` (not `io xdp`), and `npf replay`
-  only `io pcap`, on one thread (`mode rtc`, `workers 1`); both only with `fib linear`. They refuse the rest: `fib trie`, `patricia` and
+  defines, but `npf run` runs only `io af_packet`, `io mmap` and `io xdp` (the last with one
+  worker, and only when built with libbpf and libxdp), and `npf replay` only `io pcap`, on one
+  thread (`mode rtc`, `workers 1`); both only with `fib linear`. They refuse the rest: `fib trie`, `patricia` and
   `dir24_8` name tables that exist and are tested, but the router is not built on them yet.
 
 ## Known limitations
@@ -351,6 +376,8 @@ them, is not covered.
 ## Building
 
 Requires Linux (developed on WSL2 Ubuntu 24.04), CMake ≥ 3.20, Ninja, and GCC 13 or Clang 18.
+The AF_XDP backend also needs `libbpf-dev`, `libxdp-dev` and clang, to compile its XDP program;
+without them it is left out, and `--io xdp` says so.
 
 ```bash
 cmake --preset dev && cmake --build --preset dev -j && ctest --preset dev

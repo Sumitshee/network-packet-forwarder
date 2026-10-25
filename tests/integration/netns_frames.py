@@ -24,6 +24,8 @@
     netns_frames.py same-frames <a.pcap> <b.pcap>
         Exit 0 if both files hold the same frames in the same order, timestamps aside; otherwise
         say where they first differ, and exit 1.
+    netns_frames.py same-frames-untagged <a.pcap> <b.pcap>
+        The same, with any outer VLAN tag taken out of every frame on both sides first.
     netns_frames.py same-frame-set <expected.pcap> <file>...
         Exit 0 if the files together hold exactly the frames <expected.pcap> does, in any order:
         a replay writes every port's frames to one file, and a live run's leave by several ports.
@@ -220,8 +222,10 @@ def send_pcap(iface, path):
             s.send(frame)
 
 
-def same_frames(a, b):
+def same_frames(a, b, strip_vlan=False):
     left, right = read_pcap(a), read_pcap(b)
+    if strip_vlan:
+        left, right = [untagged(f) for f in left], [untagged(f) for f in right]
     for i, (x, y) in enumerate(zip(left, right)):
         if x != y:
             print(f"frame {i + 1} differs:\n  {x.hex()}\n  {y.hex()}")
@@ -263,6 +267,7 @@ def main(argv):
         "send-pcap": (send_pcap, 2),
         "count": (lambda f: print(len(read_pcap(f))), 1),
         "same-frames": (same_frames, 2),
+        "same-frames-untagged": (lambda a, b: same_frames(a, b, strip_vlan=True), 2),
         "same-frame-set": (same_frame_set, -2),  # negative: at least that many
         "same-frame-set-untagged": (lambda *f: same_frame_set(*f, strip_vlan=True), -2),
     }

@@ -6,7 +6,8 @@
 #   sudo ./scripts/run_bench.sh --tier-b             npf through the namespaces, every model
 #   sudo ./scripts/run_bench.sh --all                all three, into one result
 #   sudo ./scripts/run_bench.sh --compare-io         the kernel control, then each configuration
-#                                                    on AF_PACKET and on PACKET_MMAP in turn
+#                                                    on AF_PACKET and on PACKET_MMAP in turn, and
+#                                                    rtc:1 on AF_XDP in skb and in native mode
 #   ... [--quick]                                    a rehearsal: 2 short repetitions, no
 #                                                    bench_lpm; written to bench/results/raw only
 #
@@ -109,6 +110,10 @@ IOS=("")  # "": router.conf's io, unless --npf-args says otherwise
 if ((COMPARE_IO)); then
   CONFIGS=("rtc 1" "rtc 2" "pipeline 2")
   IOS=(af_packet mmap)
+  # [phase 17] AF_XDP, when this npf was built with it: one worker, run to completion, only.
+  if ldd "$NPF" 2>/dev/null | grep -q libxdp; then
+    IOS+=(xdp:skb xdp:native)
+  fi
   # Each session its own result: the comparison is made within a session, and the sessions'
   # results are then set side by side (docs/performance.md, phase 15's lesson on spread).
   LABEL=${LABEL:-compare-io-$(date -u +%H%M)}
@@ -280,15 +285,23 @@ kernel_baseline() {
   fresh_topology
 }
 
-npf_config() { # npf_config <mode> <workers> [io]
-  local dir="$RAW/tier_b/npf-${3:+$3-}$1-$2" log io=${3:-} io_args=()
-  if [[ -n $io ]]; then
+npf_config() { # npf_config <mode> <workers> [io, or xdp:<mode>]
+  local dir log io=${3:-} io_args=()
+  if [[ $io == *:* ]]; then
+    io_args=(--io "${io%%:*}" --xdp-mode "${io#*:}")
+    io=${io/:/-}
+  elif [[ -n $io ]]; then
     io_args=(--io "$io")
   elif [[ $NPF_ARGS =~ --io[[:space:]]+([a-z_]+) ]]; then
     io=${BASH_REMATCH[1]}
   else
     io=$(awk '$1 == "io" { print $2 }' "$CONFIG")
   fi
+  if [[ $io == xdp ]]; then  # the result names the mode, skb unless --npf-args says native
+    io=xdp-skb
+    [[ $NPF_ARGS =~ --xdp-mode[[:space:]]+native ]] && io=xdp-native
+  fi
+  dir="$RAW/tier_b/npf-${3:+$io-}$1-$2"
   mkdir -p "$dir"
   log="$dir/npf.log"
   log "tier B: npf, mode $1, $2 workers, io $io"
@@ -320,6 +333,7 @@ tier_b() {
   fresh_topology
   for c in "${CONFIGS[@]}"; do
     for io in "${IOS[@]}"; do
+      [[ $io == xdp:* && $c != "rtc 1" ]] && continue  # io xdp runs one worker only
       # shellcheck disable=SC2086
       npf_config $c $io
     done

@@ -23,7 +23,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install tools
-        run: sudo apt-get update && sudo apt-get install -y ninja-build
+        run: sudo apt-get update && sudo apt-get install -y ninja-build libbpf-dev libxdp-dev
       - uses: actions/cache@v4
         with:
           path: .deps-cache
@@ -47,7 +47,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install tools
-        run: sudo apt-get update && sudo apt-get install -y ninja-build
+        run: sudo apt-get update && sudo apt-get install -y ninja-build libbpf-dev libxdp-dev
       - uses: actions/cache@v4
         with:
           path: .deps-cache
@@ -64,7 +64,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install tools
-        run: sudo apt-get update && sudo apt-get install -y ninja-build
+        run: sudo apt-get update && sudo apt-get install -y ninja-build libbpf-dev libxdp-dev
       - uses: actions/cache@v4
         with:
           path: .deps-cache
@@ -96,12 +96,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install tools
-        run: sudo apt-get update && sudo apt-get install -y ninja-build clang-tidy-18
+        run: sudo apt-get update && sudo apt-get install -y ninja-build clang-tidy-18 libbpf-dev libxdp-dev
       - uses: actions/cache@v4
         with:
           path: .deps-cache
           key: deps-${{ hashFiles('cmake/Dependencies.cmake') }}
       - run: cmake --preset dev
+      - run: cmake --build --preset dev --target npf_xdp_object
       - name: clang-tidy
         run: |
           files=$(git ls-files 'src/*.cpp')

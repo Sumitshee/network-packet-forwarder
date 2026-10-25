@@ -1,8 +1,12 @@
 #!/usr/bin/env bash
-# Phase 16 exit test, step 2 (docs/BUILD_PLAN.md): the golden cases, live, give byte-identical
-# output with --io af_packet and with --io mmap.
+# Phase 16 exit test, step 2, and phase 17's, step 2 (docs/BUILD_PLAN.md): the golden cases, live,
+# give byte-identical output on every backend -- --io af_packet, --io mmap, and, when npf was
+# built with AF_XDP, --io xdp in each --xdp-mode.
 #
 #   sudo tests/integration/test_io_equivalence.sh build/dev/npf
+#
+# NPF_IO_BACKENDS names the backends instead: "af_packet mmap xdp:skb xdp:native" is the default
+# with AF_XDP, "af_packet mmap" without. af_packet comes first: the others are compared with it.
 #
 # For every case in tests/fixtures/golden: builds a topology of its own -- ns-eqr holds the router's
 # interfaces, named and addressed as the case's configuration says, and ns-eqp a peer for each, pN
@@ -12,9 +16,14 @@
 # once. The peers have no addresses, ARP and IPv6 off: nothing in the capture is the kernel's own.
 # Checksum and VLAN offloads are off on both ends, so every frame is on the wire as npf wrote it.
 #
-# Per case it checks that each port's frames are identical, in the same order, between the two
-# backends; that the final counters are the same; and, as a check on the topology rather than the
-# backends, that af_packet's frames are the ones `npf replay` is expected to write.
+# Per case it checks that each port's frames are identical, in the same order, on every backend
+# and af_packet; that the final counters are the same; and, as a check on the topology rather than
+# the backends, that af_packet's frames are the ones `npf replay` is expected to write.
+#
+# The vlan case is compared with each frame's VLAN tag taken out. The kernel takes a tag out of a
+# frame before a packet socket reads it, so af_packet and mmap forward the frame untagged
+# (README, "Not implemented"). XDP sees the frame before that, and may keep it. Which each
+# backend did is reported.
 #
 # Not root: exit status 77, which CTest reports as skipped.
 set -uo pipefail
@@ -28,6 +37,13 @@ HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 ROOT=$(cd "$HERE/../.." && pwd)
 GOLDEN="$ROOT/tests/fixtures/golden"
 FRAMES=(python3 "$HERE/netns_frames.py")
+if [[ -n ${NPF_IO_BACKENDS:-} ]]; then
+  read -ra BACKENDS <<< "$NPF_IO_BACKENDS"
+elif ldd "$NPF" 2>/dev/null | grep -q libxdp; then
+  BACKENDS=(af_packet mmap xdp:skb xdp:native)
+else
+  BACKENDS=(af_packet mmap)
+fi
 WORK=$(mktemp -d)
 NPF_PID=""
 CAPTURES=()
@@ -89,10 +105,23 @@ topology() { # topology <conf>
 
 # Runs the case once on one backend: its frames go to $WORK/<case>.<io>.p<N>.pcap, its final
 # counters to $WORK/<case>.<io>.stats.
-live() { # live <case> <io>
-  local name=$1 io=$2 log="$WORK/$1.$2.log" port
+# A backend's name in the files and messages, "xdp-skb" for "xdp:skb", and its npf run flags.
+label_of() { echo "${1/:/-}"; }
+args_of() { # args_of <backend>
+  if [[ $1 == *:* ]]; then
+    echo "--io ${1%%:*} --xdp-mode ${1#*:}"
+  else
+    echo "--io $1"
+  fi
+}
+
+live() { # live <case> <backend>
+  local name=$1 io args log port
+  io=$(label_of "$2")
+  read -ra args <<< "$(args_of "$2")"
+  log="$WORK/$name.$io.log"
   rm -f "$WORK/npf.pid"
-  ip netns exec ns-eqr "$NPF" run --io "$io" --config "$WORK/$name.conf" --pidfile "$WORK/npf.pid" \
+  ip netns exec ns-eqr "$NPF" run "${args[@]}" --config "$WORK/$name.conf" --pidfile "$WORK/npf.pid" \
     --stats-file "$WORK/npf.stats" > "$log" 2>&1 &
   NPF_PID=$!
   for _ in $(seq 100); do
@@ -141,54 +170,73 @@ for conf in "$GOLDEN"/*.conf; do
     fail "$name: could not build the topology"
     continue
   fi
-  live "$name" af_packet || continue
-  live "$name" mmap || continue
+  started=1
+  for backend in "${BACKENDS[@]}"; do
+    live "$name" "$backend" || started=0
+  done
+  ((started)) || continue
 
-  same=1
-  for port in "${PORTS[@]}"; do
-    a="$WORK/$name.af_packet.p$port.pcap" b="$WORK/$name.mmap.p$port.pcap"
-    if ! diff=$("${FRAMES[@]}" same-frames "$a" "$b"); then
-      fail "$name: port $port's frames differ between af_packet and mmap"
-      echo "$diff" | sed 's/^/    /'
-      same=0
+  reference=$(label_of "${BACKENDS[0]}")
+  for backend in "${BACKENDS[@]:1}"; do
+    io=$(label_of "$backend")
+    same=1
+    compare=same-frames
+    [[ $name == vlan ]] && compare=same-frames-untagged
+    for port in "${PORTS[@]}"; do
+      a="$WORK/$name.$reference.p$port.pcap" b="$WORK/$name.$io.p$port.pcap"
+      if ! diff=$("${FRAMES[@]}" "$compare" "$a" "$b"); then
+        fail "$name: port $port's frames differ between $reference and $io"
+        echo "$diff" | sed 's/^/    /'
+        same=0
+      fi
+    done
+    counts=""
+    for port in "${PORTS[@]}"; do
+      counts+="p$port: $("${FRAMES[@]}" count "$WORK/$name.$io.p$port.pcap"), "
+    done
+    if ((same)); then
+      what="byte-identical"
+      [[ $name == vlan ]] && what="identical but for any VLAN tag"
+      pass "$name: each port's frames $what between $reference and $io (${counts%, })"
     fi
-  done
-  counts=""
-  for port in "${PORTS[@]}"; do
-    counts+="p$port: $("${FRAMES[@]}" count "$WORK/$name.af_packet.p$port.pcap"), "
-  done
-  ((same)) && pass "$name: each port's frames byte-identical between af_packet and mmap (${counts%, })"
-  if diff -q "$WORK/$name.af_packet.stats" "$WORK/$name.mmap.stats" > /dev/null; then
-    pass "$name: the same final counters"
-  else
-    fail "$name: the final counters differ (af_packet <, mmap >)"
-    diff "$WORK/$name.af_packet.stats" "$WORK/$name.mmap.stats" | sed 's/^/    /'
-  fi
-  af_files=()
-  for port in "${PORTS[@]}"; do
-    af_files+=("$WORK/$name.af_packet.p$port.pcap")
-  done
-  if [[ $name == vlan ]]; then
-    # The kernel takes the tag out of a frame before any packet socket reads it, and neither
-    # backend reads it back (README, "Not implemented"): live, the frame leaves untagged.
-    if out=$("${FRAMES[@]}" same-frame-set-untagged "$GOLDEN/$name.expected.pcap" "${af_files[@]}"); then
-      pass "$name: the frames are the golden case's expected output, less the VLAN tag, as documented"
+    if diff -q "$WORK/$name.$reference.stats" "$WORK/$name.$io.stats" > /dev/null; then
+      pass "$name: the same final counters on $reference and $io"
     else
-      fail "$name: the live frames are not the golden case's expected output, even untagged"
-      echo "$out" | sed 's/^/    /'
+      fail "$name: the final counters differ ($reference <, $io >)"
+      diff "$WORK/$name.$reference.stats" "$WORK/$name.$io.stats" | sed 's/^/    /'
     fi
-  elif out=$("${FRAMES[@]}" same-frame-set "$GOLDEN/$name.expected.pcap" "${af_files[@]}"); then
-    pass "$name: the frames are the golden case's expected output"
-  else
-    fail "$name: the live frames are not the golden case's expected output"
-    echo "$out" | sed 's/^/    /'
-  fi
+  done
+
+  for backend in "${BACKENDS[@]}"; do
+    io=$(label_of "$backend")
+    files=()
+    for port in "${PORTS[@]}"; do
+      files+=("$WORK/$name.$io.p$port.pcap")
+    done
+    if [[ $name == vlan ]]; then
+      if "${FRAMES[@]}" same-frame-set "$GOLDEN/$name.expected.pcap" "${files[@]}" > /dev/null; then
+        pass "$name, $io: the frames are the golden case's expected output, VLAN tag kept"
+      elif out=$("${FRAMES[@]}" same-frame-set-untagged "$GOLDEN/$name.expected.pcap" "${files[@]}"); then
+        pass "$name, $io: the frames are the golden case's expected output less the VLAN tag"
+      else
+        fail "$name, $io: the live frames are not the golden case's expected output, even untagged"
+        echo "$out" | sed 's/^/    /'
+      fi
+    elif [[ $io == "$reference" ]]; then
+      if out=$("${FRAMES[@]}" same-frame-set "$GOLDEN/$name.expected.pcap" "${files[@]}"); then
+        pass "$name: the frames are the golden case's expected output"
+      else
+        fail "$name: the live frames are not the golden case's expected output"
+        echo "$out" | sed 's/^/    /'
+      fi
+    fi
+  done
 done
 
 echo
 if [[ $failures -eq 0 ]]; then
-  echo "PHASE 16 IO EQUIVALENCE: PASS"
+  echo "IO EQUIVALENCE (${BACKENDS[*]}): PASS"
   exit 0
 fi
-echo "PHASE 16 IO EQUIVALENCE: FAIL ($failures check(s) failed)"
+echo "IO EQUIVALENCE (${BACKENDS[*]}): FAIL ($failures check(s) failed)"
 exit 1

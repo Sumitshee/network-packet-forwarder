@@ -4,6 +4,9 @@
 #
 #   sudo tests/integration/test_mmap_soak.sh build/dev/npf [seconds] [mode] [workers]
 #
+# [phase 17] NPF_SOAK_IO_ARGS soaks another backend: "--io xdp --xdp-mode native", say. The
+# default is "--io mmap".
+#
 # Runs `npf run --io mmap` on configs/router.conf in ns-router (by default rtc, one worker), sends
 # 16 flows of UDP from ns-client through it as fast as bench/system/gen can for 60 s, and reads
 # `npf show stats` every 5 s. A ring that stalls -- an RX block never handed back to the kernel, or
@@ -60,8 +63,9 @@ if ! "$ROOT/scripts/setup_netns.sh"; then
 fi
 
 LOG="$WORK/npf.log"
-echo "\$ ip netns exec ns-router npf run --io mmap --config configs/router.conf --mode $MODE --workers $WORKERS &"
-ip netns exec ns-router "$NPF" run --io mmap --config "$ROOT/configs/router.conf" --mode "$MODE" \
+read -ra IO_ARGS <<< "${NPF_SOAK_IO_ARGS:---io mmap}"
+echo "\$ ip netns exec ns-router npf run ${IO_ARGS[*]} --config configs/router.conf --mode $MODE --workers $WORKERS &"
+ip netns exec ns-router "$NPF" run "${IO_ARGS[@]}" --config "$ROOT/configs/router.conf" --mode "$MODE" \
   --workers "$WORKERS" --pidfile "$WORK/npf.pid" --stats-file "$WORK/npf.stats" > "$LOG" 2>&1 &
 NPF_PID=$!
 for _ in $(seq 100); do
@@ -167,8 +171,8 @@ sed -n '/final counters/,$p' "$LOG" | grep -E '^(rx_packets|forwarded|RingFull|T
 
 echo
 if [[ $failures -eq 0 ]]; then
-  echo "PHASE 16 MMAP SOAK: PASS"
+  echo "SOAK (${IO_ARGS[*]}): PASS"
   exit 0
 fi
-echo "PHASE 16 MMAP SOAK: FAIL ($failures check(s) failed)"
+echo "SOAK (${IO_ARGS[*]}): FAIL ($failures check(s) failed)"
 exit 1
