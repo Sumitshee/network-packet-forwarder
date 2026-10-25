@@ -556,7 +556,7 @@ class IoBackend {
 //   AfPacketBackend    [phase 6]  — recvfrom/sendto, one socket per port
 //   PcapFileBackend    [phase 9]  — reads one pcap, writes another; deterministic
 //   PacketMmapBackend  [phase 16] — TPACKET_V3 RX ring + TX ring, PACKET_QDISC_BYPASS
-//   AfXdpBackend       [phase 17] — UMEM + XSK rings
+//   AfXdpBackend       [phase 17] — UMEM + XSK rings, one socket per port on queue 0, XDP_COPY
 
 }  // namespace npf::io
 ```
@@ -575,6 +575,30 @@ a socket and RX and TX want different versions:
 Both socket backends read the kernel's `PACKET_STATISTICS` when asked, for the frames the kernel
 dropped before the router could read them. That count is reported beside `Counters`, not in it:
 it is the kernel's, not a decision of the pipeline.
+
+[phase 17] `AfXdpBackend` (`--io xdp`) gives each port one AF_XDP socket on queue 0, with a UMEM
+of its own: 4096 frames of 2048 bytes, half kept in the fill ring for receiving and half for
+sending. On each port it attaches `bpf/xdp_redirect.c`, a one-line `bpf_redirect_map` into an
+XSKMAP, which is compiled with clang at build time and embedded in the binary.
+
+- **Attaching** is done with libbpf (`bpf_xdp_attach`), in `skb` (generic) mode or `native`
+  (driver) mode, chosen by `npf run --xdp-mode`; `skb` is the default. It fails rather than
+  replace a program already attached. The program is detached when the backend is destroyed.
+  It is not pinned: bpffs is not mounted on this machine, `ip netns exec` replaces `/sys`, and
+  the test interfaces go with their namespaces.
+- **The sockets** come from libxdp, with libxdp's own program loading inhibited, bound with
+  `XDP_COPY`: veth has no zero-copy.
+- **RX** copies each frame out of the UMEM into a pool buffer, and gives the UMEM frame straight
+  back to the fill ring.
+- **TX** copies into a free UMEM frame and posts a descriptor. `tx_flush()` kicks each port with
+  pending frames with `sendto()`, again while the kernel says there is more (copy mode sends a
+  bounded batch per call). Finished frames are reaped from the completion ring.
+- **Its `kernel_rx_drops`** is `XDP_STATISTICS`' `rx_dropped + rx_ring_full`, which the kernel
+  keeps cumulative.
+- **Scope.** One socket per port means no fanout and one queue, so `npf run --io xdp` refuses
+  anything but `mode rtc` with `workers 1`.
+- **Build.** The backend is built only when CMake finds libbpf, libxdp and a clang that can
+  target BPF (`cmake/FindLibbpf.cmake`). Without them, `--io xdp` says so and exits.
 
 ---
 
