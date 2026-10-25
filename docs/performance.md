@@ -1051,6 +1051,266 @@ These are in the Candidates.
 **Caveat:** two sessions are the least that can show this. They cannot say how wide the run-to-run
 spread really is.
 
+## Phase 16: PACKET_MMAP
+
+`--io mmap` (`src/io/packet_mmap.cpp`) gets frames to and from the wire through rings shared with
+the kernel:
+
+- **Receive** is a TPACKET_V3 ring: 8 blocks of 4 MiB per port. Those blocks are split between
+  the sockets of a fanout group, so the memory per port stays the same. The kernel hands a block
+  over when it is full, or when its 10 ms retire timeout expires.
+- **Transmit** is a TPACKET_V2 ring of 512 slots of 2048 bytes. It bypasses the queueing
+  discipline, and takes one `send()` per burst.
+
+Both backends copy each frame into a pool buffer and out again. What `mmap` saves is the system
+call per frame, with its two context switches; it pays a look at a block's status instead.
+
+**Method.** Tier B as in phase 14: 16 flows of 70-byte frames from gen (CPU 6) to sink (CPU 7),
+through npf on CPUs 0-5. Each configuration gets a 2 s warm-up and 5 repetitions of 10 s, in two
+scenarios: as fast as gen can send, and 20,000 datagrams a second. Every run was started once
+the load average was below 0.5.
+
+`scripts/run_bench.sh --compare-io` runs, in one session, the kernel control and then each
+configuration on `af_packet` and straight after on `mmap`. `scripts/bench_compare_io.py` makes
+the tables below from its JSON.
+
+**Sessions.** Three, on 2026-10-25, all in one boot of WSL; a restart between them was asked
+for, and did not happen:
+
+- **a** started at 03:44 UTC;
+- **b** started at 04:14 UTC, two minutes after a ended;
+- **c** started at 06:03 UTC.
+
+Each session also ran the back-pressure comparison below around its `--compare-io`.
+
+**Code measured.** Sessions a and b measured `6d497d5`; session c measured `999a811`. The two
+differ only in pipeline mode on `af_packet` (back-pressure, below). So that row is compared
+within session c alone, and across the sessions every other row is the same code.
+
+### What the offered rate says
+
+gen's rate is not fixed: it depends on what is receiving. In rtc:2, gen offered 208.5-320.5 kpps
+when npf ran on `af_packet`, and 295.8-385.8 kpps when it ran on `mmap`. In rtc:1 the order is the
+other way: 411.7-431.7 on `af_packet`, against 344.4-396.9 on `mmap`. Why is not measured. The
+kernel's side of a veth runs partly on the sending CPU, which is one place to look.
+
+Where the loss is 0.0% -- the kernel control, rtc:2 and pipeline:2 on `mmap` -- the delivered
+rate *is* the offered rate. It measures gen, not npf. Those rows bound npf from below and do not
+say how fast it could go. The rows that do measure npf are those where it falls behind: rtc:1 on
+both backends, and pipeline:2 on `af_packet`. **npf's CPU time per delivered datagram** compares
+the backends whatever gen offered.
+
+### Session a (`2026-10-25-6d497d5-compare-io-a`)
+
+git 6d497d5636d1, 2026-10-25T04:06:00+00:00
+
+| configuration | offered, kpps | delivered, kpps: median (min-max) | loss, % | npf CPU, % | npf CPU per datagram, us | p50 latency at 20 kpps, us | p99, us |
+|---|---|---|---|---|---|---|---|
+| kernel control | 278.2 | 278.2 (274.9-302.7) | 0.0 | - | - | 30.3 | 112.1 |
+| pipeline:2, af_packet | 281.0 | 143.2 (135.4-155.9) | 45.9 | 298 | 20.81 | 122.0 | 260.3 |
+| pipeline:2, mmap | 344.2 | 344.2 (326.6-368.8) | 0.0 | 176 | 5.10 | 8476.1 | 16153.3 |
+| rtc:1, af_packet | 411.7 | 259.0 (177.7-269.3) | 37.6 | 100 | 3.85 | 56.7 | 162.5 |
+| rtc:1, mmap | 396.9 | 324.6 (306.2-329.9) | 18.2 | 99 | 3.06 | 8538.3 | 16139.7 |
+| rtc:2, af_packet | 320.5 | 316.3 (285.2-330.1) | 1.3 | 172 | 5.44 | 64.6 | 147.6 |
+| rtc:2, mmap | 385.8 | 385.8 (306.6-410.0) | 0.0 | 112 | 2.89 | 8418.0 | 16072.8 |
+
+### Session b (`2026-10-25-6d497d5-compare-io-b`)
+
+git 6d497d5636d1, 2026-10-25T04:34:53+00:00
+
+| configuration | offered, kpps | delivered, kpps: median (min-max) | loss, % | npf CPU, % | npf CPU per datagram, us | p50 latency at 20 kpps, us | p99, us |
+|---|---|---|---|---|---|---|---|
+| kernel control | 299.1 | 299.1 (264.8-330.6) | 0.0 | - | - | 28.2 | 384.2 |
+| pipeline:2, af_packet | 301.4 | 160.3 (151.9-172.6) | 48.0 | 296 | 18.61 | 126.6 | 4051.0 |
+| pipeline:2, mmap | 319.9 | 319.9 (246.7-333.6) | 0.0 | 182 | 5.76 | 8582.0 | 16165.4 |
+| rtc:1, af_packet | 428.4 | 258.7 (199.2-280.6) | 38.3 | 100 | 3.85 | 59.1 | 424.8 |
+| rtc:1, mmap | 344.4 | 275.6 (269.0-303.5) | 20.2 | 99 | 3.60 | 8921.0 | 16170.7 |
+| rtc:2, af_packet | 267.5 | 264.2 (176.6-287.9) | 2.5 | 165 | 6.26 | 66.6 | 2419.6 |
+| rtc:2, mmap | 318.3 | 318.3 (271.8-360.5) | 0.0 | 118 | 3.72 | 8554.7 | 16093.1 |
+
+### Session c (`2026-10-25-999a811-compare-io-c`)
+
+git 999a8117f36e, 2026-10-25T06:25:47+00:00
+
+| configuration | offered, kpps | delivered, kpps: median (min-max) | loss, % | npf CPU, % | npf CPU per datagram, us | p50 latency at 20 kpps, us | p99, us |
+|---|---|---|---|---|---|---|---|
+| kernel control | 311.8 | 311.8 (193.3-328.8) | 0.0 | - | - | 27.6 | 100.3 |
+| pipeline:2, af_packet | 192.1 | 166.1 (145.0-177.5) | 13.6 | 301 | 18.10 | 160.7 | 6339.2 |
+| pipeline:2, mmap | 295.0 | 295.0 (267.3-312.9) | 0.0 | 176 | 5.95 | 8520.6 | 16199.7 |
+| rtc:1, af_packet | 431.7 | 261.1 (257.9-285.8) | 39.5 | 100 | 3.82 | 57.6 | 283.6 |
+| rtc:1, mmap | 349.2 | 280.7 (265.9-316.5) | 19.6 | 99 | 3.54 | 8701.6 | 16224.7 |
+| rtc:2, af_packet | 208.5 | 207.0 (195.0-246.4) | 0.7 | 166 | 7.96 | 76.2 | 4566.9 |
+| rtc:2, mmap | 295.8 | 295.8 (280.8-304.2) | 0.0 | 118 | 3.98 | 8480.9 | 16132.7 |
+
+### Across the three sessions: the range of the session medians
+
+| configuration | offered, kpps | delivered, kpps | loss, % | npf CPU per datagram, us | p50 latency at 20 kpps, us | p99, us |
+|---|---|---|---|---|---|---|
+| kernel control | 278.2-311.8 | 278.2-311.8 | 0.0-0.0 | - | 27.6-30.3 | 100.3-384.2 |
+| pipeline:2, af_packet | 192.1-301.4 | 143.2-166.1 | 13.6-48.0 | 18.10-20.81 | 122.0-160.7 | 260.3-6339.2 |
+| pipeline:2, mmap | 295.0-344.2 | 295.0-344.2 | 0.0-0.0 | 5.10-5.95 | 8476.1-8582.0 | 16153.3-16199.7 |
+| rtc:1, af_packet | 411.7-431.7 | 258.7-261.1 | 37.6-39.5 | 3.82-3.85 | 56.7-59.1 | 162.5-424.8 |
+| rtc:1, mmap | 344.4-396.9 | 275.6-324.6 | 18.2-20.2 | 3.06-3.60 | 8538.3-8921.0 | 16139.7-16224.7 |
+| rtc:2, af_packet | 208.5-320.5 | 207.0-316.3 | 0.7-2.5 | 5.44-7.96 | 64.6-76.2 | 147.6-4566.9 |
+| rtc:2, mmap | 295.8-385.8 | 295.8-385.8 | 0.0-0.0 | 2.89-3.98 | 8418.0-8554.7 | 16072.8-16132.7 |
+
+The pipeline:2 `af_packet` row mixes code: sessions a and b measured it with back-pressure, which
+is now off for `af_packet` (below). Its current numbers are session c's row, and the "before"
+runs below.
+
+### What the comparison shows
+
+- **One saturated worker, rtc:1.** It is at 99-100% of a CPU on both backends.
+  - `mmap` delivered 275.6-324.6 kpps across the sessions, against `af_packet`'s 258.7-261.1.
+    The ranges do not overlap.
+  - Within a session, mmap's median was higher in all three, but only session a's repetition
+    ranges were apart.
+  - npf's CPU per datagram was 3.06-3.60 µs on `mmap` against 3.82-3.85 µs on `af_packet`. Again
+    the ranges do not overlap.
+  - Loss before npf read a frame was 18.2-20.2% on `mmap` against 37.6-39.5%.
+- **Two workers, rtc:2.** `mmap` lost nothing in any session, and `af_packet` 0.7-2.5%, so the
+  delivered rate is gen's. npf's CPU per datagram is the comparison: 2.89-3.98 µs on `mmap`
+  against 5.44-7.96 µs on `af_packet`.
+- **Pipeline, pipeline:2, session c.** `mmap` lost nothing, 295.0 kpps delivered. `af_packet`
+  lost 13.6% of a lower offered rate, 166.1 kpps delivered. npf's CPU per datagram was 5.95 µs on
+  `mmap` against 18.10 µs on `af_packet`.
+- **Latency is `mmap`'s price.**
+  - At 20,000 datagrams a second, the median latency through npf is 8418.0-8921.0 µs on `mmap`
+    against 56.7-160.7 µs on `af_packet`; p99 is 16072.8-16224.7 µs against 147.6-6339.2 µs.
+  - At that rate a 4 MiB block holds thousands of datagrams and never fills, so the kernel hands
+    it over only when its 10 ms timer fires. The median is of the order of that timeout, which
+    is fixed (README, Not implemented).
+  - A shorter timeout, or a block size that follows the rate, is a candidate. Neither is built
+    or measured.
+- **Memory.** npf's peak RSS with `mmap` was 80,256-112,512 KiB, against 12,672-38,784 KiB with
+  `af_packet`.
+  This is the rings: 32 MiB of RX ring per port, split between a fanout group's sockets, and
+  1 MiB of TX ring per socket.
+- **The kernel control** delivered 278.2-311.8 kpps with no loss, which is gen's rate again. Its
+  p50 latency at 20 kpps was 27.6-30.3 µs.
+
+**Verdict: `mmap` forwards each datagram for less of npf's CPU in every configuration measured.**
+With one saturated worker it delivers more, and with two it kept up with everything gen sent.
+The cost is a latency of the order of the block timeout at a low rate, and a few tens of MiB of
+rings. `af_packet` stays the default in `configs/router.conf`: a router whose latency at low rates
+is 10 ms is the wrong default, and the choice is one flag. Whether `mmap` keeps its lead above
+gen's rate is not measured. That needs a faster sender than one gen thread.
+
+### Back-pressure in pipeline mode: on for `mmap`, off for `af_packet`
+
+At first, `mmap` pipeline mode dropped most of what it received, as `RingFull`. An RX thread
+copies a whole V3 block out at once -- thousands of frames, against 1024 slots a ring -- and the
+workers then sleep until the next block.
+
+The fix (`5a26724`): the RX thread receives only what every worker ring has room for, and leaves
+the rest in the kernel. This was first applied to both backends, and measured against
+`cc3f448`, which has none.
+
+Each session ran a sandwich: the before build on each backend, then `--compare-io` as the after
+run, then the before build again. `scripts/bench_compare_tier_b.py` pools the two before runs and
+gives the verdict:
+- **NOISE** if the after median lies inside the before repetitions' range, or between the two
+  before runs' medians;
+- otherwise **HIGHER** or **LOWER**.
+
+**Sessions a and b: back-pressure on both backends (`6d497d5`).**
+
+Session a:
+
+| configuration | metric | before: median (min-max) | after: median (min-max) | verdict |
+|---|---|---|---|---|
+| pipeline:2, af_packet | delivered, pps | 192360.9 (176408.1-207652.5) | 143185.0 (135426.9-155908.2) | LOWER |
+| pipeline:2, af_packet | loss, % | 16.0 (14.8-18.5) | 45.9 (42.3-52.6) | HIGHER |
+| pipeline:2, af_packet | p50 latency at 20 kpps, us | 126.5 (123.7-175.9) | 122.0 (120.8-123.7) | LOWER |
+| pipeline:2, af_packet | p99 latency at 20 kpps, us | 899.8 (259.2-5926.8) | 260.3 (250.0-835.1) | NOISE |
+| pipeline:2, af_packet | RingFull, summed over the runs | 3978071 | 0 | |
+| pipeline:2, af_packet | kernel_rx_drops, summed over the runs | 114825 | 6824068 | |
+| pipeline:2, mmap | delivered, pps | 140000.7 (128734.7-144048.5) | 344213.8 (326609.1-368831.1) | HIGHER |
+| pipeline:2, mmap | loss, % | 63.6 (47.9-78.7) | 0.0 (0.0-0.0) | LOWER |
+| pipeline:2, mmap | p50 latency at 20 kpps, us | 8510.9 (8453.3-8646.0) | 8476.1 (8468.5-8505.0) | NOISE |
+| pipeline:2, mmap | p99 latency at 20 kpps, us | 16185.8 (16143.9-16240.9) | 16153.3 (16143.3-16168.0) | NOISE |
+| pipeline:2, mmap | RingFull, summed over the runs | 26913483 | 0 | |
+| pipeline:2, mmap | kernel_rx_drops, summed over the runs | 0 | 0 | |
+
+Session b:
+
+| configuration | metric | before: median (min-max) | after: median (min-max) | verdict |
+|---|---|---|---|---|
+| pipeline:2, af_packet | delivered, pps | 181547.3 (119585.3-243746.6) | 160276.3 (151900.0-172597.6) | NOISE |
+| pipeline:2, af_packet | loss, % | 14.6 (7.0-17.5) | 48.0 (41.4-51.9) | HIGHER |
+| pipeline:2, af_packet | p50 latency at 20 kpps, us | 124.3 (111.3-234.4) | 126.6 (119.7-138.5) | NOISE |
+| pipeline:2, af_packet | p99 latency at 20 kpps, us | 4349.4 (323.3-21399.6) | 4051.0 (1596.8-11685.5) | NOISE |
+| pipeline:2, af_packet | RingFull, summed over the runs | 2882538 | 0 | |
+| pipeline:2, af_packet | kernel_rx_drops, summed over the runs | 403273 | 7503176 | |
+| pipeline:2, mmap | delivered, pps | 140256.8 (129407.6-143411.4) | 319858.2 (246675.1-333647.4) | HIGHER |
+| pipeline:2, mmap | loss, % | 62.1 (51.3-68.9) | 0.0 (0.0-0.0) | LOWER |
+| pipeline:2, mmap | p50 latency at 20 kpps, us | 8650.5 (8614.3-8676.2) | 8582.0 (8571.5-8626.5) | LOWER |
+| pipeline:2, mmap | p99 latency at 20 kpps, us | 16246.0 (16179.3-16323.3) | 16165.4 (16148.0-16179.8) | LOWER |
+| pipeline:2, mmap | RingFull, summed over the runs | 24182327 | 0 | |
+| pipeline:2, mmap | kernel_rx_drops, summed over the runs | 0 | 0 | |
+
+**Session c: back-pressure on `mmap` only (`999a811`).** The `af_packet` "after" here is the same
+code path as the before build: phase 13's drop as `RingFull`, behind one more branch per burst.
+
+| configuration | metric | before: median (min-max) | after: median (min-max) | verdict |
+|---|---|---|---|---|
+| pipeline:2, af_packet | delivered, pps | 183249.7 (107665.2-212774.1) | 166065.5 (144972.7-177490.0) | NOISE |
+| pipeline:2, af_packet | loss, % | 16.1 (9.5-19.0) | 13.6 (11.8-14.0) | NOISE |
+| pipeline:2, af_packet | p50 latency at 20 kpps, us | 127.9 (120.5-156.4) | 160.7 (143.3-166.9) | HIGHER |
+| pipeline:2, af_packet | p99 latency at 20 kpps, us | 677.0 (235.8-8584.3) | 6339.2 (4133.2-15449.7) | NOISE |
+| pipeline:2, af_packet | RingFull, summed over the runs | 3449937 | 1257368 | |
+| pipeline:2, af_packet | kernel_rx_drops, summed over the runs | 185301 | 92485 | |
+| pipeline:2, mmap | delivered, pps | 144347.1 (142688.0-146246.2) | 294963.8 (267281.8-312871.3) | HIGHER |
+| pipeline:2, mmap | loss, % | 73.3 (69.6-74.9) | 0.0 (0.0-0.0) | LOWER |
+| pipeline:2, mmap | p50 latency at 20 kpps, us | 8508.2 (8456.5-8595.5) | 8520.6 (8473.6-8613.6) | NOISE |
+| pipeline:2, mmap | p99 latency at 20 kpps, us | 16165.5 (16149.0-16206.4) | 16199.7 (16171.2-16378.6) | NOISE |
+| pipeline:2, mmap | RingFull, summed over the runs | 41011107 | 0 | |
+| pipeline:2, mmap | kernel_rx_drops, summed over the runs | 0 | 0 | |
+
+**What it shows:**
+
+- **On `mmap`** it is the difference between a working pipeline and a broken one, in all three
+  sessions:
+  - delivered went from 140.0-144.3 kpps to 295.0-344.2;
+  - loss went from 62.1-73.3% to 0.0%;
+  - RingFull went from tens of millions to 0, with the kernel dropping nothing.
+- **On `af_packet`** it made things worse:
+  - loss went from 14.6-16.0% to 45.9-48.0% in sessions a and b, with the drops moved from
+    `RingFull` into the kernel (`kernel_rx_drops`, 6.8 and 7.5 million);
+  - delivered was LOWER in session a and NOISE in session b.
+- **Why `af_packet` loses** is not measured. While every ring is full, its RX thread spins in
+  `poll()` on a readable socket (ARCHITECTURE.md §12), and that is the first place to look.
+
+**Verdict.** Back-pressure is kept for `mmap` and taken off `af_packet` (`92922e4`). The engine
+chooses by backend.
+
+Session c checks that `af_packet` is back where it was:
+- delivered and loss are NOISE against the before build;
+- p50 latency at 20 kpps came out HIGHER, 160.7 µs against the before build's 127.9, though
+  the code path is the same but for one predictable branch per burst. That this is drift between runs, which the
+  sandwich exists to catch, is the likely reading, but it was not investigated further.
+
+The negative result stays here: phase 13's dropping is the better policy for a backend that a
+system call per frame already paces.
+
+### Exit test
+
+All passed on 2026-10-25, under sudo:
+
+1. **Every golden case, live, gives byte-identical output on `--io af_packet` and `--io mmap`.**
+   `tests/integration/test_io_equivalence.sh` runs each case through a namespace pair, once per
+   backend. It compares every port's frames and the final counters, and checks `af_packet`'s
+   frames against the case's expected output. The `vlan` case's frame leaves untagged on both
+   backends (README, Not implemented), and that is checked too.
+2. **The phase 6, 7, 8 and 12 integration tests pass with `--io mmap`**, and so does phase 13's
+   ordering test.
+3. **`run_bench.sh --compare-io` produced the tables above**, three times.
+4. **No ring stall.** `tests/integration/test_mmap_soak.sh` runs 60 s at gen's full rate, reading
+   the counters every 5 s. No interval received or forwarded nothing, or less than half the
+   median interval.
+
+Also: the ThreadSanitizer soak passed on both backends, with nothing reported.
+
 ## Phase 3: checksum microbenchmark (tier A)
 
 **What.** `bench/micro/bench_checksum.cpp` times the three checksum paths in
@@ -1435,10 +1695,16 @@ Ideas noted for later phases, not done.
   `process()` beyond parsing and the FIB lookup cost 254 cycles per packet with DIR-24-8. Timing
   each step on its own -- or counting cycles around it -- would say which of them to look at
   first, before any change to the datapath.
-- **The kernel's own drop count** (phase 15 or 16). In the baseline, npf with 1 run-to-completion
-  worker lost 37.6% of what gen offered before reading it. Reading `PACKET_STATISTICS` from each
-  socket at the end of a run would put that loss in the result, as a number; PACKET_MMAP (phase 16)
-  may move it.
+- **`mmap`'s block timeout** (phase 16). 10 ms buys batching at the price of a median latency of
+  8-9 ms at 20,000 datagrams a second. A shorter timeout, or smaller blocks at a low rate, should
+  be measured against it, for latency and for CPU per datagram.
+- **Why back-pressure hurts `af_packet`'s pipeline** (phase 16): the RX thread's spin in `poll()`
+  while the rings are full is the first suspect. A wake-up from the workers would be the fix to
+  measure.
+- **A sender faster than one gen thread** (phase 16). Where npf loses nothing, the delivered rate
+  is gen's, and so is the kernel control's. Several gens, or a faster one, would find the
+  ceilings.
+- **Why the offered rate depends on the receiver** (phase 16, and phase 15's four workers below).
 - **Why 4 run-to-completion workers slow the sender** (phase 15). gen offered 83.1 kpps into npf
   with 4 workers against 423.6 kpps with 1. What the sender's CPU does on the receiving side's
   behalf, per fanout socket and per wake-up, was not measured.

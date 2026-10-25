@@ -51,8 +51,10 @@ TPACKET_V3 ring and hands each one over when it is full, or after 10 ms. On tran
 into the slots of a TPACKET_V2 ring that bypasses the queueing discipline, with one system call
 per burst. Both backends copy each frame into a pool buffer and out again; neither is zero-copy.
 An integration test runs every golden case live through both and requires byte-identical frames
-out of every port. In pipeline mode the RX threads receive only what the workers' rings can
-take, and leave the rest waiting in the kernel. The kernel's own receive drops are reported
+out of every port. In pipeline mode on `mmap`, the RX threads receive only what the workers'
+rings can take, and leave the rest waiting in the kernel. That measured as a large gain on
+`mmap` and a loss on `af_packet`, so `af_packet` keeps dropping as `RingFull`. The kernel's own
+receive drops are reported
 beside npf's counters as `kernel_rx_drops`. The 10 ms is a latency cost at low rates: a block
 that never fills waits for its timer. [`docs/performance.md`](docs/performance.md) compares the
 two backends.
@@ -300,8 +302,9 @@ ctest --preset dev -R golden --output-on-failure
   directions of a connection may be handled by different workers; each direction stays in order.
   Each worker resolves its neighbours for itself, so several may ask for the same one, and has its
   own ICMP rate limiter, so the router as a whole sends up to N times one limiter's allowance.
-  Pipeline mode needs a power-of-two number of workers and a `pool_size` of at most 16384. While
-  any worker's ring is full its RX threads receive nothing: they spin in `poll()` on a readable
+  Pipeline mode needs a power-of-two number of workers and a `pool_size` of at most 16384. On
+  `af_packet` it drops a packet whose worker's ring is full, as `RingFull`. On `mmap`, while any
+  worker's ring is full, its RX threads receive nothing: they spin in `poll()` on a readable
   socket until there is room, and the kernel drops what overflows. Bridged ports need `workers 1`: each worker
   would keep a MAC table of its own. The routing table cannot change while the router runs.
 - **IPv6.** Not routed: an IPv6 frame for the router is dropped as an unsupported EtherType, while
