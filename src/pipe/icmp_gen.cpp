@@ -6,6 +6,7 @@
 #include <npf/core/packet.hpp>
 #include <npf/pipe/icmp_gen.hpp>
 #include <npf/proto/checksum.hpp>
+#include <npf/proto/checksum_simd.hpp>
 #include <npf/proto/ethernet.hpp>
 #include <npf/proto/icmp.hpp>
 #include <npf/proto/ipv4.hpp>
@@ -85,9 +86,12 @@ void write_ipv4(core::Bytes hdr, const Ipv4Fields& f) noexcept {
   core::wr_be16(hdr, 10, proto::ipv4_header_checksum(hdr));
 }
 
+// [phase 18] The whole message, up to a whole echo request: the one sum on the datapath long
+// enough for the vector sum to pay (docs/performance.md, phase 18).
 void write_icmp_checksum(core::Bytes message) noexcept {
   core::wr_be16(message, 2, 0);
-  core::wr_be16(message, 2, static_cast<std::uint16_t>(~proto::ones_complement_sum(message)));
+  core::wr_be16(message, 2,
+                static_cast<std::uint16_t>(~proto::ones_complement_sum_fast(message)));
 }
 
 }  // namespace
