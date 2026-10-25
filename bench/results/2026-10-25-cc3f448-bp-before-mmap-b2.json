@@ -1,0 +1,644 @@
+{
+ "context": {
+  "git_sha": "cc3f448c56f57b208b3f1e6491de30486303efd5",
+  "git_tree_clean": true,
+  "date_utc": "2026-10-25T04:41:43+00:00",
+  "uname_r": "6.6.87.2-microsoft-standard-WSL2",
+  "cpu_model": "11th Gen Intel(R) Core(TM) i5-1135G7 @ 2.40GHz",
+  "cpus_online": 8,
+  "tsc_flags": [
+   "constant_tsc",
+   "nonstop_tsc",
+   "tsc",
+   "tsc_known_freq",
+   "tsc_reliable"
+  ],
+  "compiler": "c++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0",
+  "cmake_preset": "bp-before",
+  "cmake_build_type": "Release",
+  "compile_command_npf": "/usr/bin/c++ -I\"/mnt/c/Users/BHAJOWANPUR GP/Desktop/packet forwarder/build/ab/src/bp-before/include\" -O2 -g -DNDEBUG -std=c++20 -march=native -Wall -Wextra -Wpedantic -Wshadow -Wconversion -Wsign-conversion -Wcast-align -Wold-style-cast -Wnon-virtual-dtor -Wnull-dereference -Wdouble-promotion -Wformat=2 -Wimplicit-fallthrough -o src/CMakeFiles/npf.dir/main.cpp.o -c \"/mnt/c/Users/BHAJOWANPUR GP/Desktop/packet forwarder/build/ab/src/bp-before/src/main.cpp\"",
+  "compile_command_bench_datapath": "/usr/bin/c++ -DBENCHMARK_STATIC_DEFINE -DNPF_BENCH_BUILD_TYPE=\\\"Release\\\" -DNPF_BENCH_COMPILER=\"\\\"GNU 13.3.0\\\"\" -DNPF_BENCH_FLAGS=\"\\\"-O2 -g -DNDEBUG -march=native\\\"\" -I\"/mnt/c/Users/BHAJOWANPUR GP/Desktop/packet forwarder/build/ab/src/bp-before/include\" -I\"/mnt/c/Users/BHAJOWANPUR GP/Desktop/packet forwarder/build/ab/bp-before/_deps/benchmark-src/include\" -O2 -g -DNDEBUG -std=c++20 -march=native -Wall -Wextra -Wpedantic -Wshadow -Wconversion -Wsign-conversion -Wcast-align -Wold-style-cast -Wnon-virtual-dtor -Wnull-dereference -Wdouble-promotion -Wformat=2 -Wimplicit-fallthrough -o bench/CMakeFiles/bench_datapath.dir/micro/bench_datapath.cpp.o -c \"/mnt/c/Users/BHAJOWANPUR GP/Desktop/packet forwarder/build/ab/src/bp-before/bench/micro/bench_datapath.cpp\"",
+  "burst": 32,
+  "pool_size": 4096,
+  "perf_stat_cycles": {
+   "succeeded": false,
+   "output": "sh: 1: perf: not found"
+  },
+  "perf_event_open_cycles": null,
+  "quick_rehearsal": false
+ },
+ "tier_b": {
+  "configurations": [
+   {
+    "config": "npf",
+    "mode": "pipeline",
+    "workers": 2,
+    "io": "mmap",
+    "npf_peak_rss_kib": 112384,
+    "npf_final_counters": {
+     "rx_packets": 20268041,
+     "rx_bytes": 1418762842,
+     "tx_packets": 8350143,
+     "tx_bytes": 584509982,
+     "forwarded": 8350138,
+     "flooded": 0,
+     "to_host": 5,
+     "arp_requests_rx": 4,
+     "arp_replies_rx": 1,
+     "arp_requests_tx": 1,
+     "arp_replies_tx": 4,
+     "icmp_generated": 0,
+     "ShortFrame": 0,
+     "BadEtherType": 0,
+     "BadIpv4Header": 0,
+     "BadChecksum": 0,
+     "MartianSource": 0,
+     "TtlExpired": 0,
+     "NoRoute": 0,
+     "ArpUnresolved": 0,
+     "FilterDeny": 0,
+     "NoOutPort": 0,
+     "UnknownDestPort": 0,
+     "SamePort": 0,
+     "RingFull": 11917898,
+     "TxFull": 0,
+     "PoolExhausted": 0,
+     "ip_proto_1": 4,
+     "ip_proto_17": 8350134,
+     "pool_available": 16384,
+     "pool_capacity": 16384,
+     "kernel_rx_drops": 0
+    },
+    "scenarios": {
+     "throughput": {
+      "summary": {
+       "offered_pps": {
+        "median": 368988.9,
+        "p95": 409317.4,
+        "min": 355732.7,
+        "max": 409317.4,
+        "n": 5
+       },
+       "delivered_pps": {
+        "median": 140605.37041656647,
+        "p95": 142089.10307041663,
+        "min": 139539.84124374928,
+        "max": 142089.10307041663,
+        "n": 5
+       },
+       "loss_pct": {
+        "median": 61.89441744415927,
+        "p95": 65.28632968828164,
+        "min": 60.67041366906475,
+        "max": 65.28632968828164,
+        "n": 5
+       },
+       "latency_p50_ns": {
+        "median": 14723569.0,
+        "p95": 14769398.3,
+        "min": 14484361.6,
+        "max": 14769398.3,
+        "n": 5
+       },
+       "latency_p95_ns": {
+        "median": 16502540.7,
+        "p95": 16566266.3,
+        "min": 16403782.4,
+        "max": 16566266.3,
+        "n": 5
+       },
+       "latency_p99_ns": {
+        "median": 17414795.4,
+        "p95": 17762189.5,
+        "min": 17215102.9,
+        "max": 17762189.5,
+        "n": 5
+       },
+       "latency_p999_ns": {
+        "median": 19994028.8,
+        "p95": 24874742.2,
+        "min": 18810811.9,
+        "max": 24874742.2,
+        "n": 5
+       },
+       "latency_max_ns": {
+        "median": 23914581.3,
+        "p95": 32083899.9,
+        "min": 20995370.4,
+        "max": 32083899.9,
+        "n": 5
+       },
+       "system_busy_pct": {
+        "median": 20.30094694512907,
+        "p95": 20.840926841968237,
+        "min": 19.963889605364972,
+        "max": 20.840926841968237,
+        "n": 5
+       },
+       "npf_cpu_pct": {
+        "median": 61.32294392984276,
+        "p95": 65.51707783026136,
+        "min": 57.75067533163127,
+        "max": 65.51707783026136,
+        "n": 5
+       }
+      },
+      "repetitions": [
+       {
+        "gen": {
+         "sent": 3690496,
+         "seconds": 10.001645,
+         "per_second": 368988.9,
+         "retries": 0,
+         "flows": 16,
+         "frame_bytes": 70,
+         "rate_requested": 0.0
+        },
+        "sink": {
+         "received": 1406285,
+         "bytes": 39375980,
+         "flows_seen": 16,
+         "missing": 2283096,
+         "late_or_duplicate": 0,
+         "foreign": 0,
+         "negative_latencies": 0,
+         "receive_window_s": 10.013501,
+         "tsc_ticks_per_ns": 2.419207,
+         "calibration_s": 10.661,
+         "latency_ns": {
+          "min": 2573832.0,
+          "p50": 14769398.3,
+          "p95": 16502540.7,
+          "p99": 17314350.2,
+          "p999": 20366499.7,
+          "max": 21511770.5
+         }
+        },
+        "cpu": {
+         "window_s": 10.028872728347778,
+         "system_busy_pct": 20.30094694512907,
+         "cpus": 8,
+         "npf_cpu_pct": 61.32294392984276
+        },
+        "offered_pps": 368988.9,
+        "delivered_pps": 140605.37041656647,
+        "loss_pct": 61.89441744415927
+       },
+       {
+        "gen": {
+         "sent": 3738624,
+         "seconds": 10.002357,
+         "per_second": 373774.3,
+         "retries": 0,
+         "flows": 16,
+         "frame_bytes": 70,
+         "rate_requested": 0.0
+        },
+        "sink": {
+         "received": 1408233,
+         "bytes": 39430524,
+         "flows_seen": 16,
+         "missing": 2330391,
+         "late_or_duplicate": 0,
+         "foreign": 0,
+         "negative_latencies": 0,
+         "receive_window_s": 10.000593,
+         "tsc_ticks_per_ns": 2.419204,
+         "calibration_s": 10.669,
+         "latency_ns": {
+          "min": 2430889.4,
+          "p50": 14484361.6,
+          "p95": 16403782.4,
+          "p99": 17215102.9,
+          "p999": 18810811.9,
+          "max": 20995370.4
+         }
+        },
+        "cpu": {
+         "window_s": 10.039275884628296,
+         "system_busy_pct": 20.051948051948052,
+         "cpus": 8,
+         "npf_cpu_pct": 60.661745627737396
+        },
+        "offered_pps": 373774.3,
+        "delivered_pps": 140790.11576971307,
+        "loss_pct": 62.332852942686934
+       },
+       {
+        "gen": {
+         "sent": 3558400,
+         "seconds": 10.003015,
+         "per_second": 355732.7,
+         "retries": 0,
+         "flows": 16,
+         "frame_bytes": 70,
+         "rate_requested": 0.0
+        },
+        "sink": {
+         "received": 1399504,
+         "bytes": 39186112,
+         "flows_seen": 16,
+         "missing": 2158757,
+         "late_or_duplicate": 0,
+         "foreign": 0,
+         "negative_latencies": 0,
+         "receive_window_s": 10.005517,
+         "tsc_ticks_per_ns": 2.419201,
+         "calibration_s": 10.665,
+         "latency_ns": {
+          "min": 2935584.3,
+          "p50": 14595996.0,
+          "p95": 16477650.6,
+          "p99": 17441675.0,
+          "p999": 24874742.2,
+          "max": 32083899.9
+         }
+        },
+        "cpu": {
+         "window_s": 10.029473781585693,
+         "system_busy_pct": 20.61842276211511,
+         "cpus": 8,
+         "npf_cpu_pct": 63.81192213444461
+        },
+        "offered_pps": 355732.7,
+        "delivered_pps": 139908.2176723718,
+        "loss_pct": 60.67041366906475
+       },
+       {
+        "gen": {
+         "sent": 3584000,
+         "seconds": 10.001244,
+         "per_second": 358355.4,
+         "retries": 0,
+         "flows": 16,
+         "frame_bytes": 70,
+         "rate_requested": 0.0
+        },
+        "sink": {
+         "received": 1395572,
+         "bytes": 39076016,
+         "flows_seen": 16,
+         "missing": 2188428,
+         "late_or_duplicate": 0,
+         "foreign": 0,
+         "negative_latencies": 0,
+         "receive_window_s": 10.007208,
+         "tsc_ticks_per_ns": 2.419202,
+         "calibration_s": 10.663,
+         "latency_ns": {
+          "min": 2793835.7,
+          "p50": 14723569.0,
+          "p95": 16566266.3,
+          "p99": 17762189.5,
+          "p999": 19994028.8,
+          "max": 26899361.1
+         }
+        },
+        "cpu": {
+         "window_s": 10.02791976928711,
+         "system_busy_pct": 20.840926841968237,
+         "cpus": 8,
+         "npf_cpu_pct": 65.51707783026136
+        },
+        "offered_pps": 358355.4,
+        "delivered_pps": 139539.84124374928,
+        "loss_pct": 61.06104910714286
+       },
+       {
+        "gen": {
+         "sent": 4093952,
+         "seconds": 10.0019,
+         "per_second": 409317.4,
+         "retries": 0,
+         "flows": 16,
+         "frame_bytes": 70,
+         "rate_requested": 0.0
+        },
+        "sink": {
+         "received": 1421161,
+         "bytes": 39792508,
+         "flows_seen": 16,
+         "missing": 2671820,
+         "late_or_duplicate": 0,
+         "foreign": 0,
+         "negative_latencies": 0,
+         "receive_window_s": 10.0075,
+         "tsc_ticks_per_ns": 2.419201,
+         "calibration_s": 10.675,
+         "latency_ns": {
+          "min": 854210.8,
+          "p50": 14759098.4,
+          "p95": 16564493.7,
+          "p99": 17414795.4,
+          "p999": 19271062.6,
+          "max": 23914581.3
+         }
+        },
+        "cpu": {
+         "window_s": 10.043172597885132,
+         "system_busy_pct": 19.963889605364972,
+         "cpus": 8,
+         "npf_cpu_pct": 57.75067533163127
+        },
+        "offered_pps": 409317.4,
+        "delivered_pps": 142089.10307041663,
+        "loss_pct": 65.28632968828164
+       }
+      ]
+     },
+     "latency": {
+      "summary": {
+       "offered_pps": {
+        "median": 20000.1,
+        "p95": 20000.1,
+        "min": 20000.1,
+        "max": 20000.1,
+        "n": 5
+       },
+       "delivered_pps": {
+        "median": 20000.091677716155,
+        "p95": 20000.091677716155,
+        "min": 20000.08569870905,
+        "max": 20000.091677716155,
+        "n": 5
+       },
+       "loss_pct": {
+        "median": 0.0,
+        "p95": 0.0,
+        "min": 0.0,
+        "max": 0.0,
+        "n": 5
+       },
+       "latency_p50_ns": {
+        "median": 8665144.1,
+        "p95": 8676184.1,
+        "min": 8628149.6,
+        "max": 8676184.1,
+        "n": 5
+       },
+       "latency_p95_ns": {
+        "median": 15607503.0,
+        "p95": 15633631.2,
+        "min": 15535753.8,
+        "max": 15633631.2,
+        "n": 5
+       },
+       "latency_p99_ns": {
+        "median": 16309227.2,
+        "p95": 16323335.8,
+        "min": 16191521.7,
+        "max": 16323335.8,
+        "n": 5
+       },
+       "latency_p999_ns": {
+        "median": 17562470.9,
+        "p95": 19056264.3,
+        "min": 16552445.2,
+        "max": 19056264.3,
+        "n": 5
+       },
+       "latency_max_ns": {
+        "median": 21307758.7,
+        "p95": 26557511.9,
+        "min": 17189289.9,
+        "max": 26557511.9,
+        "n": 5
+       },
+       "system_busy_pct": {
+        "median": 12.754973558297658,
+        "p95": 12.832137010452085,
+        "min": 12.731627379301651,
+        "max": 12.832137010452085,
+        "n": 5
+       },
+       "npf_cpu_pct": {
+        "median": 8.650877754677705,
+        "p95": 10.336377724930948,
+        "min": 8.449975299437584,
+        "max": 10.336377724930948,
+        "n": 5
+       }
+      },
+      "repetitions": [
+       {
+        "gen": {
+         "sent": 200704,
+         "seconds": 10.035156,
+         "per_second": 20000.1,
+         "retries": 0,
+         "flows": 16,
+         "frame_bytes": 70,
+         "rate_requested": 20000.0
+        },
+        "sink": {
+         "received": 200704,
+         "bytes": 5619712,
+         "flows_seen": 16,
+         "missing": 0,
+         "late_or_duplicate": 0,
+         "foreign": 0,
+         "negative_latencies": 0,
+         "receive_window_s": 10.044788,
+         "tsc_ticks_per_ns": 2.419202,
+         "calibration_s": 10.688,
+         "latency_ns": {
+          "min": 425459.3,
+          "p50": 8647836.5,
+          "p95": 15535753.8,
+          "p99": 16191521.7,
+          "p999": 16552445.2,
+          "max": 17189289.9
+         }
+        },
+        "cpu": {
+         "window_s": 10.061551809310913,
+         "system_busy_pct": 12.78746525145312,
+         "cpus": 8,
+         "npf_cpu_pct": 10.336377724930948
+        },
+        "offered_pps": 20000.1,
+        "delivered_pps": 20000.087691711018,
+        "loss_pct": 0.0
+       },
+       {
+        "gen": {
+         "sent": 200704,
+         "seconds": 10.035154,
+         "per_second": 20000.1,
+         "retries": 0,
+         "flows": 16,
+         "frame_bytes": 70,
+         "rate_requested": 20000.0
+        },
+        "sink": {
+         "received": 200704,
+         "bytes": 5619712,
+         "flows_seen": 16,
+         "missing": 0,
+         "late_or_duplicate": 0,
+         "foreign": 0,
+         "negative_latencies": 0,
+         "receive_window_s": 10.022598,
+         "tsc_ticks_per_ns": 2.419202,
+         "calibration_s": 10.685,
+         "latency_ns": {
+          "min": 405685.0,
+          "p50": 8665144.1,
+          "p95": 15593113.6,
+          "p99": 16263026.7,
+          "p999": 17547842.9,
+          "max": 21867886.8
+         }
+        },
+        "cpu": {
+         "window_s": 10.057649850845337,
+         "system_busy_pct": 12.731627379301651,
+         "cpus": 8,
+         "npf_cpu_pct": 8.848985729257578
+        },
+        "offered_pps": 20000.1,
+        "delivered_pps": 20000.091677716155,
+        "loss_pct": 0.0
+       },
+       {
+        "gen": {
+         "sent": 200704,
+         "seconds": 10.035154,
+         "per_second": 20000.1,
+         "retries": 0,
+         "flows": 16,
+         "frame_bytes": 70,
+         "rate_requested": 20000.0
+        },
+        "sink": {
+         "received": 200704,
+         "bytes": 5619712,
+         "flows_seen": 16,
+         "missing": 0,
+         "late_or_duplicate": 0,
+         "foreign": 0,
+         "negative_latencies": 0,
+         "receive_window_s": 10.046471,
+         "tsc_ticks_per_ns": 2.419201,
+         "calibration_s": 10.676,
+         "latency_ns": {
+          "min": 408527.8,
+          "p50": 8628149.6,
+          "p95": 15612014.1,
+          "p99": 16309227.2,
+          "p999": 19056264.3,
+          "max": 26557511.9
+         }
+        },
+        "cpu": {
+         "window_s": 10.053261041641235,
+         "system_busy_pct": 12.736443883984867,
+         "cpus": 8,
+         "npf_cpu_pct": 8.454967959941028
+        },
+        "offered_pps": 20000.1,
+        "delivered_pps": 20000.091677716155,
+        "loss_pct": 0.0
+       },
+       {
+        "gen": {
+         "sent": 200704,
+         "seconds": 10.035154,
+         "per_second": 20000.1,
+         "retries": 0,
+         "flows": 16,
+         "frame_bytes": 70,
+         "rate_requested": 20000.0
+        },
+        "sink": {
+         "received": 200704,
+         "bytes": 5619712,
+         "flows_seen": 16,
+         "missing": 0,
+         "late_or_duplicate": 0,
+         "foreign": 0,
+         "negative_latencies": 0,
+         "receive_window_s": 10.04445,
+         "tsc_ticks_per_ns": 2.419201,
+         "calibration_s": 10.688,
+         "latency_ns": {
+          "min": 435700.9,
+          "p50": 8676184.1,
+          "p95": 15607503.0,
+          "p99": 16311743.3,
+          "p999": 18079555.9,
+          "max": 20479836.3
+         }
+        },
+        "cpu": {
+         "window_s": 10.056782960891724,
+         "system_busy_pct": 12.832137010452085,
+         "cpus": 8,
+         "npf_cpu_pct": 8.650877754677705
+        },
+        "offered_pps": 20000.1,
+        "delivered_pps": 20000.091677716155,
+        "loss_pct": 0.0
+       },
+       {
+        "gen": {
+         "sent": 200704,
+         "seconds": 10.035157,
+         "per_second": 20000.1,
+         "retries": 0,
+         "flows": 16,
+         "frame_bytes": 70,
+         "rate_requested": 20000.0
+        },
+        "sink": {
+         "received": 200704,
+         "bytes": 5619712,
+         "flows_seen": 16,
+         "missing": 0,
+         "late_or_duplicate": 0,
+         "foreign": 0,
+         "negative_latencies": 0,
+         "receive_window_s": 10.022061,
+         "tsc_ticks_per_ns": 2.419201,
+         "calibration_s": 10.693,
+         "latency_ns": {
+          "min": 439747.7,
+          "p50": 8671530.2,
+          "p95": 15633631.2,
+          "p99": 16323335.8,
+          "p999": 17562470.9,
+          "max": 21307758.7
+         }
+        },
+        "cpu": {
+         "window_s": 10.059201002120972,
+         "system_busy_pct": 12.754973558297658,
+         "cpus": 8,
+         "npf_cpu_pct": 8.449975299437584
+        },
+        "offered_pps": 20000.1,
+        "delivered_pps": 20000.08569870905,
+        "loss_pct": 0.0
+       }
+      ]
+     }
+    }
+   }
+  ],
+  "method": {
+   "flows": 16,
+   "frame_bytes": 70,
+   "latency_scenario_rate": 20000,
+   "repetitions": 5,
+   "seconds_per_repetition": 10,
+   "warmup_s": 2,
+   "label": "bp-before-mmap-b2",
+   "npf_args": "--io mmap",
+   "cpus": {
+    "gen": 6,
+    "sink": 7,
+    "npf": "0-5"
+   }
+  }
+ }
+}
