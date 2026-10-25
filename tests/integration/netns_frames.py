@@ -26,6 +26,10 @@
         say where they first differ, and exit 1.
     netns_frames.py same-frames-untagged <a.pcap> <b.pcap>
         The same, with any outer VLAN tag taken out of every frame on both sides first.
+    netns_frames.py same-counters <stats> <expected.json>
+        Exit 0 if every counter in npf's table <stats> ("name value" lines) has the value the
+        golden case's <expected.json> gives it, and each names the same counters; otherwise print
+        the differences, and exit 1.
     netns_frames.py same-frame-set <expected.pcap> <file>...
         Exit 0 if the files together hold exactly the frames <expected.pcap> does, in any order:
         a replay writes every port's frames to one file, and a live run's leave by several ports.
@@ -242,6 +246,19 @@ def untagged(frame):
     return frame[:12] + frame[16:] if tagged else frame
 
 
+def same_counters(stats, expected):
+    import json
+    with open(stats, encoding="ascii") as f:
+        have = {k: int(v) for k, v in (line.split() for line in f if line.strip())}
+    with open(expected, encoding="ascii") as f:
+        want = json.load(f)
+    bad = [f"{k}: {have.get(k)} here, {want.get(k)} expected"
+           for k in sorted(set(have) | set(want)) if have.get(k) != want.get(k)]
+    for line in bad:
+        print(line)
+    return 1 if bad else 0
+
+
 def same_frame_set(expected, *files, strip_vlan=False):
     want = sorted(untagged(f) if strip_vlan else f for f in read_pcap(expected))
     got = sorted(frame for f in files for frame in read_pcap(f))
@@ -267,6 +284,7 @@ def main(argv):
         "send-pcap": (send_pcap, 2),
         "count": (lambda f: print(len(read_pcap(f))), 1),
         "same-frames": (same_frames, 2),
+        "same-counters": (same_counters, 2),
         "same-frames-untagged": (lambda a, b: same_frames(a, b, strip_vlan=True), 2),
         "same-frame-set": (same_frame_set, -2),  # negative: at least that many
         "same-frame-set-untagged": (lambda *f: same_frame_set(*f, strip_vlan=True), -2),

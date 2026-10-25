@@ -121,6 +121,7 @@ live() { # live <case> <backend>
   read -ra args <<< "$(args_of "$2")"
   log="$WORK/$name.$io.log"
   rm -f "$WORK/npf.pid"
+  : > "$log"  # there before npf is, so the wait below never reads a file that is not yet there
   ip netns exec ns-eqr "$NPF" run "${args[@]}" --config "$WORK/$name.conf" --pidfile "$WORK/npf.pid" \
     --stats-file "$WORK/npf.stats" > "$log" 2>&1 &
   NPF_PID=$!
@@ -135,17 +136,33 @@ live() { # live <case> <backend>
     NPF_PID=""
     return 1
   fi
+  # Each capture says "listening" once its socket is bound, into a file of its own run: a file
+  # reused from the last run would say it at once, before this capture could hear anything.
   CAPTURES=()
+  local ready
   for port in "${PORTS[@]}"; do
+    ready="$WORK/$name.$io.p$port.ready"
+    rm -f "$ready"
     ip netns exec ns-eqp "${FRAMES[@]}" pcap "p$port" 30 "$WORK/$name.$io.p$port.pcap" \
-      > "$WORK/cap.p$port" 2>&1 &
+      > "$ready" 2>&1 &
     CAPTURES+=($!)
   done
   for port in "${PORTS[@]}"; do
-    for _ in $(seq 100); do
-      grep -q listening "$WORK/cap.p$port" 2>/dev/null && break
+    ready="$WORK/$name.$io.p$port.ready"
+    for _ in $(seq 200); do
+      grep -q listening "$ready" 2>/dev/null && break
       sleep 0.05
     done
+    if ! grep -q listening "$ready" 2>/dev/null; then
+      fail "$name, $io: the capture on p$port did not start"
+      sed 's/^/    /' "$ready"
+      kill -TERM "${CAPTURES[@]}" 2>/dev/null
+      kill -INT "$NPF_PID"
+      wait
+      NPF_PID=""
+      CAPTURES=()
+      return 1
+    fi
   done
   ip netns exec ns-eqp "${FRAMES[@]}" send-pcap p0 "$GOLDEN/$name.pcap"
   sleep 0.5
@@ -199,7 +216,21 @@ for conf in "$GOLDEN"/*.conf; do
       [[ $name == vlan ]] && what="identical but for any VLAN tag"
       pass "$name: each port's frames $what between $reference and $io (${counts%, })"
     fi
-    if diff -q "$WORK/$name.$reference.stats" "$WORK/$name.$io.stats" > /dev/null; then
+    files=()
+    for port in "${PORTS[@]}"; do
+      files+=("$WORK/$name.$io.p$port.pcap")
+    done
+    if [[ $name == vlan ]] &&
+      "${FRAMES[@]}" same-frame-set "$GOLDEN/$name.expected.pcap" "${files[@]}" > /dev/null; then
+      # It kept the tag the reference lost, so its byte counts are 4 a frame higher: they are held
+      # to the golden case's own counters, which count the tag, instead.
+      if out=$("${FRAMES[@]}" same-counters "$WORK/$name.$io.stats" "$GOLDEN/$name.expected.json"); then
+        pass "$name: $io's final counters are the golden case's, VLAN tag counted"
+      else
+        fail "$name: $io kept the VLAN tag, but its counters are not the golden case's"
+        echo "$out" | sed 's/^/    /'
+      fi
+    elif diff -q "$WORK/$name.$reference.stats" "$WORK/$name.$io.stats" > /dev/null; then
       pass "$name: the same final counters on $reference and $io"
     else
       fail "$name: the final counters differ ($reference <, $io >)"
