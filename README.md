@@ -336,11 +336,12 @@ ctest --preset dev -R golden --output-on-failure
 - **VLANs.** One 802.1Q (`0x8100`) or 802.1ad (`0x88a8`) tag is parsed and carried, not
   interpreted: the frame is routed as if it were untagged and leaves with the same tag, or is
   switched with the tag untouched. A second tag (QinQ) is not unwrapped, and a frame for the router
-  with one is dropped as an unsupported EtherType. That is what `npf replay` does. **Live, on
-  either socket backend, the tag is lost:** the kernel takes it out of a received frame before a
-  packet socket reads it, passing it alongside instead (`PACKET_AUXDATA`, or the TPACKET_V3
-  header), and npf does not read it back, so a tagged frame is forwarded untagged.
-  `tests/integration/test_io_equivalence.sh` checks exactly this.
+  with one is dropped as an unsupported EtherType. That is what `npf replay` does, and what
+  `--io xdp` does live: XDP sees the frame before the kernel touches it. **Live, on the socket
+  backends, `af_packet` and `mmap`, the tag is lost.** The kernel takes it out of a received
+  frame before a packet socket reads it, passing it alongside instead (`PACKET_AUXDATA`, or the
+  TPACKET_V3 header). npf does not read it back, so a tagged frame is forwarded untagged.
+  `tests/integration/test_io_equivalence.sh` checks both behaviours.
 - **Zero-copy.** Both socket backends copy every frame between the kernel's memory and a pool
   buffer, once on the way in and once on the way out. PACKET_MMAP saves the system call per
   frame, not the copies. With `mmap`, the 10 ms block timeout is fixed, as are the ring sizes:

@@ -1311,6 +1311,144 @@ All passed on 2026-10-25, under sudo:
 
 Also: the ThreadSanitizer soak passed on both backends, with nothing reported.
 
+## Phase 17: AF_XDP
+
+`--io xdp` (`src/io/af_xdp.cpp`) puts one AF_XDP socket on queue 0 of each port. Each socket
+has a UMEM of its own: 4096 frames of 2048 bytes. The XDP program `bpf/xdp_redirect.c` hands
+every frame to that socket.
+
+- **`--xdp-mode skb`** runs the program in the kernel's generic receive path, and **`native`**
+  in the veth driver.
+- **Copies.** veth has no zero-copy, so both modes copy each frame into the UMEM and npf copies
+  it out again, as with the other backends. What AF_XDP saves on receive is the rest of the
+  kernel's network stack.
+- **One worker.** One socket per port means one queue and no fanout, so only rtc:1 is measured.
+- **The kernel.** No custom kernel was needed: the stock WSL2 kernel has AF_XDP
+  (`docs/wsl2-custom-kernel.md`).
+
+**Method.** As phase 16. Two sessions of `scripts/run_bench.sh --compare-io`, on `eeb8b1c`:
+
+- **a** started at 10:28 UTC, with WSL up for 24,914 s;
+- **b** started at 11:20 UTC, up 27,994 s.
+
+A WSL restart between them was asked for, and the uptimes show it did not happen: both ran on
+one boot, about 50 minutes apart.
+
+Each session ran the kernel control, then rtc:1, rtc:2 and pipeline:2 on `af_packet` and on
+`mmap`, and rtc:1 on `xdp` in skb and in native mode. As in phase 16, where the loss is 0.0% the
+delivered rate is gen's, not npf's.
+
+### Session a (`bench/results/2026-10-25-eeb8b1c-compare-io-p17a.json`)
+
+git eeb8b1cac044, 2026-10-25T10:46:58+00:00
+
+| configuration | offered, kpps | delivered, kpps: median (min-max) | loss, % | npf CPU, % | npf CPU per datagram, us | p50 latency at 20 kpps, us | p99, us |
+|---|---|---|---|---|---|---|---|
+| kernel control | 346.7 | 346.7 (302.9-352.6) | 0.0 | - | - | 28.3 | 546.4 |
+| pipeline:2, af_packet | 213.7 | 183.8 (151.5-194.0) | 16.6 | 305 | 16.62 | 149.3 | 30432.8 |
+| pipeline:2, mmap | 261.0 | 261.0 (168.7-324.3) | 0.0 | 177 | 6.81 | 8636.0 | 16277.0 |
+| rtc:1, af_packet | 430.3 | 260.5 (235.8-271.6) | 39.0 | 100 | 3.84 | 61.1 | 2372.2 |
+| rtc:1, mmap | 372.0 | 299.6 (278.4-308.2) | 19.5 | 99 | 3.30 | 8816.8 | 16113.4 |
+| rtc:1, xdp-native | 376.8 | 366.0 (346.1-379.8) | 2.3 | 99 | 2.71 | 60.3 | 435.3 |
+| rtc:1, xdp-skb | 419.0 | 348.8 (304.2-408.4) | 16.8 | 100 | 2.85 | 58.9 | 1507.1 |
+| rtc:2, af_packet | 262.0 | 259.9 (241.8-277.4) | 0.8 | 170 | 6.56 | 66.1 | 144.6 |
+| rtc:2, mmap | 397.6 | 397.6 (391.9-407.7) | 0.0 | 112 | 2.81 | 8393.5 | 16082.0 |
+
+### Session b (`bench/results/2026-10-25-eeb8b1c-compare-io-p17b.json`)
+
+git eeb8b1cac044, 2026-10-25T11:38:41+00:00
+
+| configuration | offered, kpps | delivered, kpps: median (min-max) | loss, % | npf CPU, % | npf CPU per datagram, us | p50 latency at 20 kpps, us | p99, us |
+|---|---|---|---|---|---|---|---|
+| kernel control | 348.5 | 348.5 (323.4-368.1) | 0.0 | - | - | 25.7 | 92.4 |
+| pipeline:2, af_packet | 241.2 | 195.4 (190.1-199.2) | 19.4 | 314 | 15.79 | 120.0 | 262.8 |
+| pipeline:2, mmap | 373.4 | 373.4 (350.1-381.2) | 0.0 | 181 | 4.80 | 8503.0 | 16255.5 |
+| rtc:1, af_packet | 447.0 | 271.2 (264.2-313.9) | 38.9 | 101 | 3.71 | 57.1 | 157.3 |
+| rtc:1, mmap | 409.5 | 328.4 (324.8-330.0) | 19.8 | 101 | 3.08 | 8646.9 | 16387.0 |
+| rtc:1, xdp-native | 465.3 | 446.2 (441.4-454.8) | 4.7 | 101 | 2.23 | 58.2 | 159.7 |
+| rtc:1, xdp-skb | 522.7 | 434.7 (426.3-436.2) | 17.7 | 101 | 2.34 | 57.1 | 150.0 |
+| rtc:2, af_packet | 338.5 | 333.2 (325.9-340.2) | 1.4 | 175 | 5.19 | 65.3 | 140.5 |
+| rtc:2, mmap | 408.9 | 408.9 (391.7-422.4) | 0.0 | 114 | 2.77 | 8526.7 | 16338.1 |
+
+### Across the two sessions: the range of the session medians
+
+| configuration | offered, kpps | delivered, kpps | loss, % | npf CPU per datagram, us | p50 latency at 20 kpps, us | p99, us |
+|---|---|---|---|---|---|---|
+| kernel control | 346.7-348.5 | 346.7-348.5 | 0.0-0.0 | - | 25.7-28.3 | 92.4-546.4 |
+| pipeline:2, af_packet | 213.7-241.2 | 183.8-195.4 | 16.6-19.4 | 15.79-16.62 | 120.0-149.3 | 262.8-30432.8 |
+| pipeline:2, mmap | 261.0-373.4 | 261.0-373.4 | 0.0-0.0 | 4.80-6.81 | 8503.0-8636.0 | 16255.5-16277.0 |
+| rtc:1, af_packet | 430.3-447.0 | 260.5-271.2 | 38.9-39.0 | 3.71-3.84 | 57.1-61.1 | 157.3-2372.2 |
+| rtc:1, mmap | 372.0-409.5 | 299.6-328.4 | 19.5-19.8 | 3.08-3.30 | 8646.9-8816.8 | 16113.4-16387.0 |
+| rtc:1, xdp-native | 376.8-465.3 | 366.0-446.2 | 2.3-4.7 | 2.23-2.71 | 58.2-60.3 | 159.7-435.3 |
+| rtc:1, xdp-skb | 419.0-522.7 | 348.8-434.7 | 16.8-17.7 | 2.34-2.85 | 57.1-58.9 | 150.0-1507.1 |
+| rtc:2, af_packet | 262.0-338.5 | 259.9-333.2 | 0.8-1.4 | 5.19-6.56 | 65.3-66.1 | 140.5-144.6 |
+| rtc:2, mmap | 397.6-408.9 | 397.6-408.9 | 0.0-0.0 | 2.77-2.81 | 8393.5-8526.7 | 16082.0-16338.1 |
+
+### What it shows
+
+**One worker, run to completion (rtc:1).** In every rtc:1 row npf is at 99-101% of a CPU, and
+loses part of what gen offers, so these rows measure npf.
+
+- **AF_XDP delivers the most.** In the medians across the sessions: xdp native 366.0-446.2 kpps,
+  xdp skb 348.8-434.7, mmap 299.6-328.4, af_packet 260.5-271.2. Neither xdp range overlaps
+  mmap's. Within each session the repetition ranges of native and mmap are apart; skb's and
+  mmap's are apart in session b and overlap in session a.
+- **It costs the least of npf's CPU per datagram:** 2.23-2.71 µs in native mode and 2.34-2.85
+  µs in skb mode, against mmap's 3.08-3.30 and af_packet's 3.71-3.84. Neither xdp range
+  overlaps mmap's.
+- **It keeps af_packet's latency.** The median at 20,000 datagrams a second was 58.2-60.3 µs in
+  native mode and 57.1-58.9 µs in skb mode, against af_packet's 57.1-61.1 µs. That is two orders
+  of magnitude below mmap's 8646.9-8816.8 µs: there is no block to wait for.
+- **Memory:** a peak RSS of 29,952-30,080 KiB, with 8 MiB of UMEM per port, between af_packet's
+  13,056-13,184 KiB and mmap's 80,640-80,768 KiB.
+
+**Native against skb mode.**
+
+- **Delivered.** Within session b, native's repetitions (441.4-454.8 kpps) were above all of
+  skb's (426.3-436.2). In session a the two ranges overlap, 346.1-379.8 against 304.2-408.4.
+- **CPU per datagram.** Native was lower in both sessions, 2.71 against 2.85 µs and 2.23 against
+  2.34. Across the sessions the two ranges overlap.
+- **Loss.** Native lost 2.3-4.7% against skb's 16.8-17.7%. But gen offered skb more:
+  419.0-522.7 kpps against 376.8-465.3. So the loss is not a like-for-like comparison, and
+  neither is the kernel's drop count it matches (XDP_STATISTICS: 0.5 and 1.2 million in native
+  mode, 3.8 and 4.8 million in skb mode).
+- **Latency** goes the other way, if anything: skb's p50 at 20 kpps was 57.1-58.9 µs against
+  native's 58.2-60.3. The ranges overlap.
+- **Reading.** Native leads in delivered rate, CPU per datagram and loss, in both sessions. The
+  margin is clear only in session b, so it is called a consistent lead, not a measured gap.
+
+**The multi-worker and pipeline rows** are af_packet and mmap only. This phase did not change
+them, and they are reported again here as part of the same sessions.
+
+**Verdict: on one worker, AF_XDP is the fastest and cheapest of the three backends, with the
+latency of af_packet; native mode leads skb mode in throughput and CPU.** It does not yet scale past one worker
+(README, Not implemented), and that is what keeps `mmap` and `af_packet` the backends for rtc:2
+and the pipeline. As in phase 16, how far above gen's rate xdp would go is not measured.
+
+### Exit test
+
+All passed on 2026-10-25, under sudo:
+
+1. **`docs/wsl2-custom-kernel.md`** says how to check a stock WSL2 install for AF_XDP, gives
+   what this machine showed, and keeps the procedure for building a kernel that lacks it. That
+   procedure is marked as not run, because this kernel needed no rebuild.
+2. **Every golden case gives the same output on `--io xdp`, in both modes, as on af_packet.**
+   `tests/integration/test_io_equivalence.sh` ran twice in a row, passing every check: 146 in
+   all, across af_packet, mmap, xdp skb and xdp native. The `vlan` case differs, for the better:
+   - XDP sees the frame before the kernel takes its VLAN tag out, so xdp forwards it **with** the
+     tag. That is the golden case's expected output, counters included.
+   - af_packet and mmap forward it untagged, as documented.
+
+   An earlier run failed on `basic_fwd`. af_packet's capture held no frame, while its counters
+   matched the other backends', whose captures held the expected frame. That was a race in the
+   test itself: a capture's "ready" file was reused from the previous run. It was fixed before
+   these two runs.
+3. **The phase 6, 7, 8 and 12 integration tests pass with `--io xdp`, in skb and in native mode.**
+   So do 60 s of full-rate traffic in each mode with no interval stalled, and 30 s under
+   ThreadSanitizer.
+4. **`run_bench.sh --compare-io` shows the kernel control, af_packet, mmap and xdp**, with skb and
+   native mode separately: the tables above.
+
 ## Phase 3: checksum microbenchmark (tier A)
 
 **What.** `bench/micro/bench_checksum.cpp` times the three checksum paths in
@@ -1705,6 +1843,11 @@ Ideas noted for later phases, not done.
   is gen's, and so is the kernel control's. Several gens, or a faster one, would find the
   ceilings.
 - **Why the offered rate depends on the receiver** (phase 16, and phase 15's four workers below).
+- **AF_XDP on several workers** (phase 17): multi-queue veths, one socket per queue, a shared
+  UMEM or one per queue. It is the step that would let xdp be compared on rtc:2 and pipeline:2.
+- **Native against skb XDP, at one offered rate** (phase 17). gen offered skb mode more than
+  native mode, so their loss could not be compared; a fixed rate below both ceilings, or a
+  faster sender, would.
 - **Why 4 run-to-completion workers slow the sender** (phase 15). gen offered 83.1 kpps into npf
   with 4 workers against 423.6 kpps with 1. What the sender's CPU does on the receiving side's
   behalf, per fanout socket and per wake-up, was not measured.
