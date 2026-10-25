@@ -4,7 +4,7 @@ A userspace Layer-2/Layer-3 packet forwarding engine — a software router — w
 Linux. It receives raw Ethernet frames from network interfaces, parses them, makes forwarding
 decisions, rewrites headers and transmits them out of the correct interface.
 
-**Status: phase 17 of 19.** `npf` routes IPv4 between Linux interfaces. It runs every packet
+**Status: phase 18 of 19.** `npf` routes IPv4 between Linux interfaces. It runs every packet
 through a fixed fourteen-step pipeline: parse, validate, route,
 resolve the next hop, rewrite the MAC addresses, decrement the TTL and patch the checksum. Every
 packet it drops is counted under a reason. It resolves its neighbours with ARP itself: a packet
@@ -74,6 +74,23 @@ The stock WSL2 kernel already has AF_XDP, so no custom kernel was built.
 [`docs/wsl2-custom-kernel.md`](docs/wsl2-custom-kernel.md) says how to check, and how one would
 be built for a kernel that lacks it. The same integration test runs every golden case through
 `xdp` in both modes too.
+
+It runs on aarch64 as well as x86-64. CI builds it and runs its whole test suite on GitHub's arm64
+runner, with GCC and Clang alike.
+
+- **Checksums.** The one place it uses SIMD is the Internet checksum, with an AVX2 sum on x86-64
+  (chosen at run time, when the CPU has AVX2) and a NEON sum on aarch64. Both are held to a
+  byte-at-a-time reference at every length and alignment.
+  - They are used only for the ICMP message checksum, where a full-size echo reply measured
+    27.5% fewer cycles.
+  - The per-packet header check stays scalar: on 20 bytes the vector sums measured slower, on
+    every machine tried.
+- **Memory ordering.** `tests/arch/` holds a demonstration of why the rings publish with
+  `release`: with `relaxed` instead, an arm64 core read a slot before its value had arrived in
+  each of 5 runs, and no x86 machine ever did.
+
+[`docs/performance.md`](docs/performance.md) has the numbers for an x86 laptop, an x86 cloud
+VM and an arm64 cloud VM.
 
 It is measured at two tiers, kept apart. Tier A times the forwarding code in process, with no I/O:
 parsing, FIB lookups in each of the four tables, the whole fourteen-step pipeline, the packet pool

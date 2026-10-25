@@ -1449,6 +1449,167 @@ All passed on 2026-10-25, under sudo:
 4. **`run_bench.sh --compare-io` shows the kernel control, af_packet, mmap and xdp**, with skb and
    native mode separately: the tables above.
 
+## Phase 18: aarch64, and the SIMD checksums
+
+`npf_proto` has three one's complement sums (ARCHITECTURE.md §4):
+
+- **scalar:** the portable loop, `ones_complement_sum`;
+- **AVX2:** on x86-64, chosen at run time when the CPU has it;
+- **NEON:** on aarch64, chosen at compile time.
+
+All three are held to `checksum_reference()` at every length from 0 to 2048 bytes and every
+start offset from 0 to 31, and fuzzed.
+
+### The checksum on three machines
+
+**Method.** `bench_checksum`, on each machine pinned to one CPU, 7 repetitions, aggregates
+only, every build GCC 13.3.0 with `-O2 -g -DNDEBUG -march=native`:
+
+- **The laptop**, this project's machine, at `ef6cc1a`, on CPU 2, started at a load average of
+  0.32 (`bench/results/2026-10-25-ef6cc1a-checksum-laptop.json`).
+- **Two GitHub runners**, at `e62eb95`, on CPU 1, by `.github/workflows/arch.yml` on 2026-10-25
+  at 15:37 UTC (`bench/results/2026-10-25-e62eb95-arch/`):
+  - `ubuntu-24.04`, an AMD EPYC 7763;
+  - `ubuntu-24.04-arm`, an ARM Neoverse-N2.
+
+  Each is a shared cloud VM with 4 vCPUs, and its numbers are its own.
+
+The two commits differ only in formatting and the workflow file: the sums are the same code.
+The machines differ in more than their architecture, so a comparison **across** columns says
+which machine was faster, not which architecture. The comparisons that mean something are made
+**within** each machine.
+
+#### laptop (i5-1135G7)
+
+`LAPTOP-5AABPJVI`, 8 CPUs at 2419 MHz, GNU 13.3.0, `-O2 -g -DNDEBUG -march=native`, git ef6cc1a
+
+| bytes | scalar, ns: median (p95; min-max) | vector, ns | fast, ns |
+|---|---|---|---|
+| 20 | 11.2 (12.1; 8.6-12.1) | 13.5 (16.2; 13.2-16.2) avx2 | 14.7 (16.2; 13.9-16.2) avx2 |
+| 60 | 26.2 (34.4; 25.2-34.4) | 20.1 (21.5; 18.5-21.5) avx2 | 22.1 (23.7; 19.7-23.7) avx2 |
+| 576 | 233.9 (267.7; 204.1-267.7) | 22.2 (25.3; 21.1-25.3) avx2 | 25.2 (28.4; 23.0-28.4) avx2 |
+| 1500 | 653.8 (763.7; 588.4-763.7) | 70.6 (95.6; 67.6-95.6) avx2 | 80.4 (94.0; 68.3-94.0) avx2 |
+
+#### GitHub x86-64 (EPYC 7763)
+
+`runnervmtai0g`, 4 CPUs at 3241 MHz, GNU 13.3.0, `-O2 -g -DNDEBUG -march=native`, git e62eb95
+
+| bytes | scalar, ns: median (p95; min-max) | vector, ns | fast, ns |
+|---|---|---|---|
+| 20 | 7.0 (7.1; 7.0-7.1) | 9.3 (9.3; 9.2-9.3) avx2 | 9.5 (9.6; 9.5-9.6) avx2 |
+| 60 | 18.9 (18.9; 18.9-18.9) | 11.4 (11.5; 11.4-11.5) avx2 | 12.1 (12.1; 12.0-12.1) avx2 |
+| 576 | 187.1 (187.1; 187.0-187.1) | 14.0 (14.4; 14.0-14.4) avx2 | 15.3 (15.4; 15.3-15.4) avx2 |
+| 1500 | 474.6 (475.1; 474.6-475.1) | 40.3 (40.4; 40.0-40.4) avx2 | 40.9 (41.0; 40.9-41.0) avx2 |
+
+#### GitHub arm64 (Neoverse-N2)
+
+`runnervm4yw5a`, 4 CPUs at 2000 MHz, GNU 13.3.0, `-O2 -g -DNDEBUG -march=native`, git e62eb95
+
+| bytes | scalar, ns: median (p95; min-max) | vector, ns | fast, ns |
+|---|---|---|---|
+| 20 | 5.2 (5.2; 5.2-5.2) | 7.0 (7.0; 7.0-7.0) neon | 8.1 (8.1; 8.1-8.1) neon |
+| 60 | 8.3 (8.3; 8.2-8.3) | 9.7 (9.7; 9.7-9.7) neon | 10.9 (10.9; 10.8-10.9) neon |
+| 576 | 59.8 (59.8; 59.7-59.8) | 12.1 (12.2; 12.1-12.2) neon | 12.7 (12.7; 12.7-12.7) neon |
+| 1500 | 159.3 (159.7; 158.9-159.7) | 33.7 (33.7; 33.6-33.7) neon | 34.7 (34.8; 34.7-34.8) neon |
+
+#### The vector sum against the scalar one, on each machine
+
+| bytes | laptop (i5-1135G7) | GitHub x86-64 (EPYC 7763) | GitHub arm64 (Neoverse-N2) |
+|---|---|---|---|
+| 20 | 0.83x, slower (avx2) | 0.76x, slower (avx2) | 0.74x, slower (neon) |
+| 60 | 1.30x, faster (avx2) | 1.65x, faster (avx2) | 0.85x, slower (neon) |
+| 576 | 10.53x, faster (avx2) | 13.33x, faster (avx2) | 4.92x, faster (neon) |
+| 1500 | 9.26x, faster (avx2) | 11.78x, faster (avx2) | 4.73x, faster (neon) |
+
+A sum is called faster or slower only where its repetitions' range is apart from the scalar
+sum's on the same machine.
+
+### What it shows
+
+- **At 576 and 1500 bytes the vector sum wins on every machine:**
+  - 10.53x and 9.26x on the laptop;
+  - 13.33x and 11.78x on the EPYC;
+  - 4.92x and 4.73x on the Neoverse-N2.
+- **At 20 bytes it loses on every machine** (0.83x, 0.76x, 0.74x): the setup and the final fold
+  cost more than they save on a header. That is why `ipv4_checksum_valid`, run on every packet,
+  stays scalar.
+- **At 60 bytes the architectures part.** AVX2 is faster on both x86 machines (1.30x, 1.65x).
+  NEON is slower than scalar on the Neoverse-N2 (0.85x).
+- **The scalar loop on the Neoverse-N2** takes 159.3 ns for 1500 bytes, against 474.6 on the
+  EPYC and 653.8 on the laptop. With `-O2 -march=native`, GCC may have vectorised that loop
+  itself; the generated code was not inspected, so this is not explained here.
+- **The dispatched sum, `fast`,** costs a little over the vector sum it chose: its one-time
+  choice is a function-local static, checked on every call.
+
+### The ICMP checksum
+
+The only datapath sum long enough to gain is the ICMP message, up to a whole echo request.
+`write_icmp_checksum` was switched to the dispatched sum, and measured on the laptop with
+`scripts/ab_bench.sh` (`bench/results/2026-10-25-87b9d17-ab-icmp-simd.json`, `bench_datapath`'s
+`echo_reply`, cycles per reply):
+
+| Benchmark | Before (scalar) | After (AVX2) | Delta | Band | Rounds | Verdict |
+|---|---:|---:|---:|---:|---|---|
+| echo_reply/1472 | 4850.56 | 3516.28 | -1334.29 (-27.5%) | 238.71 | -1367.60, -1231.87 | FASTER |
+| echo_reply/56 | 283.30 | 284.41 | +1.11 (+0.4%) | 26.94 | +0.26, +3.93 | NOISE |
+
+The change stays. A full-size ping's reply costs 27.5% fewer cycles, and a default ping's is
+unchanged.
+
+On aarch64 it was **not** measured. The table above has NEON slower than scalar at 60 bytes, and
+a default ping's message is 64, so a small ping's reply may cost a little more there. That is a
+candidate, not a finding.
+
+The request's own checksum, checked by the header-only `IcmpView::parse`, stays scalar: the
+parsers stay header-only, and each is fuzzed on its own.
+
+### The memory-ordering demonstration
+
+`tests/arch/test_memory_ordering.cpp` runs a ring whose producer publishes its index with
+`release` (the control) or `relaxed`. Its slots are relaxed atomics, so neither variant has a
+data race. The consumer counts the slots it reads before the value its index promised has
+arrived. Each run: 5 rounds of 200,000,000 items per variant, with
+`--gtest_also_run_disabled_tests --gtest_repeat=5`.
+
+| Machine | Logged | `release`: stale reads per round | `relaxed`: stale reads per round |
+|---|---|---|---|
+| laptop, i5-1135G7 | 2026-10-25, at `ef6cc1a` | 0, 0, 0, 0, 0 | 0, 0, 0, 0, 0 |
+| GitHub x86-64, EPYC 7763 | 2026-10-25, at `e62eb95` | 0, 0, 0, 0, 0 | 0, 0, 0, 0, 0 |
+| GitHub arm64, Neoverse-N2 | 2026-10-25, at `e62eb95` | 0, 0, 0, 0, 0 | **11, 7, 4, 127, 5** |
+
+**It shows the hazard ARCHITECTURE.md §13 describes.**
+
+- **On aarch64,** with `relaxed`, the consumer saw the producer's new index before the slot's
+  new value in every round: 154 times in a billion items. With `release` it never did.
+- **On both x86 machines** it never happened with either. x86 keeps a core's stores in order,
+  so the wrong code passes there.
+- **In practice:** an ordering bug can pass every test on the laptop it was written on, and
+  ship. It is why `SpscRing` publishes with `release`, and why the arm64 CI job matters.
+
+The x86 zeros say only that no reordering was seen in a billion items. That is what the
+architecture predicts, but it is not a proof.
+
+### The root integration tests on the runners (a check, not a gate)
+
+The same run ran the 8 root integration tests on each runner, af_packet, mmap and xdp included.
+7 of 8 passed on both, io_equivalence and both soaks among them. `integration.traceroute` failed
+on both, identically: the runners have no `traceroute` binary (`exec of "traceroute" failed`),
+and the workflow did not install one. Without its probes, the test's count of ICMP messages fell
+short too. The workflow now installs `traceroute`; the run was not repeated.
+
+### Exit test
+
+All passed on 2026-10-25:
+
+1. **The full suite is green on aarch64.** CI's `build (gcc-13, ci, arm64)` and
+   `build (clang-18, ci, arm64)` jobs, on GitHub's `ubuntu-24.04-arm`, built and ran every
+   test, `test_checksum_simd` among them. They passed on `ef6cc1a`, and again in the run for
+   `5f60201`, which succeeded in full. Real hardware, so no qemu was needed: the plan's caveat
+   that qemu does not model memory ordering does not arise.
+2. **Checksum numbers for both architectures:** the tables above.
+3. **The ordering demonstration is documented**, with what it found: reproduced on aarch64 in
+   all 5 rounds, never on x86.
+
 ## Phase 3: checksum microbenchmark (tier A)
 
 **What.** `bench/micro/bench_checksum.cpp` times the three checksum paths in
@@ -1843,6 +2004,10 @@ Ideas noted for later phases, not done.
   is gen's, and so is the kernel control's. Several gens, or a faster one, would find the
   ceilings.
 - **Why the offered rate depends on the receiver** (phase 16, and phase 15's four workers below).
+- **The ICMP checksum on aarch64** (phase 18): `echo_reply` before and after on an arm64 machine.
+  NEON was slower than scalar at 60 bytes, so a small ping's reply may be slower there.
+- **What GCC made of the scalar sum** (phase 18): on the Neoverse-N2 it ran 3-4 times faster per
+  byte than on either x86 machine. The generated code would say whether it was vectorised.
 - **AF_XDP on several workers** (phase 17): multi-queue veths, one socket per queue, a shared
   UMEM or one per queue. It is the step that would let xdp be compared on rtc:2 and pipeline:2.
 - **Native against skb XDP, at one offered rate** (phase 17). gen offered skb mode more than
