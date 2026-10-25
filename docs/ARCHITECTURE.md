@@ -300,6 +300,36 @@ class IcmpView {
                                               std::uint16_t new_word) noexcept;
 ```
 
+[phase 18] `include/npf/proto/checksum_simd.hpp`, compiled into the `npf_proto` library: the same
+sum as `ones_complement_sum`, for buffers of any length up to `kMaxSummedBytes`, in three
+implementations.
+
+```cpp
+[[nodiscard]] std::uint16_t ones_complement_sum_scalar(CBytes) noexcept;  // ones_complement_sum
+[[nodiscard]] std::uint16_t ones_complement_sum_avx2(CBytes) noexcept;    // x86-64 only
+[[nodiscard]] std::uint16_t ones_complement_sum_neon(CBytes) noexcept;    // aarch64 only
+[[nodiscard]] std::uint16_t ones_complement_sum_fast(CBytes) noexcept;    // the best of them here
+[[nodiscard]] const char*   checksum_implementation() noexcept;           // "avx2", "neon", "scalar"
+```
+
+- **Choosing.** `ones_complement_sum_fast` decides once, the first time it is called, and keeps
+  its choice in a function-local `static const` function pointer, so there is no mutable global.
+  - On x86-64 the choice is made at run time: AVX2 if `__builtin_cpu_supports("avx2")` says so,
+    else scalar.
+  - On aarch64 it is made at compile time: NEON is part of ARMv8.
+  - Anywhere else it is scalar.
+- **Building.** `checksum_avx2.cpp` alone is compiled with `-mavx2`, so nothing else in the
+  binary assumes AVX2.
+- **Loads.** The vector code loads with `std::memcpy` into a vector, never by casting the buffer
+  pointer (§4).
+- **Testing.** Every implementation is held to `checksum_reference()`, at every length and
+  alignment.
+- **Where it is used.** Only where the datapath sums more than a header: the ICMP message
+  checksum, whose message is up to a whole echo request. The per-packet header check
+  (`ipv4_checksum_valid`, 20-60 bytes) stays scalar. Phase 15 (entry 4) found nothing to gain
+  there, and the ICMP wiring is itself kept only if it measures faster (docs/performance.md,
+  phase 18).
+
 ---
 
 ## 5. Forwarding information base  [phase 5, implementations phase 10]
@@ -784,6 +814,15 @@ be asked:
 - `relaxed` on the producer's `head_` store would let a consumer that has already acquired the new
   index read a slot the producer has not finished writing. On x86 the store buffer usually hides
   this; on aarch64 it does not. Phase 18 exists partly to demonstrate exactly that.
+
+  [phase 18] `tests/arch/test_memory_ordering.cpp` is that demonstration.
+  - **The rings.** A ring whose index store is a template parameter, `release` or `relaxed`. Its
+    slots are themselves relaxed atomics, so the program has no data race and no undefined
+    behaviour: the only question is the order in which another core sees two stores.
+  - **The test.** Its consumer counts every slot it reads that does not yet hold the value its
+    index promised.
+  - **When it runs.** Its tests are `DISABLED_`, run by hand or by the `arch` workflow with
+    `--gtest_also_run_disabled_tests`. Whatever they find goes in docs/performance.md.
 
 The three `alignas(64)` are not decoration: without them `head_` and `tail_` share a cache line and
 every push invalidates the consumer's line. Measure it in phase 15.
