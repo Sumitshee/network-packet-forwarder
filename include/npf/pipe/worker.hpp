@@ -284,11 +284,17 @@ class NewsRings {
 // One pipeline RX thread's work: take home the packets the workers have finished with, receive a
 // burst on its port, and steer each packet to its worker. A packet whose worker's ring is full is
 // dropped here, counted in this stage's own counters as received and as RingFull.
+// [phase 16] What an RX stage does when a worker's ring cannot take what it receives
+// (ARCHITECTURE.md §12): drop the packet as RingFull, or receive no more than every ring can take,
+// leaving the rest in the kernel.
+enum class RxOverflow : std::uint8_t { Drop, HoldBack };
+
 class RxStage {
  public:
   // rx receives on one port, into pool. rings: this stage's rings. bells: each worker's.
   RxStage(io::IoBackend& rx, core::PacketPool& pool, PipelineRings& rings, std::size_t index,
-          std::span<Doorbell* const> bells, std::size_t burst);
+          std::span<Doorbell* const> bells, std::size_t burst,
+          RxOverflow overflow = RxOverflow::Drop);
 
   std::size_t run_once() noexcept;
 
@@ -308,6 +314,7 @@ class RxStage {
   std::vector<ReturnRing*> home_;  // by worker
   std::vector<Doorbell*> bells_;   // by worker
   std::size_t burst_;
+  RxOverflow overflow_;
   stat::Counters stats_;
   std::array<core::Packet*, core::kMaxBurst> rx_{};
   std::vector<std::array<core::Packet*, core::kMaxBurst>> staged_;  // by worker

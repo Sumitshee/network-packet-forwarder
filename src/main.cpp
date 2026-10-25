@@ -654,6 +654,11 @@ template <class Socket>
 class Engine {
   using Lane = LaneOf<Socket>;
   using RxLane = RxLaneOf<Socket>;
+  // Measured per backend (ARCHITECTURE.md §12): holding back lifts PACKET_MMAP's pipeline, whose
+  // RX thread copies a whole block out at once, and lowers AF_PACKET's.
+  static constexpr npf::pipe::RxOverflow kRxOverflow =
+      std::is_same_v<Socket, npf::io::PacketMmapBackend> ? npf::pipe::RxOverflow::HoldBack
+                                                         : npf::pipe::RxOverflow::Drop;
 
  public:
   Engine(npf::core::Config cfg, const npf::core::FilterConfig& rules, bool busy_poll)
@@ -842,7 +847,7 @@ class Engine {
     for (std::size_t k = 0; k < n_ports; ++k) {
       RxLane& lane = rx_lanes_[k];
       lane.stage = std::make_unique<npf::pipe::RxStage>(*lane.sockets, *lane.pool, *rings_, k,
-                                                        bells, cfg_.burst);
+                                                        bells, cfg_.burst, kRxOverflow);
     }
   }
 

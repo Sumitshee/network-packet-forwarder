@@ -341,7 +341,35 @@ TEST(Recycler, SendsEachPacketHomeToItsOwnPool) {
   rx.release(back);
 }
 
-// [phase 16] A worker that does not take its packets: the ring fills, and then the RX stage
+// With RxOverflow::Drop (phase 13's, and the af_packet backend's): a worker that never takes its
+// packets: the ring fills, and every packet after that is dropped by the RX stage -- counted as
+// received and as RingFull, its buffer straight back in the pool.
+TEST(RxStage, APacketForAFullRingIsCountedAsRingFull) {
+  const Config cfg = topology();
+  constexpr std::size_t kSent = npf::pipe::kWorkerRingSize + 300;
+  PacketPool pool(kSent + 16);
+  std::vector<Arrival> arrivals;
+  for (std::uint32_t seq = 0; seq < kSent; ++seq) {
+    arrivals.push_back({udp(0, seq), 0});
+  }
+  FakeBackend source(pool, port_infos(cfg), std::move(arrivals));
+  source.allow_all();
+  PipelineRings rings(1, 1);
+  Doorbell bell;
+  std::array<Doorbell*, 1> bells{&bell};
+  RxStage stage(source, pool, rings, 0, bells, cfg.burst, npf::pipe::RxOverflow::Drop);
+  while (!source.drained()) {
+    stage.run_once();
+  }
+  EXPECT_EQ(stage.stats().rx_packets, kSent - npf::pipe::kWorkerRingSize);
+  EXPECT_EQ(stage.stats().drop(DropReason::RingFull), kSent - npf::pipe::kWorkerRingSize);
+  EXPECT_EQ(pool.available(), pool.capacity() - npf::pipe::kWorkerRingSize);  // in the ring
+  stage.reclaim();
+  EXPECT_EQ(pool.available(), pool.capacity());
+}
+
+// [phase 16] With RxOverflow::HoldBack (the mmap backend's), a worker that does not take its
+// packets: the ring fills, and then the RX stage
 // receives nothing more -- the rest wait in the source, as they would in the kernel -- and drops
 // nothing. Once the worker makes room, the stage receives again, as much as fits.
 TEST(RxStage, AFullRingHoldsBackTheSourceAndDropsNothing) {
@@ -357,7 +385,7 @@ TEST(RxStage, AFullRingHoldsBackTheSourceAndDropsNothing) {
   PipelineRings rings(1, 1);
   Doorbell bell;
   std::array<Doorbell*, 1> bells{&bell};
-  RxStage stage(source, pool, rings, 0, bells, cfg.burst);
+  RxStage stage(source, pool, rings, 0, bells, cfg.burst, npf::pipe::RxOverflow::HoldBack);
   for (int i = 0; i < 1000; ++i) {
     stage.run_once();
   }
@@ -502,7 +530,7 @@ void expect_flows_in_order(std::span<const std::vector<Sent>* const> per_worker)
 // their own threads; the test thread parks them all, again and again, to watch. Every packet must
 // be accounted for once, every flow must leave in order from a single worker, and every buffer
 // must end up back in the pool it came from.
-TEST(PipelineThreads, FlowsStayInOrderAndEveryBufferGoesHome) {
+void pipeline_threads(npf::pipe::RxOverflow overflow) {
   constexpr std::size_t kWorkers = 4;
   constexpr std::size_t kPorts = 2;
   constexpr std::uint32_t kPerFlow = 1500;
@@ -561,8 +589,8 @@ TEST(PipelineThreads, FlowsStayInOrderAndEveryBufferGoesHome) {
   news.connect(worker_ptrs);
   std::vector<std::unique_ptr<RxStage>> stages;
   for (std::size_t k = 0; k < kPorts; ++k) {
-    stages.push_back(
-        std::make_unique<RxStage>(*sources[k], *rx_pools[k], rings, k, bell_ptrs, cfg.burst));
+    stages.push_back(std::make_unique<RxStage>(*sources[k], *rx_pools[k], rings, k, bell_ptrs,
+                                               cfg.burst, overflow));
   }
 
   Rendezvous rv(kWorkers + kPorts);
@@ -634,6 +662,16 @@ TEST(PipelineThreads, FlowsStayInOrderAndEveryBufferGoesHome) {
   for (const auto& p : pools) {
     EXPECT_EQ(p->available(), p->capacity());
   }
+}
+
+TEST(PipelineThreads, FlowsStayInOrderAndEveryBufferGoesHome) {
+  pipeline_threads(npf::pipe::RxOverflow::Drop);
+}
+
+// [phase 16] The same with the RX stages holding back when a ring is full, as the mmap backend's
+// do.
+TEST(PipelineThreads, FlowsStayInOrderAndEveryBufferGoesHomeHoldingBack) {
+  pipeline_threads(npf::pipe::RxOverflow::HoldBack);
 }
 
 // Run-to-completion, threaded: two workers with sources of their own each have packets waiting

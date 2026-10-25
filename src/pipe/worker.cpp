@@ -367,11 +367,12 @@ void NewsRings::connect(std::span<Worker* const> workers) {
 }
 
 RxStage::RxStage(io::IoBackend& rx, core::PacketPool& pool, PipelineRings& rings, std::size_t index,
-                 std::span<Doorbell* const> bells, std::size_t burst)
+                 std::span<Doorbell* const> bells, std::size_t burst, RxOverflow overflow)
     : source_{&rx},
       pool_{&pool},
       bells_(bells.begin(), bells.end()),
       burst_{burst},
+      overflow_{overflow},
       staged_(bells.size()),
       n_staged_(bells.size(), 0) {
   for (std::size_t w = 0; w < bells.size(); ++w) {
@@ -385,11 +386,13 @@ std::size_t RxStage::run_once() noexcept {
   // Back-pressure (ARCHITECTURE.md §12): no more than the fullest ring can take, wherever the
   // packets steer. The rest wait in the kernel, which counts what it then has to drop.
   std::size_t room = burst_;
-  for (PacketRing* ring : out_) {
-    room = ring->room(room);
-  }
-  if (room == 0) {
-    return 0;
+  if (overflow_ == RxOverflow::HoldBack) {
+    for (PacketRing* ring : out_) {
+      room = ring->room(room);
+    }
+    if (room == 0) {
+      return 0;
+    }
   }
   const std::size_t n = source_->rx_burst(rx_.data(), room);
   for (core::Packet* p : std::span(rx_.data(), n)) {
