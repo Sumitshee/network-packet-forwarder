@@ -39,8 +39,8 @@ enum class DropReason : std::uint8_t {
   UnknownDestPort,   // L2 lookup miss on a port with no bridge domain
   SamePort,          // [phase 12] L2: the destination was learned on the port the frame came in on
   RingFull,          // [phase 13] pipeline mode: the ring to the chosen worker was full, so the RX
-                     // thread dropped the packet before any worker saw it. [phase 16] A guard:
-                     // the RX thread receives no more than every ring has room for (§12)
+                     // thread dropped the packet before any worker saw it. [phase 16] With mmap,
+                     // a guard: its RX thread receives no more than every ring can take (§12)
   TxFull,            // transmit ring or socket buffer full
   PoolExhausted,     // no free packet buffer
   _Count
@@ -699,7 +699,8 @@ switches a frame whatever its EtherType, before step 2 could refuse it:
 | `IoBackend` sockets | one per worker in run-to-completion mode | none | Every worker's socket on a port joins that port's `PACKET_FANOUT_HASH` group, which distributes in-kernel |
 | `IoBackend` sockets, pipeline | one receiving socket per port, one RX thread each; every worker its own transmit-only sockets | none | The RX thread steers by `symmetric_hash_5tuple & (workers-1)`, so the worker count is a power of two |
 
-[phase 16] Back-pressure in pipeline mode. Before each receive, the RX thread asks every ring to a
+[phase 16] Back-pressure in pipeline mode, for the `mmap` backend only (`RxOverflow::HoldBack`;
+`af_packet` keeps phase 13's `RxOverflow::Drop`, measured below). Before each receive, the RX thread asks every ring to a
 worker how much room it has, `SpscRing::room(burst)`, and receives at most the smallest answer —
 so whichever workers a burst steers to, every packet of it fits, and none is dropped as `RingFull`.
 What the workers cannot take yet stays in the kernel: in the socket's receive buffer
@@ -710,6 +711,11 @@ a whole block out in microseconds — thousands of frames, against 1024 slots a 
 most of them. While every ring is full the RX thread finds nothing to do and polls its socket,
 which is readable, so it spins in `poll()` until a worker makes room; a wake-up from the workers
 would save that CPU, and is not built.
+Measured on both backends (docs/performance.md, phase 16): it took `mmap` pipeline mode from
+about 140 to 320-344 kpps and its loss from about 63% to 0%, but `af_packet`'s loss from 15-16%
+to 46-48%, with its delivered rate lower in one session and inside the noise in the other. So
+the engine chooses by backend: `HoldBack` for `PacketMmapBackend`, `Drop` (`RingFull`) for
+`AfPacketBackend`, whose RX thread a system call per frame already paces.
 
 [phase 13] Not built: NUMA awareness (a laptop has one node), work stealing, dynamic worker
 scaling, CPU pinning.
