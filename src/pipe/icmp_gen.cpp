@@ -90,8 +90,7 @@ void write_ipv4(core::Bytes hdr, const Ipv4Fields& f) noexcept {
 // enough for the vector sum to pay (docs/performance.md, phase 18).
 void write_icmp_checksum(core::Bytes message) noexcept {
   core::wr_be16(message, 2, 0);
-  core::wr_be16(message, 2,
-                static_cast<std::uint16_t>(~proto::ones_complement_sum_fast(message)));
+  core::wr_be16(message, 2, static_cast<std::uint16_t>(~proto::ones_complement_sum_fast(message)));
 }
 
 }  // namespace
