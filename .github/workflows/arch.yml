@@ -6,11 +6,15 @@ name: arch
 #  - the memory-ordering demonstration (tests/arch), which is disabled in every other run;
 #  - the root integration tests, which these runners can run (passwordless sudo): a check of the
 #    socket backends on arm64, not a gate.
+# Started by hand from the Actions page, or by pushing a tag named arch-*:
+#   git tag arch-1 && git push origin arch-1
 # Everything lands in one artifact per runner, arch-X64 and arch-ARM64, to be downloaded from the
 # run's page into bench/results/. Shared cloud VMs: the numbers are theirs, and labelled so.
 
 on:
   workflow_dispatch:
+  push:
+    tags: ['arch-*']
 
 jobs:
   measure:
