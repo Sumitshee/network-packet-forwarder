@@ -3,7 +3,7 @@
 #
 # Run one, e.g. for the CI's 60 seconds:
 #   build/ci/tests/fuzz/fuzz_ethernet -max_total_time=60 build/ci/tests/fuzz/corpus/ethernet
-foreach(harness fuzz_ethernet fuzz_arp fuzz_ipv4 fuzz_l4 fuzz_pcap)
+foreach(harness fuzz_ethernet fuzz_arp fuzz_ipv4 fuzz_l4 fuzz_pcap fuzz_checksum)
   add_executable(${harness} ${harness}.cpp)
   target_link_libraries(${harness} PRIVATE npf_warnings npf_core)
   # -UNDEBUG keeps assert() live in every preset: a fuzzer should trip on each broken
@@ -15,6 +15,16 @@ endforeach()
 # The protocol parsers are header-only, and so instrumented in their harnesses. The pcap parser is
 # not: compiled into its harness, rather than linked from npf_io, it is instrumented too.
 target_sources(fuzz_pcap PRIVATE ${PROJECT_SOURCE_DIR}/src/io/pcap_file.cpp)
+# [phase 18] The vector sums live in npf_proto, so they too are compiled into their harness, to be
+# instrumented. checksum_avx2.cpp keeps its -mavx2 from its source properties.
+target_sources(fuzz_checksum PRIVATE ${PROJECT_SOURCE_DIR}/src/proto/checksum_simd.cpp)
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
+  target_sources(fuzz_checksum PRIVATE ${PROJECT_SOURCE_DIR}/src/proto/checksum_avx2.cpp)
+  set_source_files_properties(${PROJECT_SOURCE_DIR}/src/proto/checksum_avx2.cpp
+                              TARGET_DIRECTORY fuzz_checksum PROPERTIES COMPILE_OPTIONS -mavx2)
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
+  target_sources(fuzz_checksum PRIVATE ${PROJECT_SOURCE_DIR}/src/proto/checksum_neon.cpp)
+endif()
 
 # The seed corpora, one file per fixture frame and, for fuzz_pcap, every fixture file whole,
 # regenerated whenever a fixture changes. The golden cases' pcaps are fixtures too.

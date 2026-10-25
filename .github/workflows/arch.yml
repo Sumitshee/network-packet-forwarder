@@ -1,0 +1,66 @@
+name: arch
+
+# [phase 18] The cross-architecture measurements for docs/performance.md, run by hand (Actions,
+# "arch", "Run workflow"): on an x86-64 and an arm64 GitHub runner alike,
+#  - the checksum benchmark, pinned to one CPU, 7 repetitions, as tier A is run on the laptop;
+#  - the memory-ordering demonstration (tests/arch), which is disabled in every other run;
+#  - the root integration tests, which these runners can run (passwordless sudo): a check of the
+#    socket backends on arm64, not a gate.
+# Everything lands in one artifact per runner, arch-X64 and arch-ARM64, to be downloaded from the
+# run's page into bench/results/. Shared cloud VMs: the numbers are theirs, and labelled so.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  measure:
+    name: measure (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    env:
+      CXX: g++-13
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build g++-13 clang-18 libbpf-dev libxdp-dev ethtool iproute2 tcpdump
+      - uses: actions/cache@v4
+        with:
+          path: .deps-cache
+          key: deps-${{ hashFiles('cmake/Dependencies.cmake') }}
+      - name: the machine
+        run: |
+          mkdir -p out
+          { echo "runner: ${{ matrix.runner }}"; echo "git: $(git rev-parse HEAD)"; date -u
+            uname -a; nproc; lscpu; g++-13 --version | head -1
+            grep -E '^(MemTotal|Hugepagesize)' /proc/meminfo; } > out/machine.txt
+          cat out/machine.txt
+      - run: cmake --preset bench && cmake --build --preset bench -j --target bench_checksum
+      - name: bench_checksum
+        run: |
+          taskset -c 1 build/bench/bench/bench_checksum --benchmark_repetitions=7 \
+            --benchmark_report_aggregates_only=true --benchmark_min_warmup_time=0.5 \
+            --benchmark_out=out/bench_checksum.json --benchmark_out_format=json \
+            --benchmark_context=git_sha=$(git rev-parse --short HEAD),runner=${{ matrix.runner }},pinned_cpus=1 \
+            | tee out/bench_checksum.txt
+      - run: cmake --preset ci && cmake --build --preset ci -j
+      - name: memory ordering (tests/arch)
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          NPF_ORDERING_ITEMS=200000000 build/ci/tests/test_memory_ordering \
+            --gtest_also_run_disabled_tests --gtest_repeat=5 2>&1 | tee out/memory_ordering.txt
+      - name: root integration tests
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          sudo NPF_CAPTURE=python ctest --preset ci -R integration --output-on-failure 2>&1 | tee out/integration.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: arch-${{ runner.arch }}
+          path: out/

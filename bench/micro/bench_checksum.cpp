@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <npf/proto/checksum.hpp>
+#include <npf/proto/checksum_simd.hpp>
 #include <random>
 #include <vector>
 
@@ -85,11 +86,54 @@ void BM_ChecksumUpdate16(benchmark::State& state) {
   }
 }
 
+// [phase 18] The sums of checksum_simd.hpp, each out of line, so all pay the same call: scalar,
+// the vector one of this architecture, and the dispatched one, which adds its choice's lookup.
+using SumFn = std::uint16_t (*)(npf::core::CBytes) noexcept;
+
+void run_sum(benchmark::State& state, SumFn fn) {
+  const std::vector<std::byte> data = random_bytes(static_cast<std::size_t>(state.range(0)));
+  for ([[maybe_unused]] auto _ : state) {
+    std::uint16_t sum = fn(data);
+    benchmark::DoNotOptimize(sum);
+    benchmark::ClobberMemory();
+  }
+  state.SetBytesProcessed(state.iterations() * state.range(0));
+}
+
+void BM_SumScalar(benchmark::State& state) {
+  run_sum(state, &npf::proto::ones_complement_sum_scalar);
+}
+
+void BM_SumVector(benchmark::State& state) {
+#if defined(__x86_64__)
+  if (__builtin_cpu_supports("avx2") == 0) {
+    state.SkipWithError("this CPU has no AVX2");
+    return;
+  }
+  state.SetLabel("avx2");
+  run_sum(state, &npf::proto::ones_complement_sum_avx2);
+#elif defined(__aarch64__)
+  state.SetLabel("neon");
+  run_sum(state, &npf::proto::ones_complement_sum_neon);
+#else
+  state.SkipWithError("no vector sum for this architecture");
+#endif
+}
+
+void BM_SumFast(benchmark::State& state) {
+  state.SetLabel(npf::proto::checksum_implementation());
+  run_sum(state, &npf::proto::ones_complement_sum_fast);
+}
+
 // 20 and 60 bytes: the smallest and largest IPv4 headers. 1500: an MTU-sized payload, the scale an
 // L4 checksum works at.
 BENCHMARK(BM_ChecksumReference)->Arg(20)->Arg(60)->Arg(1500)->Apply(with_spread);
 BENCHMARK(BM_OnesComplementSum)->Arg(20)->Arg(60)->Arg(1500)->Apply(with_spread);
 BENCHMARK(BM_ChecksumUpdate16)->Apply(with_spread);
+// 576: the most an ICMP error may quote, RFC 1812. 1500: an echo request of a full MTU.
+BENCHMARK(BM_SumScalar)->Arg(20)->Arg(60)->Arg(576)->Arg(1500)->Apply(with_spread);
+BENCHMARK(BM_SumVector)->Arg(20)->Arg(60)->Arg(576)->Arg(1500)->Apply(with_spread);
+BENCHMARK(BM_SumFast)->Arg(20)->Arg(60)->Arg(576)->Arg(1500)->Apply(with_spread);
 
 }  // namespace
 

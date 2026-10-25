@@ -42,6 +42,8 @@ npf_add_unit_test(test_mac unit/test_mac.cpp)
 npf_add_unit_test(test_ethernet unit/test_ethernet.cpp)
 npf_add_unit_test(test_arp unit/test_arp.cpp)
 npf_add_unit_test(test_checksum unit/test_checksum.cpp)
+npf_add_unit_test(test_checksum_simd unit/test_checksum_simd.cpp)
+target_link_libraries(test_checksum_simd PRIVATE npf_proto)
 npf_add_unit_test(test_ipv4 unit/test_ipv4.cpp)
 npf_add_unit_test(test_l4 unit/test_l4.cpp)
 npf_add_unit_test(test_lpm_linear unit/test_lpm_linear.cpp)
@@ -69,6 +71,10 @@ target_compile_definitions(test_filter PRIVATE NPF_CONFIG_DIR="${PROJECT_SOURCE_
 
 npf_add_unit_test(test_ring unit/test_ring.cpp)
 target_link_libraries(test_ring PRIVATE Threads::Threads)
+# [phase 18] The memory-ordering demonstration: every test in it is DISABLED_, so ctest lists them
+# and runs none. See the file for how to run it.
+npf_add_unit_test(test_memory_ordering arch/test_memory_ordering.cpp)
+target_link_libraries(test_memory_ordering PRIVATE Threads::Threads)
 npf_add_unit_test(test_hash unit/test_hash.cpp)
 npf_add_unit_test(test_worker unit/test_worker.cpp)
 target_link_libraries(test_worker PRIVATE npf_pipe)

@@ -49,6 +49,7 @@
 #include <npf/pipe/decision.hpp>
 #include <npf/pipe/filter.hpp>
 #include <npf/pipe/forward.hpp>
+#include <npf/pipe/icmp_gen.hpp>
 #include <npf/proto/checksum.hpp>
 #include <npf/proto/ethernet.hpp>
 #include <npf/proto/ipv4.hpp>
@@ -62,6 +63,7 @@
 #include <npf/table/lpm_patricia.hpp>
 #include <npf/table/lpm_trie.hpp>
 #include <npf/table/mac_table.hpp>
+#include <optional>
 #include <random>
 #include <span>
 #include <stdexcept>
@@ -396,6 +398,61 @@ void full_datapath(benchmark::State& state, const Workload& w, std::size_t n = k
   state.counters["routes"] = static_cast<double>(fib->size());
 }
 
+// [phase 18] One Echo Reply built per iteration, to a ping of `payload` bytes of data: what the
+// router does for a ping to itself, past the parse. It sums the whole ICMP message twice -- the
+// request's checksum checked, the reply's written -- which is where the vector sum can count.
+void echo_reply(benchmark::State& state, std::size_t payload) {
+  constexpr std::size_t kEth = 14;
+  constexpr std::size_t kIp = 20;
+  const std::size_t icmp_len = 8 + payload;
+  std::vector<std::byte> frame(kEth + kIp + icmp_len);
+  const npf::core::Bytes f(frame);
+  npf::core::wr_be16(f, 12, 0x0800);
+  const npf::core::Bytes ip = f.subspan(kEth, kIp);
+  npf::core::wr_u8(ip, 0, 0x45);
+  npf::core::wr_be16(ip, 2, static_cast<std::uint16_t>(kIp + icmp_len));
+  npf::core::wr_u8(ip, 8, 64);
+  npf::core::wr_u8(ip, 9, 1);
+  npf::core::wr_be32(ip, 12, 0x0A000102);
+  npf::core::wr_be32(ip, 16, 0x0A000101);
+  npf::core::wr_be16(ip, 10, npf::proto::ipv4_header_checksum(ip));
+  const npf::core::Bytes icmp = f.subspan(kEth + kIp);
+  npf::core::wr_u8(icmp, 0, 8);  // echo request
+  for (std::size_t i = 8; i < icmp_len; ++i) {
+    npf::core::wr_u8(icmp, i, static_cast<std::uint8_t>(i * 7));
+  }
+  npf::core::wr_be16(icmp, 2, static_cast<std::uint16_t>(~npf::proto::ones_complement_sum(icmp)));
+  const std::optional<npf::proto::Ipv4View> req =
+      npf::proto::Ipv4View::parse(npf::core::CBytes(f).subspan(kEth));
+  npf::core::PacketPool pool(1);
+  npf::core::Packet* out = pool.acquire();
+  if (!req || out == nullptr) {
+    state.SkipWithError("could not build the request");
+    return;
+  }
+  const npf::proto::MacAddr mac{{0x02, 0, 0, 0, 0, 1}};
+  const CycleCounter cycles;
+  std::size_t built = 0;
+  cycles.start();
+  for ([[maybe_unused]] auto _ : state) {
+    bool ok = npf::pipe::build_echo_reply(*out, *req, frame, mac, mac);
+    benchmark::DoNotOptimize(ok);
+    benchmark::ClobberMemory();
+    built += ok ? 1 : 0;
+  }
+  cycles.pause();
+  if (built != static_cast<std::size_t>(state.iterations())) {
+    state.SkipWithError("build_echo_reply refused the request");
+  }
+  state.counters["packets"] = 1;
+  state.SetItemsProcessed(static_cast<std::int64_t>(built));
+  if (cycles.available() && built != 0) {
+    state.counters["cycles_per_packet"] =
+        static_cast<double>(cycles.read()) / static_cast<double>(built);
+  }
+  pool.release(out);
+}
+
 template <class Fib>
 void register_fib(const char* name, const std::vector<Workload>& workloads) {
   for (const Workload& w : workloads) {
@@ -431,6 +488,13 @@ int main(int argc, char** argv) {
   } catch (const std::exception& e) {
     std::fprintf(stderr, "bench_datapath: %s\n", e.what());
     return 1;
+  }
+  // 56 bytes: ping's default. 1472: a full 1500-byte IPv4 packet.
+  for (const std::size_t payload : {std::size_t{56}, std::size_t{1472}}) {
+    benchmark::RegisterBenchmark(std::format("echo_reply/{}", payload), [payload](
+                                                                            benchmark::State& s) {
+      echo_reply(s, payload);
+    })->Apply(with_spread);
   }
   benchmark::RegisterBenchmark("parse_only", [](benchmark::State& s) {
     parse_only(s, false);

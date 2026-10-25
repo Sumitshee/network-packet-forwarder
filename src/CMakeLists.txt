@@ -5,6 +5,17 @@ target_include_directories(npf_core PUBLIC ${PROJECT_SOURCE_DIR}/include)
 target_compile_features(npf_core PUBLIC cxx_std_20)
 target_link_libraries(npf_core PRIVATE npf_warnings)
 
+# [phase 18] The checksum sums that are not header-only: the vector ones, each built only for its
+# architecture, and the choice between them (ARCHITECTURE.md §4).
+add_library(npf_proto proto/checksum_simd.cpp)
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
+  target_sources(npf_proto PRIVATE proto/checksum_avx2.cpp)
+  set_source_files_properties(proto/checksum_avx2.cpp PROPERTIES COMPILE_OPTIONS -mavx2)
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
+  target_sources(npf_proto PRIVATE proto/checksum_neon.cpp)
+endif()
+target_link_libraries(npf_proto PUBLIC npf_core PRIVATE npf_warnings)
+
 add_library(npf_table
   table/arp_cache.cpp
   table/lpm_dir24_8.cpp
@@ -58,7 +69,7 @@ add_library(npf_pipe
   pipe/forward.cpp
   pipe/icmp_gen.cpp
   pipe/worker.cpp)
-target_link_libraries(npf_pipe PUBLIC npf_table npf_core Threads::Threads PRIVATE npf_warnings)
+target_link_libraries(npf_pipe PUBLIC npf_table npf_proto npf_core Threads::Threads PRIVATE npf_warnings)
 
 add_executable(npf main.cpp)
 target_link_libraries(npf PRIVATE npf_pipe npf_io npf_table npf_core npf_warnings)
